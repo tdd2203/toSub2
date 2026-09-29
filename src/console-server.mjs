@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import react from "@vitejs/plugin-react";
@@ -77,6 +77,42 @@ let sub2ApiMonitorConfig = null;
 let sub2ApiMonitorTimer = null;
 let sub2ApiMonitorPromise = null;
 let mailRequestConfig = { method: "GET", url: null, headers: {} };
+
+// ---- Native temp-mail (magicskill) integration: read the API key from the
+// macOS Keychain so the console can create mailboxes and auto-read OTP codes
+// without a separate connector or a hand-pasted Authorization header. ----
+const MAIL_API_BASE = "https://mail.magicskill.org/emailservice/api/v1";
+const MAIL_KEYCHAIN_SERVICE = "magicskill-email-api";
+function readMailApiKey() {
+  try {
+    return execFileSync("security", ["find-generic-password", "-s", MAIL_KEYCHAIN_SERVICE, "-w"], {
+      encoding: "utf8",
+    }).trim();
+  } catch {
+    return "";
+  }
+}
+const mailApiKey = readMailApiKey();
+// Self-configure the email-OTP request so verification codes are read straight
+// from the mail service — no external connector, no manual JSON paste.
+if (mailApiKey) {
+  mailRequestConfig = { method: "GET", url: null, headers: { authorization: `Bearer ${mailApiKey}` } };
+}
+async function mailApi(path, { method = "GET", body } = {}) {
+  const res = await fetch(`${MAIL_API_BASE}${path}`, {
+    method,
+    headers: {
+      authorization: `Bearer ${mailApiKey}`,
+      ...(body ? { "content-type": "application/json" } : {}),
+    },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+  const text = await res.text();
+  let json;
+  try { json = JSON.parse(text); } catch { json = text; }
+  return { ok: res.ok, status: res.status, json };
+}
+
 const sub2ApiRequestControllers = new Set();
 const sub2ApiRequestPromises = new Set();
 const sub2ApiAutoRepairPromises = new Set();
@@ -249,6 +285,53 @@ async function handleApi(req, res, requestUrl) {
         headerCount: Object.keys(mailRequestConfig.headers).length,
       },
     });
+    return;
+  }
+
+  // Domains grouped by root + subdomains, for the "Tạo email" picker.
+  if (req.method === "GET" && requestUrl.pathname === "/api/mail/domains") {
+    const d = await mailApi("/domains");
+    const domains = d.ok ? d.json.domains || [] : [];
+    const points = d.ok ? d.json.points || {} : {};
+    const roots = Object.keys(points);
+    const groups = Object.fromEntries(roots.map((r) => [r, []]));
+    for (const dom of domains) {
+      const root = roots
+        .filter((r) => dom === r || dom.endsWith(`.${r}`))
+        .sort((a, b) => b.length - a.length)[0];
+      if (root) groups[root].push(dom);
+    }
+    const DEFAULTS = ["ndaigroup.com", "dataidcc.com"];
+    const rootsOut = roots
+      .map((r) => ({ root: r, weight: points[r], subdomains: groups[r].filter((x) => x !== r).sort() }))
+      .sort((a, b) => (DEFAULTS.indexOf(a.root) < 0 ? 99 : DEFAULTS.indexOf(a.root)) - (DEFAULTS.indexOf(b.root) < 0 ? 99 : DEFAULTS.indexOf(b.root)));
+    sendJson(res, 200, { available: d.ok, keyPresent: Boolean(mailApiKey), defaults: DEFAULTS, roots: rootsOut });
+    return;
+  }
+
+  // Create N mailboxes (optionally on a chosen domain, optionally tagged) and
+  // return ready-to-add "email----otpUrl" lines for the batch box.
+  if (req.method === "POST" && requestUrl.pathname === "/api/mail/create") {
+    const body = await readJson(req);
+    const count = Number(body.count);
+    if (!Number.isInteger(count) || count < 1 || count > 50) {
+      sendJson(res, 400, { error: "Số lượng phải từ 1 đến 50" });
+      return;
+    }
+    const payload = { count };
+    if (body.domain) payload.domain = String(body.domain);
+    if (body.tag) payload.tag = String(body.tag);
+    const r = await mailApi("/mailboxes/batch", { method: "POST", body: payload });
+    if (!r.ok) {
+      sendJson(res, r.status, { error: (r.json && r.json.detail) || `HTTP ${r.status}` });
+      return;
+    }
+    const boxes = (r.json.mailboxes || []).map((mb) => ({
+      email: mb.email,
+      tag: mb.tag,
+      line: `${mb.email}----${MAIL_API_BASE}/mailboxes/${encodeURIComponent(mb.email)}/otp`,
+    }));
+    sendJson(res, 200, { created: r.json.created ?? boxes.length, boxes, errors: r.json.errors || [] });
     return;
   }
 

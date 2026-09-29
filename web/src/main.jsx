@@ -85,6 +85,16 @@ function App() {
   const [mailRequestSettingsOpen, setMailRequestSettingsOpen] = useState(false);
   const [mailRequestSettingsError, setMailRequestSettingsError] = useState("");
   const [mailRequestSettingsSaving, setMailRequestSettingsSaving] = useState(false);
+  // "Tạo email" — native temp-mail creation (domain gốc → subdomain → số lượng → tag).
+  const [createOpen, setCreateOpen] = useState(false);
+  const [createBusy, setCreateBusy] = useState(false);
+  const [createError, setCreateError] = useState("");
+  const [mailRoots, setMailRoots] = useState([]);
+  const [createRoot, setCreateRoot] = useState("");
+  const [createSub, setCreateSub] = useState("");
+  const [createCount, setCreateCount] = useState(10);
+  const [createTag, setCreateTag] = useState("ChatGPT Team");
+  const [createResult, setCreateResult] = useState(null); // { boxes, errors, domain, tag } after a create
   const [sub2apiSettings, setSub2apiSettings] = useState(readSub2ApiSettings);
   const [sub2apiSettingsDraft, setSub2apiSettingsDraft] = useState(readSub2ApiSettings);
   const [sub2apiGroups, setSub2apiGroups] = useState([]);
@@ -506,6 +516,63 @@ function App() {
     }
   }
 
+  async function openCreateEmail() {
+    setCreateError("");
+    setCreateResult(null);
+    setCreateOpen(true);
+    try {
+      const data = await apiFetch(token, "/api/mail/domains");
+      const roots = data.roots || [];
+      setMailRoots(roots);
+      setCreateRoot((prev) =>
+        prev
+        || (data.defaults || []).find((d) => roots.some((r) => r.root === d))
+        || roots[0]?.root
+        || "");
+      setCreateSub("");
+    } catch (requestError) {
+      setCreateError(requestError.message);
+    }
+  }
+
+  async function submitCreateEmail(event) {
+    event.preventDefault();
+    if (createBusy) return;
+    const domain = createSub || createRoot;
+    if (!domain) { setCreateError("Chọn domain"); return; }
+    setCreateBusy(true);
+    try {
+      const data = await apiFetch(token, "/api/mail/create", {
+        method: "POST",
+        body: JSON.stringify({ count: Number(createCount), domain, tag: createTag.trim() }),
+      });
+      // Show the created addresses in the popup; the user then copies them or
+      // pushes them into the batch box.
+      setCreateResult({ boxes: data.boxes || [], errors: data.errors || [], domain, tag: createTag.trim() });
+      setError("");
+    } catch (requestError) {
+      setCreateError(requestError.message);
+    } finally {
+      setCreateBusy(false);
+    }
+  }
+
+  function sendCreatedToBatch() {
+    const lines = (createResult?.boxes || []).map((box) => box.line).join("\n");
+    if (!lines) return;
+    setBatchText((prev) => (prev.trim() ? `${prev.trim()}\n${lines}` : lines));
+    setCreateResult(null);
+    setCreateOpen(false);
+    setBatchError("");
+    setBatchOpen(true);
+  }
+
+  async function copyCreatedEmails() {
+    const text = (createResult?.boxes || []).map((box) => box.email).join("\n");
+    if (!text) return;
+    try { await navigator.clipboard.writeText(text); } catch {}
+  }
+
   function applyEmailFilter(event) {
     event.preventDefault();
     try {
@@ -759,6 +826,11 @@ function App() {
                     aria-label={t("代理 IP 地址")}
                   />
                 </label>
+                <div style={{ display: "flex", gap: 6, alignItems: "center", marginTop: 7, flexWrap: "wrap" }}>
+                  <span style={{ fontSize: 12, opacity: 0.55 }}>Đổi định dạng:</span>
+                  <button type="button" style={proxyFmtBtn} onClick={() => setAccountProxyUrl((v) => toProxyUrl(v, "socks5h"))} title="host:port:user:pass → socks5h://user:pass@host:port">SOCKS5</button>
+                  <button type="button" style={proxyFmtBtn} onClick={() => setAccountProxyUrl((v) => toProxyUrl(v, "http"))} title="host:port:user:pass → http://user:pass@host:port">HTTP</button>
+                </div>
               </div>
               <span className={`provider-ready ${accountProxyUrl.trim() ? "" : "incomplete"}`}>
                 {accountProxyUrl.trim() ? <Check size={14} /> : <CircleAlert size={14} />}
@@ -880,6 +952,10 @@ function App() {
                 <button className="secondary-button" type="button" onClick={() => { setBatchError(""); setBatchOpen(true); }} disabled={!token}>
                   <ListPlus size={17} />
                   {t("批量添加")}
+                </button>
+                <button className="secondary-button" type="button" onClick={openCreateEmail} disabled={!token}>
+                  <Plus size={17} />
+                  Tạo email
                 </button>
                 <button
                   className={`secondary-button ${emailFilter.length ? "filter-active" : ""}`}
@@ -1490,6 +1566,84 @@ function App() {
           </form>
         </div>
       )}
+      {createOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget && !createBusy) setCreateOpen(false);
+        }}>
+          <form className="batch-dialog" onSubmit={submitCreateEmail} role="dialog" aria-modal="true" aria-labelledby="create-email-title">
+            <div className="dialog-header">
+              <div>
+                <h2 id="create-email-title">Tạo email</h2>
+                <span>{createResult ? `Đã tạo ${createResult.boxes.length} email — chọn đưa vào danh sách hoặc copy` : "Tạo hộp thư tạm, xem danh sách rồi đưa vào ô thêm hàng loạt"}</span>
+              </div>
+              <button type="button" className="icon-button" onClick={() => { setCreateOpen(false); setCreateResult(null); }} disabled={createBusy} title="Đóng">
+                <X size={18} />
+              </button>
+            </div>
+            {!createResult ? (
+              <>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginTop: 4 }}>
+                  <label style={createFieldLabel}>Domain gốc
+                    <select style={createField} value={createRoot} onChange={(event) => { setCreateRoot(event.target.value); setCreateSub(""); }}>
+                      {mailRoots.map((r) => <option key={r.root} value={r.root}>{r.root}</option>)}
+                    </select>
+                  </label>
+                  <label style={createFieldLabel}>Subdomain
+                    <select style={createField} value={createSub} onChange={(event) => setCreateSub(event.target.value)}>
+                      <option value="">(không dùng subdomain)</option>
+                      {(mailRoots.find((r) => r.root === createRoot)?.subdomains || []).map((s) => <option key={s} value={s}>{s}</option>)}
+                    </select>
+                  </label>
+                  <label style={createFieldLabel}>Số lượng (1–50)
+                    <input style={createField} type="number" min="1" max="50" value={createCount} onChange={(event) => setCreateCount(event.target.value)} />
+                  </label>
+                  <label style={createFieldLabel}>Tag (tuỳ chọn)
+                    <input style={createField} type="text" value={createTag} onChange={(event) => setCreateTag(event.target.value)} placeholder="ChatGPT Team" />
+                  </label>
+                </div>
+                <div style={{ fontSize: 12.5, opacity: 0.7, marginTop: 10 }}>
+                  Sẽ tạo trên: <b>{createSub || createRoot || "—"}</b>{createTag.trim() ? <> · tag <b>{createTag.trim()}</b></> : null}
+                </div>
+                {createError && <div className="dialog-error" role="alert"><CircleAlert size={15} />{ts(createError)}</div>}
+                <div className="dialog-footer">
+                  <button type="button" className="cancel-button" onClick={() => { setCreateOpen(false); setCreateResult(null); }} disabled={createBusy}>Huỷ</button>
+                  <button type="submit" className="primary-button" disabled={createBusy || !(Number(createCount) >= 1 && Number(createCount) <= 50)}>
+                    {createBusy ? <LoaderCircle className="spin" size={17} /> : <Plus size={17} />}
+                    Tạo {Number(createCount) || ""} email
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <div style={{ fontSize: 13, opacity: 0.85, margin: "6px 0 8px" }}>
+                  Đã tạo <b>{createResult.boxes.length}</b> email trên <b>{createResult.domain}</b>
+                  {createResult.tag ? <> · tag <b>{createResult.tag}</b></> : null}
+                  {createResult.errors?.length ? <> · <span style={{ color: "#dc2626" }}>{createResult.errors.length} lỗi</span></> : null}
+                </div>
+                <div style={{ maxHeight: 270, overflowY: "auto", border: "1px solid rgba(128,128,128,0.25)", borderRadius: 8 }}>
+                  {createResult.boxes.map((box) => (
+                    <div key={box.email} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, padding: "7px 11px", borderBottom: "1px solid rgba(128,128,128,0.12)", fontSize: 13 }}>
+                      <span style={{ fontFamily: "ui-monospace, Menlo, monospace", wordBreak: "break-all" }}>{box.email}</span>
+                      {box.tag ? <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 999, background: "rgba(16,162,113,0.15)", color: "#10a271", whiteSpace: "nowrap" }}>{box.tag}</span> : null}
+                    </div>
+                  ))}
+                </div>
+                {createResult.errors?.length ? (
+                  <div className="dialog-error" role="alert" style={{ marginTop: 8 }}><CircleAlert size={15} />{createResult.errors.join("; ")}</div>
+                ) : null}
+                <div className="dialog-footer">
+                  <button type="button" className="cancel-button" onClick={() => setCreateResult(null)}>Tạo thêm</button>
+                  <button type="button" className="cancel-button" onClick={copyCreatedEmails}>Copy email</button>
+                  <button type="button" className="primary-button" onClick={sendCreatedToBatch}>
+                    <ListPlus size={17} />
+                    Đưa vào Thêm hàng loạt
+                  </button>
+                </div>
+              </>
+            )}
+          </form>
+        </div>
+      )}
       {filterOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
           if (event.target === event.currentTarget) setFilterOpen(false);
@@ -2026,6 +2180,41 @@ function formatRelativeMonitorTime(value) {
   if (elapsed < 60_000) return t("刚刚检查");
   if (elapsed < 60 * 60_000) return tf("{0} 分钟前检查", Math.floor(elapsed / 60_000));
   return tf("{0} 小时前检查", Math.floor(elapsed / (60 * 60_000)));
+}
+
+const createField = {
+  width: "100%",
+  marginTop: 4,
+  padding: "8px 10px",
+  borderRadius: 8,
+  border: "1px solid rgba(128,128,128,0.35)",
+  background: "rgba(128,128,128,0.08)",
+  color: "inherit",
+  font: "inherit",
+};
+const createFieldLabel = { display: "block", fontSize: 12.5, opacity: 0.7 };
+const proxyFmtBtn = {
+  padding: "3px 11px",
+  fontSize: 12.5,
+  borderRadius: 7,
+  border: "1px solid rgba(128,128,128,0.4)",
+  background: "rgba(128,128,128,0.1)",
+  color: "inherit",
+  cursor: "pointer",
+};
+
+// Convert a proxy string to a full URL with the chosen scheme. Accepts the
+// "host:port:user:pass" (or "host:port") colon form that most providers give,
+// and an existing scheme://… URL (just swaps the scheme).
+function toProxyUrl(value, scheme) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  const hasScheme = text.match(/^[a-z][a-z0-9+.-]*:\/\/(.*)$/i);
+  if (hasScheme) return `${scheme}://${hasScheme[1]}`;
+  const parts = text.split(":").map((p) => p.trim());
+  if (parts.length === 4) return `${scheme}://${parts[2]}:${parts[3]}@${parts[0]}:${parts[1]}`;
+  if (parts.length === 2) return `${scheme}://${parts[0]}:${parts[1]}`;
+  return `${scheme}://${text}`;
 }
 
 async function apiFetch(token, url, options = {}) {
