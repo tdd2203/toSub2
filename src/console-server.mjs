@@ -16,7 +16,8 @@ import {
   validateMailApiUrl,
 } from "./mail-otp.mjs";
 import { createSmsProvider, publicSmsProviderDefinitions } from "./sms-providers.mjs";
-import { DirectTlsProfileProbe, proxySupportsSessionRotation } from "./tls-transport.mjs";
+import { fetchSmsBowerServiceCatalog, parseSmsBowerServiceCatalog } from "./smsbower.mjs";
+import { DirectTlsProfileProbe, proxySupportsSessionRotation, TlsFingerprintTransport } from "./tls-transport.mjs";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 4399;
@@ -82,6 +83,7 @@ let mailRequestConfig = { method: "GET", url: null, headers: {} };
 // macOS Keychain so the console can create mailboxes and auto-read OTP codes
 // without a separate connector or a hand-pasted Authorization header. ----
 const MAIL_API_BASE = "https://mail.magicskill.org/emailservice/api/v1";
+const MAIL_API_HOST = new URL(MAIL_API_BASE).host; // mail.magicskill.org — used to auto-attach the Keychain Bearer
 const MAIL_KEYCHAIN_SERVICE = "magicskill-email-api";
 function readMailApiKey() {
   try {
@@ -111,6 +113,78 @@ async function mailApi(path, { method = "GET", body } = {}) {
   let json;
   try { json = JSON.parse(text); } catch { json = text; }
   return { ok: res.ok, status: res.status, json };
+}
+
+// Public IP of the machine running this console (fetched directly, no proxy),
+// cached briefly. Used to show the user which IP accounts get if they opt to
+// create on the machine's own network instead of a proxy.
+let machineIpCache = { ip: "", at: 0 };
+async function fetchMachinePublicIp() {
+  if (machineIpCache.ip && Date.now() - machineIpCache.at < 60_000) return machineIpCache.ip;
+  const sources = ["https://api.ipify.org?format=json", "https://ifconfig.co/json", "https://ipinfo.io/json"];
+  for (const url of sources) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 6_000);
+      const res = await fetch(url, { headers: { accept: "application/json" }, signal: controller.signal });
+      clearTimeout(timer);
+      if (!res.ok) continue;
+      const data = await res.json();
+      const ip = String(data.ip || data.query || "").trim();
+      if (ip) {
+        machineIpCache = { ip, at: Date.now() };
+        return ip;
+      }
+    } catch {
+      // try next source
+    }
+  }
+  return "";
+}
+
+// Check that a proxy actually connects by routing an IP-echo request through it
+// (same TLS transport used for onboarding) and returning the proxy's exit IP.
+async function checkProxyExitIp(proxyUrl) {
+  const url = String(proxyUrl || "").trim();
+  if (!url) return { ok: false, error: "缺少代理地址" };
+  let transport = null;
+  try {
+    transport = new TlsFingerprintTransport({ cloudflareSolver: false });
+    const res = await transport.fetch("https://api.ipify.org?format=json", {
+      method: "GET",
+      proxy: url,
+      timeoutMs: 12_000,
+    });
+    if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
+    const data = await res.json().catch(() => null);
+    const ip = String(data?.ip || "").trim();
+    return ip ? { ok: true, ip } : { ok: false, error: "无法解析出口 IP" };
+  } catch (error) {
+    // Never leak proxy credentials in the error text.
+    const message = String(error?.message || error).replace(/\/\/[^/@\s]*@/g, "//***@").slice(0, 200);
+    return { ok: false, error: message };
+  } finally {
+    if (transport) await transport.close().catch(() => {});
+  }
+}
+
+// SMSBower price catalog per service, cached briefly (the raw response is large).
+const smsBowerCatalogCache = new Map(); // serviceId -> { at, data }
+async function fetchSmsBowerCatalogCached(serviceId) {
+  const key = String(serviceId);
+  const cached = smsBowerCatalogCache.get(key);
+  if (cached && Date.now() - cached.at < 60_000) return cached.data;
+  try {
+    const raw = await fetchSmsBowerServiceCatalog(key, { webBase: process.env.SMSBOWER_WEB_BASE });
+    const data = parseSmsBowerServiceCatalog(raw, key);
+    if (data) {
+      smsBowerCatalogCache.set(key, { at: Date.now(), data });
+      return data;
+    }
+  } catch (error) {
+    console.warn(`[warn] SMSBower 价格目录获取失败：${String(error?.message || error).slice(0, 180)}`);
+  }
+  return cached?.data || null;
 }
 
 const sub2ApiRequestControllers = new Set();
@@ -247,6 +321,7 @@ async function handleApi(req, res, requestUrl) {
         sourceExport: true,
         cancelAll: true,
         sub2apiUpload: true,
+        sub2apiBackfill: true,
         sub2apiMonitor: true,
         tlsFingerprint: true,
         totpSetup: true,
@@ -309,6 +384,72 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
+  // Public IP of THIS machine (no proxy) — shown to the user when they choose to
+  // create accounts on the machine's own network instead of a proxy.
+  if (req.method === "GET" && requestUrl.pathname === "/api/machine-ip") {
+    const ip = await fetchMachinePublicIp();
+    sendJson(res, ip ? 200 : 502, ip ? { ip } : { error: "无法获取本机公网 IP" });
+    return;
+  }
+
+  // Test a proxy and return its exit IP so the user can see it is connected.
+  if (req.method === "POST" && requestUrl.pathname === "/api/proxy-check") {
+    const body = await readJson(req);
+    const result = await checkProxyExitIp(body.proxyUrl);
+    sendJson(res, result.ok ? 200 : 502, result.ok ? { ip: result.ip } : { error: result.error || "代理连接失败" });
+    return;
+  }
+
+  // Proxy IP list overview: for each configured proxy, report connection status,
+  // exit IP, the mailboxes registered through that proxy (grouped by host:port),
+  // and how many more accounts it can still register (limitPerIp − used).
+  if (req.method === "POST" && requestUrl.pathname === "/api/proxies/status") {
+    const body = await readJson(req);
+    const limitPerIp = Math.min(999, Math.max(1, Math.trunc(Number(body.limitPerIp)) || 15));
+    const mode = body.mode === "batch" ? "batch" : "single";
+    let urls = [];
+    if (mode === "batch") {
+      urls = parseProxyList(body.proxies).map(proxyObjToUrl);
+    } else {
+      const one = normalizeProxyUrl(body.proxies);
+      if (one) urls = [one];
+    }
+    // Group existing jobs by their proxy's host:port (the proxy "IP").
+    const emailsByKey = new Map();
+    for (const job of listUniqueJobs()) {
+      if (job.deleted || !job.proxyUrl) continue;
+      const parsed = parseProxyUrlForSub2Api(job.proxyUrl);
+      if (!parsed) continue;
+      const key = `${parsed.host}:${parsed.port}`;
+      if (!emailsByKey.has(key)) emailsByKey.set(key, []);
+      emailsByKey.get(key).push({ email: job.email, status: job.status });
+    }
+    const proxies = await mapWithConcurrency(urls, 6, async (url) => {
+      const parsed = parseProxyUrlForSub2Api(url);
+      const key = parsed ? `${parsed.host}:${parsed.port}` : url;
+      const emails = emailsByKey.get(key) || [];
+      const check = await checkProxyExitIp(url);
+      const emailCount = emails.length;
+      return {
+        host: parsed?.host || "",
+        port: parsed?.port || 0,
+        protocol: parsed?.protocol || "",
+        label: parsed ? `${parsed.host}:${parsed.port}` : url,
+        connected: check.ok,
+        ip: check.ip || "",
+        error: check.ok ? "" : (check.error || ""),
+        emails: emails.map((e) => e.email),
+        completed: emails.filter((e) => e.status === "completed").length,
+        emailCount,
+        remaining: Math.max(0, limitPerIp - emailCount),
+      };
+    });
+    const activeCount = proxies.filter((p) => p.connected).length;
+    const remaining = proxies.filter((p) => p.connected).reduce((sum, p) => sum + p.remaining, 0);
+    sendJson(res, 200, { limitPerIp, mode, totalCount: proxies.length, activeCount, remaining, proxies });
+    return;
+  }
+
   // Create N mailboxes (optionally on a chosen domain, optionally tagged) and
   // return ready-to-add "email----otpUrl" lines for the batch box.
   if (req.method === "POST" && requestUrl.pathname === "/api/mail/create") {
@@ -332,6 +473,64 @@ async function handleApi(req, res, requestUrl) {
       line: `${mb.email}----${MAIL_API_BASE}/mailboxes/${encodeURIComponent(mb.email)}/otp`,
     }));
     sendJson(res, 200, { created: r.json.created ?? boxes.length, boxes, errors: r.json.errors || [] });
+    return;
+  }
+
+  // List existing mailboxes for the "Danh sách email" panel. Optional ?tag= / ?domain= filters.
+  if (req.method === "GET" && requestUrl.pathname === "/api/mail/mailboxes") {
+    const r = await mailApi("/mailboxes");
+    if (!r.ok) {
+      sendJson(res, r.status, { error: (r.json && r.json.detail) || `HTTP ${r.status}` });
+      return;
+    }
+    const tagFilter = requestUrl.searchParams.get("tag");
+    const domainFilter = requestUrl.searchParams.get("domain");
+    let list = (r.json.mailboxes || []).map((mb) => {
+      const email = mb.email;
+      const otpUrl = `${MAIL_API_BASE}/mailboxes/${encodeURIComponent(email)}/otp`;
+      // Has this mailbox already been used to onboard a ChatGPT account?
+      const job = findJobByEmail(email);
+      const accountCreated = job?.status === "completed";
+      return {
+        id: mb.id,
+        email,
+        tag: mb.tag || null,
+        category: mb.category || null,
+        created_at: mb.created_at || null,
+        last_message_at: mb.last_message_at || null,
+        suspended: Boolean(mb.suspended),
+        domain: String(email || "").split("@")[1] || "",
+        accountCreated,
+        accountStatus: job?.status || null,
+        otpUrl,
+        line: `${email}----${otpUrl}`,
+      };
+    });
+    if (tagFilter) list = list.filter((m) => (m.tag || "") === tagFilter);
+    if (domainFilter) list = list.filter((m) => m.domain === domainFilter || m.domain.endsWith(`.${domainFilter}`));
+    // Mailboxes already used for an account sink to the bottom; within each
+    // group, newest first so freshly created ones are easy to find.
+    list.sort((a, b) => {
+      if (a.accountCreated !== b.accountCreated) return a.accountCreated ? 1 : -1;
+      return String(b.created_at || "").localeCompare(String(a.created_at || ""));
+    });
+    sendJson(res, 200, { mailboxes: list, total: list.length });
+    return;
+  }
+
+  // Delete one mailbox (the frontend confirms with the user before calling this).
+  if (req.method === "DELETE" && requestUrl.pathname === "/api/mail/mailbox") {
+    const email = String(requestUrl.searchParams.get("email") || "").trim();
+    if (!email) {
+      sendJson(res, 400, { error: "Thiếu email" });
+      return;
+    }
+    const r = await mailApi(`/mailboxes/${encodeURIComponent(email)}`, { method: "DELETE" });
+    if (!r.ok) {
+      sendJson(res, r.status, { error: (r.json && r.json.detail) || `HTTP ${r.status}` });
+      return;
+    }
+    sendJson(res, 200, { status: (r.json && r.json.status) || "deleted", email });
     return;
   }
 
@@ -529,7 +728,54 @@ async function handleApi(req, res, requestUrl) {
     const payload = await buildSub2ApiUploadPayload(downloadable);
     const idempotencyKey = `tosub2-upload-${crypto.randomUUID()}`;
 
-    const accounts = payload.accounts.map((account) => {
+    // Step 2: resolve a proxy_id for each account.
+    //  - batch mode: create a shared list of proxies, then hand each proxy up to
+    //    `limitPerIp` accounts in sequence before moving to the next proxy.
+    //  - single mode: create each account's own registration proxy and link it.
+    const proxyLink = body.proxyLink && typeof body.proxyLink === "object" ? body.proxyLink : null;
+    const batchMode = proxyLink?.mode === "batch";
+    let proxiesCreated = 0;
+    let unassigned = 0;
+    let proxyIdForAccount;
+    if (batchMode) {
+      const limitPerIp = Math.max(1, Math.floor(Number(proxyLink.limitPerIp) || 15));
+      const batchObjs = parseProxyList(proxyLink.proxies);
+      if (batchObjs.length === 0) throw httpError(400, "批量代理列表为空或格式不正确");
+
+      // Keep each account's own registration proxy when it is still alive; only
+      // accounts without a (working) proxy draw from the batch list (15/IP).
+      const oldProxyByKey = new Map();
+      for (const p of payload.proxies) if (p?.proxy_key) oldProxyByKey.set(p.proxy_key, p);
+      const liveOldKeys = new Set();
+      for (const [key, p] of oldProxyByKey) {
+        const check = await checkProxyExitIp(proxyObjToUrl(p));
+        if (check.ok) liveOldKeys.add(key);
+      }
+      const oldIdByKey = new Map();
+      for (const key of liveOldKeys) {
+        const ids = await createSub2ApiProxyList(config, [oldProxyByKey.get(key)]);
+        if (ids[0]) { oldIdByKey.set(key, ids[0]); proxiesCreated += 1; }
+      }
+      const batchProxyIds = await createSub2ApiProxyList(config, batchObjs);
+      proxiesCreated += batchProxyIds.length;
+
+      let fill = 0;
+      proxyIdForAccount = (_index, account) => {
+        const key = account.proxy_key;
+        if (key && oldIdByKey.has(key)) return oldIdByKey.get(key); // old IP still works → keep it
+        const slot = Math.floor(fill / limitPerIp);
+        fill += 1;
+        return slot < batchProxyIds.length ? batchProxyIds[slot] : undefined;
+      };
+    } else {
+      const { idByKey, created } = await createSub2ApiProxyIds(config, payload.proxies);
+      proxiesCreated = created;
+      proxyIdForAccount = (_index, account) => (account.proxy_key ? idByKey.get(account.proxy_key) : undefined);
+    }
+
+    // Step 3: batch-create accounts, each carrying its proxy_id and group_ids.
+    const groupIds = config.groupIds.length ? config.groupIds : [3];
+    const accounts = payload.accounts.map((account, index) => {
       const { proxy_key: _proxyKey, ...accountData } = account;
       const credentials = { ...(account.credentials || {}) };
       const extra = {
@@ -539,17 +785,20 @@ async function handleApi(req, res, requestUrl) {
       if (config.modelWhitelist.length) {
         credentials.model_mapping = Object.fromEntries(config.modelWhitelist.map((model) => [model, model]));
       }
+      const resolvedProxyId = proxyIdForAccount(index, account);
+      if (!resolvedProxyId && !config.proxyId) unassigned += 1;
       return {
         ...accountData,
         credentials,
         extra,
         status: "active",
         schedulable: true,
-        group_ids: config.groupIds.length ? config.groupIds : (account.group_ids || []),
-        ...(config.proxyId ? { proxy_id: config.proxyId } : {}),
+        group_ids: groupIds,
+        ...(resolvedProxyId ? { proxy_id: resolvedProxyId } : (config.proxyId ? { proxy_id: config.proxyId } : {})),
         ...(config.concurrency !== null ? { concurrency: config.concurrency } : {}),
         ...(config.loadFactor !== null ? { load_factor: config.loadFactor } : {}),
         ...(config.priority !== null ? { priority: config.priority } : {}),
+        confirm_mixed_channel_risk: false,
       };
     });
     const result = await requestSub2Api(config, "/api/v1/admin/accounts/batch", {
@@ -558,13 +807,33 @@ async function handleApi(req, res, requestUrl) {
       body: JSON.stringify({ accounts }),
     });
 
+    // Tag every uploaded account so the console can tell at a glance which
+    // accounts have already been pushed to a Sub2API backend.
+    const uploadedAt = new Date().toISOString();
+    for (const job of downloadable) {
+      job.sub2apiUploadedAt = uploadedAt;
+      job.sub2apiUploadedBaseUrl = config.baseUrl;
+      touch(job);
+      await saveJobMetadata(job);
+    }
+
     sendJson(res, 200, {
       selected: selected.length,
       uploaded: downloadable.length,
       skipped: selected.length - downloadable.length,
-      groupIds: config.groupIds,
+      groupIds,
+      proxiesCreated,
+      unassigned,
       result,
     });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/backfill-tags") {
+    const body = await readJson(req);
+    const config = normalizeSub2ApiConfig(body.config);
+    const result = await backfillSub2ApiUploadTags(config);
+    sendJson(res, 200, result);
     return;
   }
 
@@ -592,6 +861,45 @@ async function handleApi(req, res, requestUrl) {
     if (!sub2ApiMonitorConfig?.enabled) throw httpError(409, "请先启用 Sub2API 号池监控");
     const result = await runSub2ApiMonitor("manual");
     sendJson(res, 200, { ...publicSub2ApiMonitorState(), result });
+    return;
+  }
+
+  // SMS cost ledger: itemized number purchases with outcome (charged / refunded / held).
+  if (req.method === "GET" && requestUrl.pathname === "/api/sms-costs") {
+    const rows = [];
+    const totals = { charged: 0, chargedCount: 0, refundedCount: 0, heldCount: 0, currency: "$" };
+    for (const job of listUniqueJobs()) {
+      for (const ev of (Array.isArray(job.smsCostEvents) ? job.smsCostEvents : [])) {
+        rows.push({
+          email: job.email,
+          provider: ev.provider || null,
+          serviceLabel: ev.serviceLabel || null,
+          number: ev.number || null,
+          price: typeof ev.price === "number" ? ev.price : null,
+          currency: ev.currency || "$",
+          status: ev.status,
+          at: ev.at || null,
+          resolvedAt: ev.resolvedAt || null,
+        });
+        if (ev.status === "charged") { totals.charged += Number(ev.price) || 0; totals.chargedCount += 1; }
+        else if (ev.status === "refunded") totals.refundedCount += 1;
+        else if (ev.status === "held") totals.heldCount += 1;
+      }
+    }
+    rows.sort((a, b) => String(b.at || "").localeCompare(String(a.at || "")));
+    totals.charged = Math.round(totals.charged * 1e6) / 1e6;
+    sendJson(res, 200, { rows, totals });
+    return;
+  }
+
+  // Public SMSBower price catalog (country -> quality/rank positions) for the picker.
+  if (req.method === "GET" && requestUrl.pathname === "/api/sms-providers/smsbower/catalog") {
+    const serviceId = /^\d{1,6}$/.test(requestUrl.searchParams.get("serviceId") || "")
+      ? requestUrl.searchParams.get("serviceId")
+      : "247";
+    const catalog = await fetchSmsBowerCatalogCached(serviceId);
+    if (!catalog) throw httpError(502, "无法获取 SMSBower 价格目录");
+    sendJson(res, 200, catalog);
     return;
   }
 
@@ -815,6 +1123,8 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
     autoRepairPendingAccountIds: [],
     autoRepairPendingBackend: null,
     autoRepairOperation: null,
+    sub2apiUploadedAt: null,
+    sub2apiUploadedBaseUrl: null,
     ...newSmsState(),
   };
   beginAuthorizationAutomationAttempt(job, "initial");
@@ -1728,6 +2038,7 @@ function consumeOutput(job, rawText) {
   if (scan.includes("[ok] Phone OTP validated")) {
     completeSmsNumber(job);
   }
+  applyLoginProgress(job, scan);
   if (scan.includes("[5/5] Select workspace") || scan.includes("[6/6] Convert OAuth callback")) {
     setStage(job, "finalizing", "正在完成授权并生成文件");
   }
@@ -2024,6 +2335,21 @@ async function acquireSmsNumber(job, providerId, config) {
     job.smsNumber = order.number;
     job.smsStatus = "number_acquired";
     job.smsError = null;
+    // Cost ledger: a number was taken → money is held until the code verifies
+    // (success = charged) or the number is released (cancel = refunded).
+    const smsPrice = Number(config?.maxPrice);
+    if (!Array.isArray(job.smsCostEvents)) job.smsCostEvents = [];
+    job.smsCostEvents.push({
+      id: crypto.randomUUID(),
+      provider: smsClient.name,
+      serviceLabel: smsClient.serviceLabel || null,
+      number: order.number,
+      price: Number.isFinite(smsPrice) && smsPrice >= 0 ? smsPrice : null,
+      currency: "$",
+      status: "held",
+      at: new Date().toISOString(),
+      resolvedAt: null,
+    });
     await saveJobMetadata(job);
     appendJobLog(job, `[sms] 已从 ${smsClient.name} 获取手机号并提交，等待短信发送结果。\n`);
     await submitJobInput(job, { action: "phone", value: order.number }, { source: "sms-provider" });
@@ -2122,6 +2448,19 @@ function stopSmsPolling(job) {
   job.smsPollToken = null;
 }
 
+// Settle the most recent "held" SMS cost event as charged (verified) or refunded (canceled).
+function settleSmsCost(job, status) {
+  const events = Array.isArray(job.smsCostEvents) ? job.smsCostEvents : null;
+  if (!events) return;
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    if (events[i].status === "held") {
+      events[i].status = status;
+      events[i].resolvedAt = new Date().toISOString();
+      return;
+    }
+  }
+}
+
 function releaseSmsNumber(job, nextStatus = "idle", errorMessage = null) {
   const requestId = job.smsOrderId;
   const smsClient = job.smsClient;
@@ -2139,6 +2478,7 @@ function releaseSmsNumber(job, nextStatus = "idle", errorMessage = null) {
     job.smsServiceLabel = null;
   }
   if (requestId && smsClient) {
+    settleSmsCost(job, "refunded"); // number released before verifying → refunded
     void smsClient.release(requestId).catch(() => {
       appendJobLog(job, `[sms] ${providerName} 号码释放请求失败，请在平台控制台检查订单。\n`);
     });
@@ -2156,6 +2496,7 @@ function completeSmsNumber(job) {
   job.smsLastSubmittedCode = null;
   job.smsStatus = "completed";
   job.smsError = null;
+  settleSmsCost(job, "charged"); // code verified → this number is charged (counts)
   appendJobLog(job, `[sms] 手机验证码已通过，正在完成 ${smsClient.name} 订单。\n`);
   if (smsClient.complete) {
     void smsClient.complete(requestId).catch((error) => {
@@ -2444,6 +2785,115 @@ async function buildSub2ApiUploadPayload(downloadable) {
     proxies: uniqueByJson(proxies),
     accounts,
   };
+}
+
+// Create each registration proxy (from the import bundle) in Sub2API and map its
+// proxy_key to the returned proxy id, so accounts can carry proxy_id in the
+// batch import. Proxies are already deduped within one upload (uniqueByJson), so
+// each distinct proxy is created once. Returns { idByKey: Map<proxy_key, id>, created }.
+async function createSub2ApiProxyIds(config, proxies) {
+  const idByKey = new Map();
+  let created = 0;
+  if (!Array.isArray(proxies) || proxies.length === 0) return { idByKey, created };
+  for (const proxy of proxies) {
+    if (!proxy?.proxy_key) continue;
+    // protocol restricted to http/https/socks5/socks5h by Sub2API.
+    const createdPayload = await requestSub2Api(config, "/api/v1/admin/proxies", {
+      method: "POST",
+      body: JSON.stringify({
+        name: proxy.name || `${proxy.host}:${proxy.port}`,
+        protocol: proxy.protocol,
+        host: proxy.host,
+        port: proxy.port,
+        username: proxy.username || "",
+        password: proxy.password || "",
+      }),
+    });
+    const id = Number(createdPayload?.data?.id ?? createdPayload?.id);
+    if (Number.isInteger(id) && id > 0) {
+      idByKey.set(proxy.proxy_key, id);
+      created += 1;
+    }
+  }
+  return { idByKey, created };
+}
+
+// Parse a proxy URL into a Sub2API proxy object, or null when invalid.
+function parseProxyUrlForSub2Api(value) {
+  const text = String(value || "").trim();
+  if (!text) return null;
+  let url;
+  try {
+    url = new URL(text);
+  } catch {
+    return null;
+  }
+  const protocol = { "http:": "http", "https:": "https", "socks5:": "socks5", "socks5h:": "socks5h" }[url.protocol];
+  const host = url.hostname;
+  const port = Number(url.port);
+  if (!protocol || !host || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+  const username = url.username ? decodeURIComponent(url.username) : "";
+  const password = url.password ? decodeURIComponent(url.password) : "";
+  return { name: `${host}:${port}`, protocol, host, port, username, password };
+}
+
+// Parse a newline/comma separated proxy list into unique Sub2API proxy objects,
+// preserving order (dedup by protocol|host|port|username).
+function parseProxyList(text) {
+  const seen = new Set();
+  const out = [];
+  for (const line of String(text || "").split(/[\r\n,]+/)) {
+    const proxy = parseProxyUrlForSub2Api(line);
+    if (!proxy) continue;
+    const key = `${proxy.protocol}|${proxy.host}|${proxy.port}|${proxy.username}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(proxy);
+  }
+  return out;
+}
+
+// Rebuild a proxy URL from a Sub2API proxy object (for health-checking old proxies).
+function proxyObjToUrl(p) {
+  const auth = p.username ? `${encodeURIComponent(p.username)}:${encodeURIComponent(p.password || "")}@` : "";
+  return `${p.protocol}://${auth}${p.host}:${p.port}`;
+}
+
+// Run an async mapper over items with a bounded number of concurrent workers,
+// preserving input order in the returned array.
+async function mapWithConcurrency(items, limit, mapper) {
+  const list = [...items];
+  const results = new Array(list.length);
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < list.length) {
+      const index = cursor++;
+      results[index] = await mapper(list[index], index);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(Math.max(1, limit), list.length || 1) }, worker));
+  return results;
+}
+
+// Create a list of proxies in Sub2API and return their ids in the same order.
+async function createSub2ApiProxyList(config, proxyObjs) {
+  const ids = [];
+  for (const proxy of proxyObjs) {
+    const createdPayload = await requestSub2Api(config, "/api/v1/admin/proxies", {
+      method: "POST",
+      body: JSON.stringify({
+        name: proxy.name,
+        protocol: proxy.protocol,
+        host: proxy.host,
+        port: proxy.port,
+        username: proxy.username || "",
+        password: proxy.password || "",
+      }),
+    });
+    const id = Number(createdPayload?.data?.id ?? createdPayload?.id);
+    if (Number.isInteger(id) && id > 0) ids.push(id);
+  }
+  return ids;
 }
 
 function normalizeSub2ApiConfig(value) {
@@ -2861,6 +3311,88 @@ async function listSub2ApiErrorAccounts(config) {
   return accounts;
 }
 
+// List every OpenAI account on the backend (all statuses). Used to backfill the
+// "uploaded to Sub2API" tag on local jobs by matching their email.
+async function listAllSub2ApiAccounts(config) {
+  const accounts = [];
+  let page = 1;
+  let pages = 1;
+  do {
+    const query = new URLSearchParams({
+      page: String(page),
+      page_size: "100",
+      platform: "openai",
+    });
+    const payload = await requestSub2Api(config, `/api/v1/admin/accounts?${query}`);
+    const data = payload?.data && typeof payload.data === "object" ? payload.data : payload;
+    const items = Array.isArray(data?.items) ? data.items : Array.isArray(data) ? data : [];
+    accounts.push(...items.filter((account) => account && String(account.platform || "openai") === "openai"));
+    const reportedPages = Number(data?.pages);
+    pages = Number.isSafeInteger(reportedPages) && reportedPages > 0
+      ? reportedPages
+      : items.length >= 100 ? page + 1 : page;
+    page += 1;
+  } while (page <= pages && page <= 1_000);
+  return accounts;
+}
+
+// Match local jobs to accounts that already exist on the configured backend (by
+// email) and tag them as uploaded. Honors accounts pushed before the tag
+// feature existed. Uses each backend account's created_at as the upload time
+// when available. Returns { tagged, alreadyTagged, backendAccounts }.
+async function backfillSub2ApiUploadTags(config) {
+  const backendAccounts = await listAllSub2ApiAccounts(config);
+  const timeByEmail = new Map();
+  for (const account of backendAccounts) {
+    const email = sub2ApiAccountEmail(account);
+    if (!email) continue;
+    const uploadedAt = account?.created_at || account?.updated_at || null;
+    const existing = timeByEmail.get(email);
+    // Keep the earliest known timestamp for an email.
+    if (!existing || (uploadedAt && String(uploadedAt) < String(existing))) {
+      timeByEmail.set(email, uploadedAt);
+    } else if (!timeByEmail.has(email)) {
+      timeByEmail.set(email, uploadedAt);
+    }
+  }
+
+  const fallback = new Date().toISOString();
+  let tagged = 0;
+  let alreadyTagged = 0;
+  for (const candidate of listUniqueJobs()) {
+    const email = candidate.email.toLowerCase();
+    if (!timeByEmail.has(email)) continue;
+    const uploadedAt = normalizeUploadTimestamp(timeByEmail.get(email)) || fallback;
+    await withEmailJobLock(candidate.email, async () => {
+      for (const job of [...jobs.values()].filter((item) => item.email.toLowerCase() === email && !item.deleted)) {
+        if (job.sub2apiUploadedAt) {
+          alreadyTagged += 1;
+          continue;
+        }
+        job.sub2apiUploadedAt = uploadedAt;
+        job.sub2apiUploadedBaseUrl = config.baseUrl;
+        touch(job);
+        await saveJobMetadata(job);
+        tagged += 1;
+      }
+    });
+  }
+  return { tagged, alreadyTagged, backendAccounts: backendAccounts.length, matchedEmails: timeByEmail.size };
+}
+
+// Coerce an arbitrary backend timestamp (ISO string or epoch seconds/ms) into an
+// ISO string, or null when it cannot be parsed.
+function normalizeUploadTimestamp(value) {
+  if (value == null || value === "") return null;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const ms = value < 1e12 ? value * 1000 : value;
+    const date = new Date(ms);
+    return Number.isNaN(date.getTime()) ? null : date.toISOString();
+  }
+  const date = new Date(String(value));
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
 function sub2ApiAccountEmail(account) {
   const direct = [account?.credentials?.email, account?.extra?.email]
     .map((value) => String(value || "").trim().toLowerCase())
@@ -3056,6 +3588,8 @@ function publicJob(job) {
     completedAt: job.completedAt,
     lastError: job.lastError,
     canDownload: Boolean(job.resultSaved),
+    sub2apiUploadedAt: job.sub2apiUploadedAt || null,
+    sub2apiUploadedBaseUrl: job.sub2apiUploadedBaseUrl || null,
     loginMode: job.loginMode || (job.mailApiUrl ? "email_otp" : "manual"),
     hasTotpKey: Boolean(job.totpSecret || job.hasTotpCredential),
     autoEmailOtp: Boolean(job.mailApiUrl),
@@ -3124,6 +3658,54 @@ function canAddPassword(job) {
   if (job.status === "completed" && job.resultSaved) return true;
   return Boolean(job.loginCheckpointAvailable)
     && ["phone", "phone_otp", "resume_available", "failed", "canceled", "reauth_required"].includes(job.status);
+}
+
+// Fine-grained "current operation" updates for the full/refresh login flow.
+// protocol-login.mjs emits many progress markers between the coarse stages, and
+// without surfacing them the current-operation column freezes on one message
+// (e.g. "verifying email code") for the whole password → 2FA → profile →
+// workspace → OAuth → phone stretch. Each entry maps a worker marker to the
+// working prompt shown while that step is the most recent event, in flow order.
+const LOGIN_PROGRESS_STEPS = [
+  ["[ok] 2FA verification accepted", "2FA 验证通过，正在继续登录"],
+  ["[sentinel] Requesting a fresh security token for account profile creation.", "正在创建账号资料"],
+  ["[ok] Account profile completed", "账号资料已创建，正在继续登录"],
+  ["[web] Select ChatGPT login workspace", "正在选择登录工作区"],
+  ["[2/5] Start Codex OAuth flow", "网页登录完成，正在进行授权"],
+  ["[ok] Phone OTP validated", "手机号验证通过，正在继续授权"],
+];
+
+// Prompts that mean the worker is waiting for the operator. A progress step is
+// surfaced only when it is newer than the latest of these, so a pending input
+// request is never overwritten by an earlier "in progress" line that is still
+// sitting in the rolling parser buffer.
+const LOGIN_INPUT_MARKERS = [
+  "Email OTP (r=resend, q=quit):",
+  "Password (q=quit):",
+  "2FA OTP (6 digits, q=quit):",
+  "Phone number, E.164 format",
+  "Phone OTP (r=resend, p=change phone, q=quit):",
+];
+
+function applyLoginProgress(job, scan) {
+  if (job.runMode !== "full" && job.runMode !== "refresh") return;
+  let stepPos = -1;
+  let stepPrompt = null;
+  for (const [marker, prompt] of LOGIN_PROGRESS_STEPS) {
+    const pos = scan.lastIndexOf(marker);
+    if (pos > stepPos) {
+      stepPos = pos;
+      stepPrompt = prompt;
+    }
+  }
+  if (stepPrompt === null) return;
+  let inputPos = -1;
+  for (const marker of LOGIN_INPUT_MARKERS) {
+    inputPos = Math.max(inputPos, scan.lastIndexOf(marker));
+  }
+  if (stepPos <= inputPos) return;
+  if (job.status === "working" && job.prompt === stepPrompt) return;
+  setStage(job, "working", stepPrompt);
 }
 
 function setStage(job, status, prompt) {
@@ -3422,6 +4004,7 @@ async function syncCompletedOutputs(force = false) {
           ...restoredTotpSetupState(metadata, storedCredentials),
           ...restoredProxyRiskState(metadata),
           ...restoredAutoRepairState(metadata),
+          ...restoredSub2ApiUploadState(metadata),
           totpSetupError: restoredOperation.totpSetupError,
           passwordAddError: restoredOperation.passwordAddError,
           passwordAddedAt: metadata.password_added_at || passwordRecovery.addedAt || null,
@@ -3431,6 +4014,7 @@ async function syncCompletedOutputs(force = false) {
           loginCheckpointAvailable: false,
           securityCheckRequired: Boolean(metadata.security_check_required),
           ...newSmsState(),
+          smsCostEvents: Array.isArray(metadata.sms_cost_events) ? metadata.sms_cost_events : [],
         });
         return;
       } catch {}
@@ -3515,6 +4099,7 @@ async function syncCompletedOutputs(force = false) {
           ...restoredTotpSetupState(metadata, storedCredentials),
           ...restoredProxyRiskState(metadata),
           ...restoredAutoRepairState(metadata),
+          ...restoredSub2ApiUploadState(metadata),
           totpSetupError: totpRecovery.error || null,
           passwordAddError: passwordRecovery.error || metadata.password_add_error || null,
           passwordAddedAt: metadata.password_added_at || passwordRecovery.addedAt || null,
@@ -3524,6 +4109,7 @@ async function syncCompletedOutputs(force = false) {
           loginCheckpointAvailable: true,
           securityCheckRequired: Boolean(metadata.security_check_required),
           ...restoredSmsState(metadata),
+          smsCostEvents: Array.isArray(metadata.sms_cost_events) ? metadata.sms_cost_events : [],
         });
       } catch {
         if (
@@ -3610,6 +4196,7 @@ async function syncCompletedOutputs(force = false) {
           ...restoredTotpSetupState(metadata, storedCredentials),
           ...restoredProxyRiskState(metadata),
           ...restoredAutoRepairState(metadata),
+          ...restoredSub2ApiUploadState(metadata),
           passwordAddError: metadata.password_add_error || null,
           passwordAddedAt: metadata.password_added_at || null,
           pendingNewPassword: null,
@@ -3618,6 +4205,7 @@ async function syncCompletedOutputs(force = false) {
           loginCheckpointAvailable: Boolean(metadata.login_checkpoint_available),
           securityCheckRequired: Boolean(metadata.security_check_required),
           ...newSmsState(),
+          smsCostEvents: Array.isArray(metadata.sms_cost_events) ? metadata.sms_cost_events : [],
         });
       }
     }));
@@ -3896,6 +4484,13 @@ function restoredAutoRepairState(metadata = {}) {
     autoRepairPendingAccountIds: [...new Set(pendingIds)],
     autoRepairPendingBackend: metadata.auto_repair_pending_backend || null,
     autoRepairOperation: null,
+  };
+}
+
+function restoredSub2ApiUploadState(metadata = {}) {
+  return {
+    sub2apiUploadedAt: metadata.sub2api_uploaded_at || null,
+    sub2apiUploadedBaseUrl: metadata.sub2api_uploaded_base_url || null,
   };
 }
 
@@ -4435,6 +5030,7 @@ async function saveJobMetadata(job) {
         sms_order_id: job.smsOrderId || null,
         sms_number: job.smsNumber || null,
         sms_status: job.smsStatus || null,
+        sms_cost_events: Array.isArray(job.smsCostEvents) ? job.smsCostEvents : [],
         last_auth_automated: Boolean(job.lastAuthAutomated),
         last_auth_automation_reason: job.lastAuthAutomationReason || null,
         last_auth_automated_at: job.lastAuthAutomatedAt || null,
@@ -4447,6 +5043,8 @@ async function saveJobMetadata(job) {
         auto_repair_last_error: job.autoRepairLastError || null,
         auto_repair_pending_account_ids: job.autoRepairPendingAccountIds || [],
         auto_repair_pending_backend: job.autoRepairPendingBackend || null,
+        sub2api_uploaded_at: job.sub2apiUploadedAt || null,
+        sub2api_uploaded_base_url: job.sub2apiUploadedBaseUrl || null,
         updated_at: new Date().toISOString(),
       };
       const tempPath = `${metadataPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
@@ -4628,9 +5226,18 @@ function normalizeMailRequestConfig(value) {
 }
 
 function mailRequestForJob(job) {
+  const headers = { ...(mailRequestConfig.headers || {}) };
+  // For magicskill mailbox URLs, always attach the Keychain Bearer key so OTP
+  // reading keeps working even if the browser overwrote the global config with
+  // 0 headers (the SPA POSTs mailRequestConfig from localStorage on load). The
+  // user's own Authorization header, if any, still takes precedence.
+  let sameHost = false;
+  try { sameHost = new URL(mailApiUrlForJob(job)).host === MAIL_API_HOST; } catch { sameHost = false; }
+  const hasAuth = Object.keys(headers).some((name) => name.toLowerCase() === "authorization");
+  if (mailApiKey && sameHost && !hasAuth) headers.authorization = `Bearer ${mailApiKey}`;
   return {
     method: mailRequestConfig.method,
-    headers: mailRequestConfig.headers,
+    headers,
     body: mailRequestConfig.method === "POST" ? job.mailRequestBody || "" : "",
   };
 }

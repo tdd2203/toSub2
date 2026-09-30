@@ -16,6 +16,8 @@
   --amber-soft: #fff6df;
   --blue: #2c609f;
   --blue-soft: #edf4fd;
+  --indigo: #4f46b8;
+  --indigo-soft: #eeecfb;
 }
 
 * { box-sizing: border-box; }
@@ -162,8 +164,79 @@ button { letter-spacing: 0; }
 .provider-field input { width: 100%; min-width: 0; border: 0; outline: 0; color: var(--ink); background: transparent; font-size: 12px; }
 .provider-field input::placeholder { color: #929b97; }
 .provider-field.service-field { width: 160px; }
-.account-proxy-input { width: min(270px, 28vw); min-width: 0; }
+.account-proxy-input { flex: 1 1 auto; min-width: 0; max-width: min(480px, 50vw); }
 .account-proxy-field { width: 100%; }
+
+/* Proxy format hover dropdown */
+.proxy-fmt-dropdown {
+  position: relative;
+  flex-shrink: 0;
+  z-index: 5;
+}
+.proxy-fmt-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 34px;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #53615b;
+  background: #fbfcfb;
+  border: 1px solid #ccd4d0;
+  border-radius: 5px 0 0 5px;
+  cursor: default;
+  white-space: nowrap;
+  transition: border-color .15s, background .15s, color .15s;
+}
+.proxy-fmt-dropdown:hover .proxy-fmt-trigger {
+  border-color: var(--blue);
+  color: var(--blue);
+  background: var(--blue-soft);
+}
+.proxy-fmt-menu {
+  position: absolute;
+  top: calc(100% + 3px);
+  left: 0;
+  min-width: 100%;
+  padding: 4px 0;
+  background: #fff;
+  border: 1px solid #ccd4d0;
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0,0,0,.1);
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(-4px);
+  transition: opacity .12s, visibility .12s, transform .12s;
+}
+.proxy-fmt-dropdown:hover .proxy-fmt-menu {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0);
+}
+.proxy-fmt-menu button {
+  display: block;
+  width: 100%;
+  padding: 7px 14px;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font-size: 12.5px;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  transition: background .1s;
+}
+.proxy-fmt-menu button:hover { background: var(--blue-soft); color: var(--blue); }
+
+/* Email action buttons group */
+.mail-actions-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+.mail-actions-group .provider-settings-button { margin-left: 2px; }
 .provider-ready { display: inline-flex; align-items: center; gap: 4px; color: var(--green-strong); font-size: 11px; font-weight: 700; }
 .provider-ready.incomplete { color: var(--amber); }
 .provider-external-link {
@@ -366,7 +439,18 @@ tbody tr:last-child td { border-bottom: 0; }
   font-size: 13px;
   font-weight: 750;
 }
-.account-details { min-width: 0; }
+.account-details { min-width: 0; flex: 1 1 auto; }
+.account-cell .account-badges {
+  margin-left: auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  justify-content: flex-end;
+  align-items: center;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.account-cell .account-badges .mail-mode { margin: 0; }
 .account-cell strong { display: block; overflow: hidden; text-overflow: ellipsis; color: var(--ink); font-size: 13px; white-space: nowrap; }
 .account-cell span { display: block; margin-top: 4px; color: #8a9490; font-size: 11px; }
 .account-cell .mail-mode {
@@ -387,6 +471,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .account-cell .mail-mode.error { color: var(--danger); background: var(--danger-soft); }
 .account-cell .mail-mode.password-mode { color: var(--blue); background: var(--blue-soft); }
 .account-cell .mail-mode.unknown-mode { color: var(--amber); background: var(--amber-soft); }
+.account-cell .mail-mode.sub2api-uploaded { color: var(--indigo); background: var(--indigo-soft); }
 
 .status-badge {
   min-height: 25px;
@@ -903,6 +988,25 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .sms-settings-dialog .settings-textarea:focus,
 .mail-request-settings-dialog .settings-textarea:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(18, 113, 91, .1); }
+
+/* "Domain áp dụng" chips: bounded scroll box so long domain lists never overflow the dialog or slip behind the sticky footer. */
+.mail-domain-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  gap: 8px;
+  margin-top: 6px;
+  min-height: 92px;
+  max-height: 150px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 10px;
+  background: #fbfcfb;
+  border: 1px solid #cdd5d1;
+  border-radius: 7px;
+}
+.mail-domain-chips label { font-weight: 600; }
+.mail-domain-chips input[type="checkbox"] { margin: 0; }
 .settings-field > .price-select-row {
   height: auto;
   padding: 0;
