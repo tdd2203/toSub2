@@ -1,82 +1,81 @@
 # toSub2
 
-QQ 交流群：`1085165735`
+> Fork of [poxiao33/toSub2](https://github.com/poxiao33/toSub2), optimized for security and user experience.
 
-[点击链接加入群聊【toSub2】](https://qm.qq.com/q/n40xuIClm8)
+toSub2 is a local web tool that logs into ChatGPT and completes Codex OAuth through protocol requests, automatically decides whether an account still needs a phone number, and produces a JSON file ready to import into sub2api.
 
-toSub2 是一个本地网页工具，通过协议请求完成 ChatGPT 登录和 Codex OAuth（授权登录），自动判断账号是否需要绑定手机号，并生成可供 sub2api 导入的 JSON（结构化数据）文件。
+> This project is not affiliated with OpenAI. Upstream login endpoints can change at any time.
 
-> 本项目不是 OpenAI 官方项目。上游登录接口随时可能变化。
+![toSub2 console](docs/console.png)
 
-![toSub2 控制台](docs/console.png)
+## Workflow
 
-## 工作流程
+1. Sign in to ChatGPT with an email verification code or a password.
+2. When the account has 2FA enabled, generate and submit the TOTP automatically.
+3. Start Codex OAuth (authorization login).
+4. Read the server response to decide whether the account is already bound to a phone number.
+5. If it is not, go through SMS verification: manual number, LubanSMS, SMSBower, or a custom code API.
+6. Pick a workspace and exchange the OAuth token.
+7. Generate a standard `sub2api-data` import file.
 
-1. 通过邮箱验证码或密码登录 ChatGPT。
-2. 账号启用 2FA（双重身份验证）时，自动生成并提交 TOTP（基于时间的一次性密码）。
-3. 发起 Codex OAuth（授权登录）。
-4. 根据服务端响应判断账号是否已经绑定手机号。
-5. 未绑定手机号时进入短信验证，支持手动号码、LubanSMS（鲁班接码）、SMSBower（短信接码平台）或自定义接码 API（接口）。
-6. 选择 workspace（工作区），兑换 OAuth Token（授权令牌）。
-7. 生成标准 `sub2api-data` 导入文件。
+## Features
 
-## 主要功能
+- Local web console that manages many login tasks at once.
+- Up to 20 tasks run in parallel; the rest queue automatically.
+- Manual email verification codes, or automatic pickup through an email code API.
+- Password login, plus 2FA after either a password or an email-code login.
+- Built-in temporary mailbox creation: pick a domain (root or subdomain), a count and an optional tag, generate the addresses, and drop them straight into the batch box.
+- Accounts already signed in to ChatGPT can create new TOTP 2FA one at a time or in bulk, without first binding a phone number or finishing Codex OAuth. The activation code is generated and submitted automatically, the secret never lands in the protocol log, and the original flow can continue afterwards.
+- Passwordless accounts can get a random strong password added, one at a time or in bulk; accounts that already have one are skipped. Email codes can be picked up automatically or entered by hand; on success the local account record is updated. Only a saved email-login checkpoint is required, not a phone binding or Codex OAuth.
+- Accounts already bound to a phone number are skipped automatically.
+- Unbound accounts support a manual phone number and code, plus automatic number rental and code pickup via LubanSMS, SMSBower, or a custom number pool.
+- A checkpoint is saved as soon as email login succeeds, so an interrupted run can resume at the phone step.
+- Single and bulk re-authorization: "re-authorize" reuses an existing refresh token first, while "re-login and authorize" skips the refresh token and old checkpoint and forces a full login and authorization.
+- Pagination, precise filtering, cross-page multi-select, bulk delete, stop-all, bulk re-authorization, and bulk download.
+- Optional five-minute watch over faulty Sub2API accounts: tasks that last logged in fully automatically are re-logged-in and their remote authorization is refreshed.
+- Final output is the sub2api import format, with a timestamp appended to the download filename.
 
-- 本地网页控制台，可同时管理多条登录任务。
-- 最多同时运行 20 条任务，超出后自动排队。
-- 支持手动邮箱验证码、邮箱收码 API（接口）自动取码。
-- 支持密码登录，以及密码或邮箱验证码登录后的 2FA（双重身份验证）。
-- 已完成 ChatGPT 登录的账号可以单个或批量创建新的 TOTP 2FA（基于时间的一次性密码），不要求先完成手机号绑定或 Codex 授权；程序会自动生成并提交激活验证码，密钥不会写入协议日志，设置完成后可继续原授权流程。
-- 无密码账号可以单个或批量添加随机强密码，已有密码的账号会自动跳过；支持邮箱 API 自动收码或手动输入验证码，成功后会更新本地账号原始信息。账号只要已保存邮箱登录检查点即可添加密码，不要求先完成手机号绑定或 Codex 授权；添加后可继续原授权流程。
-- 自动跳过已经完成手机号绑定的账号。
-- 未绑定账号支持手动手机号、手动短信验证码，以及 LubanSMS、SMSBower、自定义号码池自动取号收码。
-- 邮箱登录成功后立即保存 checkpoint（检查点），中断后可继续手机号流程。
-- 支持单个和批量重新授权；“重新授权”优先使用已有 Refresh Token（刷新令牌），“重新登录并授权”会跳过刷新令牌和旧检查点，强制重新完成登录与授权。
-- 支持分页、精确筛选、跨页多选、批量删除、停止全部、批量重新授权和批量下载。
-- 可每 5 分钟巡检 Sub2API 异常账号，对上次全自动登录的任务自动重新登录并更新远端授权。
-- 最终输出 sub2api 导入格式，下载文件名自动附带时间戳。
+## Requirements
 
-## 环境要求
+- Node.js 20 or later (Node.js 22 recommended).
+- Python 3.9 or later. The default protocol-login flow needs `curl_cffi` (a browser-TLS-fingerprint HTTP library), even without a proxy.
+- On macOS, passwords, 2FA secrets, and account proxies are persisted in the Keychain.
+- On Windows they are encrypted with the current user's DPAPI; the ciphertext lives in `%LOCALAPPDATA%\toSub2\credentials` and can only be decrypted by the same Windows user.
+- On Linux the email-code flow still works, but passwords, 2FA secrets, and account proxies are not persisted; after a restart, queued tasks that had a proxy configured will not silently fall back to the local network.
 
-- Node.js 20 或更高版本，建议使用 Node.js 22。
-- Python 3.9 或更高版本；默认协议登录流程需要安装 `curl_cffi`（浏览器 TLS 指纹请求库），即使不使用代理也需要。
-- macOS 使用 Keychain（钥匙串）持久保存密码、2FA 密钥和账号代理。
-- Windows 使用当前用户的 DPAPI（数据保护接口）加密保存上述数据，密文位于 `%LOCALAPPDATA%\toSub2\credentials`，只能由同一个 Windows 用户解密。
-- Linux 仍可使用邮箱验证码流程，但目前不持久保存密码、2FA 密钥和账号代理；服务重启后不会让原本配置代理的排队任务悄悄改用本机网络。
-
-## 安装与启动
+## Install and run
 
 ```bash
-git clone https://github.com/poxiao33/toSub2.git
+git clone https://github.com/tdd2203/toSub2.git
 cd toSub2
 npm install
 python -m pip install -r requirements.txt
 npm run dev
 ```
 
-默认访问地址：
+Default address:
 
 ```text
 http://127.0.0.1:4399
 ```
 
-指定其他端口：
+Use a different port:
 
 ```bash
 npm run dev -- --port 4400
 ```
 
-允许局域网设备访问：
+Allow devices on the local network:
 
 ```bash
 npm run dev -- --host 0.0.0.0
 ```
 
-局域网模式没有访问认证，只应在可信网络内短时间使用。
+LAN mode has no access authentication, so only use it briefly inside a trusted network.
 
-### PM2（Node.js 进程管理器）守护运行
+### Run as a daemon with PM2
 
-号池巡检依赖控制台服务持续运行。需要崩溃后自动重启或开机启动时，建议使用项目内置的 PM2 配置：
+The pool watcher needs the console service to keep running. For automatic restart after a crash, or start on boot, use the bundled PM2 config:
 
 ```bash
 npm install -g pm2
@@ -85,15 +84,15 @@ pm2 save
 pm2 startup
 ```
 
-`pm2 startup`（生成开机启动配置）会输出一条系统命令，继续执行该命令即可。默认使用 `127.0.0.1:4399` 和项目内的 `tmp/chatgpt-onboarding-console` 数据目录。
+`pm2 startup` prints a system command; run it to finish enabling start on boot. Defaults are `127.0.0.1:4399` and the in-project data directory `tmp/chatgpt-onboarding-console`.
 
-需要保留旧数据目录并开放局域网时，macOS/Linux 可以在首次启动时传入：
+To keep an existing data directory and open the LAN, pass the variables on first start. macOS/Linux:
 
 ```bash
 ONBOARDING_OUTPUT_ROOT=/path/to/existing-data ONBOARDING_HOST=0.0.0.0 npm run daemon:start
 ```
 
-Windows PowerShell（命令行）使用：
+Windows PowerShell:
 
 ```powershell
 $env:ONBOARDING_OUTPUT_ROOT="C:\path\to\existing-data"
@@ -101,7 +100,7 @@ $env:ONBOARDING_HOST="0.0.0.0"
 npm run daemon:start
 ```
 
-常用管理命令：
+Common management commands:
 
 ```bash
 npm run daemon:restart
@@ -109,156 +108,160 @@ npm run daemon:logs
 npm run daemon:stop
 ```
 
-PM2 只负责在进程异常退出后重启。toSub2 在正常关闭时仍会先取消巡检请求、停止登录任务并保存任务状态。
+PM2 only restarts the process after an abnormal exit. On a normal shutdown, toSub2 still cancels watcher requests, stops login tasks, and saves task state first.
 
-## 账号代理和 TLS 指纹
+## Account proxy and TLS fingerprint
 
-网页顶部的“代理 IP”输入框配置账号登录使用的代理。支持以下格式：
+The "Proxy IP" box at the top of the page sets the proxy used for account login. Supported formats:
 
 ```text
-http://用户名:密码@主机:端口
-socks5h://用户名:密码@主机:端口
+http://user:pass@host:port
+socks5h://user:pass@host:port
 socks5h://account-id:proxy-secret-JP-91977332-20m@proxy.example.com:1000
 ```
 
-如果用户名中存在 `-sid-xxxxxxxx-t-20`，或者密码中存在 `-JP-12345678-20m` 这样的会话字段，toSub2 会为每个任务随机生成新的会话编号，并使用 `curl_cffi` 的 Chrome 浏览器 TLS 指纹真实访问 `chatgpt.com` 检测出口。未配置代理时默认直接使用 `chrome146`，不在正常任务启动前筛选指纹；如果遇到 Cloudflare（云防护平台）挑战，会优先使用本地求解器处理，只有求解失败时才启动一次共享的直连 TLS 指纹筛选作为兜底，然后用筛选出的指纹重试当前任务。通过 `--tls-profile` 或 `TOSUB2_TLS_PROFILE` 显式指定时使用指定指纹，也可以显式指定 `auto` 才启用指纹探测。如果当前 Python `curl_cffi` 或底层库不支持指定指纹，会自动降级到兼容指纹，并把实际降级结果同步给后续流程。协议请求的 User-Agent、Client Hints、OAuth 请求头以及补充账号资料时的 Sentinel 浏览器环境都会跟随最终指纹版本，不再混用固定版本或不同操作系统环境。HTTP 风控响应会更换会话，最多使用 10 个有响应的代理会话；TLS、超时等纯连接失败不占这 10 次，但连续连接失败达到 20 次也会停止，避免网络异常时无限循环。代理检测通过后，如果在邮箱登录、2FA、手机号绑定、工作区选择或 OAuth（授权登录）阶段再次遇到 403 HTML 风控页，任务会清除本次无效登录状态、换新代理会话并从当前流程起点自动重试。没有可识别会话字段的固定代理不会重复轮换，失败后直接提示用户更换代理。
+A format helper next to the box converts a `host:port:user:pass` string into a full URL for either SOCKS5 or HTTP.
 
-代理首次检测通过后，正式登录和授权流程如果再次遇到明确的安全校验页面，会先保持当前代理出口重试最多 3 次；手机号验证码发送接口只有在 `400/409` 同时带有安全校验响应头或实际安全校验页面时才采用相同策略。连续 3 次重试后仍然触发风控，才会进入更换代理并重新授权流程。普通手机号不可用、`invalid_state` JSON 等业务错误不会触发代理重试，只提示用户更换当前手机号。
+If the username contains a session field like `-sid-xxxxxxxx-t-20`, or the password contains one like `-JP-12345678-20m`, toSub2 generates a fresh session id for every task and uses `curl_cffi` with a Chrome TLS fingerprint to reach `chatgpt.com` and check the exit. With no proxy configured it uses `chrome146` directly and does not screen fingerprints before a normal task starts. On a Cloudflare challenge it tries the local solver first, and only if that fails does it run a single shared direct-connection fingerprint screen as a fallback, then retries the task with the chosen fingerprint. An explicit `--tls-profile` or `TOSUB2_TLS_PROFILE` pins a fingerprint; pass `auto` to enable probing. If the local `curl_cffi` or its underlying library does not support the requested fingerprint, it falls back to a compatible one and passes the real result on to later steps. The protocol requests' User-Agent, Client Hints, OAuth headers, and the Sentinel browser environment used when filling in account details all follow the final fingerprint version rather than mixing a fixed version or a different OS.
 
-当响应包含可执行的 Cloudflare（云防护平台）挑战配置时，toSub2 会优先在当前 `curl_cffi` Session（会话）中运行父挑战和 Turnstile（人机验证）子挑战。获得 `cf_clearance` 后会使用同一代理出口、同一 TLS 指纹和同一 Cookie 会话重放原请求。只有挑战无法完成或重放后仍被拦截时，才进入上述同出口重试和随机会话编号兜底。该运行环境依赖 `jsdom`（网页环境模拟器），执行 `npm install` 时会自动安装。
+HTTP risk-control responses rotate the session, using up to 10 responding proxy sessions; pure connection failures (TLS, timeout) do not count against those 10, but 20 consecutive connection failures also stop the task to avoid an endless loop on a bad network. Once the proxy check passes, if a 403 HTML risk-control page appears again during email login, 2FA, phone binding, workspace selection, or OAuth, the task clears the failed login state, rotates to a new proxy session, and retries from the start of the current stage. A fixed proxy with no recognizable session field is not rotated; on failure it simply tells you to change the proxy.
 
-Sentinel（动态安全令牌）不再使用项目内置的静态 PoW/DX 生成器。每个登录会话会实时下载 Sentinel 加载器和当前版本 SDK，在独立的 `jsdom` 父页面和 iframe（内嵌页面）中执行，并由当前 Python `curl_cffi` Session 提交 SDK 产生的请求。生成过程复用账号当前代理、Cookie、设备 ID、TLS 指纹、User-Agent 和平台语言信息；代理会话或 `sid` 更换后会销毁旧 Sentinel 运行时并重新初始化。最终按服务端要求生成 `OpenAI-Sentinel-Token`，存在 Session Observer（会话观察器）数据时同时生成 `OpenAI-Sentinel-SO-Token`。
+After the first proxy check passes, if the real login and authorization flow hits a clear security-check page again, it keeps the current proxy exit and retries up to 3 times; the phone-code send endpoint only uses that strategy on a `400/409` that also carries a security-check response header or an actual security-check page. Only after 3 retries still trip risk control does it rotate the proxy and re-authorize. Business errors like an unusable phone number or `invalid_state` JSON do not trigger a proxy retry; they only prompt you to change the current phone number.
 
-代理输入为空时使用本机网络。页面设置保存在当前浏览器的 localStorage（本地存储）中；创建任务、重试和重新授权会读取输入框当前最新内容。任务实际使用的代理还会保存在系统安全凭据存储中，以便服务重启后恢复排队任务。代理密码不会写入 `job-meta.json`（任务元数据）或日志。
+When a response includes a runnable Cloudflare challenge config, toSub2 runs the parent challenge and the Turnstile sub-challenge inside the current `curl_cffi` session first. After it gets `cf_clearance`, it replays the original request over the same proxy exit, TLS fingerprint, and cookie session. Only if the challenge cannot complete, or the replay is still blocked, does it fall back to the same-exit retry and random session id above. This runtime depends on `jsdom`, installed automatically by `npm install`.
 
-Python 辅助进程默认使用 `python3`（macOS/Linux）或 `python`/`py -3`（Windows）。如果系统有多个 Python，可以设置环境变量 `TOSUB2_PYTHON` 指定解释器路径。
+Sentinel no longer uses a bundled static PoW/DX generator. Each login session downloads the Sentinel loader and the current SDK live, runs them in an isolated `jsdom` parent page and iframe, and submits the SDK's requests through the current `curl_cffi` session. Generation reuses the account's current proxy, cookies, device id, TLS fingerprint, User-Agent, and platform language; when the proxy session or `sid` changes, the old Sentinel runtime is destroyed and re-initialized. It produces `OpenAI-Sentinel-Token` as required, plus `OpenAI-Sentinel-SO-Token` when Session Observer data is present.
 
-## 批量添加格式
+An empty proxy box means the local network is used. Page settings are stored in the current browser's `localStorage`; creating a task, retrying, and re-authorizing read the box's latest value. The proxy a task actually used is also saved in the system credential store so queued tasks can be restored after a restart. The proxy password is never written to `job-meta.json` or the logs.
 
-每行一个账号。toSub2 会根据字段特征自动识别邮箱、密码、邮件接收 API 和 2FA 密钥，字段顺序不固定。现有 `----` 格式仍完全兼容：
+Python helper processes use `python3` (macOS/Linux) or `python` / `py -3` (Windows) by default. If several Python versions are installed, set `TOSUB2_PYTHON` to the interpreter path.
+
+## Batch add format
+
+One account per line. toSub2 recognizes the email, password, email code API, and 2FA secret by their shape, so field order is not fixed. The existing `----` format is still fully supported:
 
 ```text
-邮箱
-邮箱----邮箱收码接口
-邮箱----密码
-邮箱----密码----2FA身份验证密钥
-邮箱----密码----邮件接收API
-邮箱----密码----邮件接收API----2FA身份验证密钥
-邮箱----邮箱收码接口----2FA身份验证密钥
-邮箱--------2FA身份验证密钥
+email
+email----email-code-api
+email----password
+email----password----2FA-secret
+email----password----email-code-api
+email----password----email-code-api----2FA-secret
+email----email-code-api----2FA-secret
+email--------2FA-secret
 ```
 
-示例：
+Example:
 
 ```text
 name@example.com
 name2@example.com----https://mail.example/messages/account-token
-name3@example.com----账号密码----JBSWY3DPEHPK3PXP
-name4@example.com----账号密码----https://mail.example/messages/name4
-name5@example.com----账号密码----https://mail.example/messages/name5----JBSWY3DPEHPK3PXP
+name3@example.com----password----JBSWY3DPEHPK3PXP
+name4@example.com----password----https://mail.example/messages/name4
+name5@example.com----password----https://mail.example/messages/name5----JBSWY3DPEHPK3PXP
 name6@example.com----https://mail.example/messages/account-token----JBSWY3DPEHPK3PXP
 name7@example.com--------JBSWY3DPEHPK3PXP
 ```
 
-也可使用 `|`、Tab（制表符）、`::`、逗号、分号或连续空格分隔，例如：
+Fields may also be separated by `|`, tab, `::`, comma, semicolon, or runs of spaces:
 
 ```text
-https://mail.example/messages/name|JBSWY3DPEHPK3PXP|账号密码|name@example.co.uk
-JBSWY3DPEHPK3PXP::name+tag@example.dev::账号密码
+https://mail.example/messages/name|JBSWY3DPEHPK3PXP|password|name@example.co.uk
+JBSWY3DPEHPK3PXP::name+tag@example.dev::password
 ```
 
-解析器会先确定完整 URL（网址）、独立邮箱和 Base32（基础三十二进制）2FA 密钥，然后根据它们的边界推断分隔符，将剩余原文作为密码。因此密码内包含 `|` 等字符时也会尽量完整保留。邮箱中的合法短横线也会尽量合并回完整邮箱，不会直接把邮箱前半部分当成密码。如果一行存在多种可能的拆分方式、多个完整邮箱、URL 中的逗号或分号可能被当成字段分隔符，会明确报错并提示改用 `----`，不会静默猜测。仅有邮箱和 2FA 密钥的账号继续使用 `邮箱--------2FA密钥` 表示空密码；`邮箱----密码--------2FA密钥` 也会正确识别密码和 2FA。仅有邮箱、一个 Base32 字段和邮件 API 时，Base32 字段在 API 之前按密码保留，在 API 之后按 2FA 密钥处理；如果同时还有另一个普通字段，则 Base32 字段按 2FA。单独出现的 `http://` 或 `https://` 字段按邮件 API 处理，不支持自动区分“网址形式的密码”。邮箱支持多级域名及点、短横线、下划线、加号等常见前缀，不限制为 `.com` 后缀。邮箱是唯一字段，重复导入会更新原任务资料。
+The parser first locks the full URL, the standalone email, and the Base32 2FA secret, then infers the separator from their boundaries and keeps the rest as the password, so a password containing `|` and similar characters is preserved as far as possible. Legitimate hyphens inside an email are merged back into the full email rather than treating the local part as a password. If a line has more than one possible split, more than one full email, or a URL whose comma or semicolon could be read as a separator, it reports a clear error and asks you to use `----` instead of guessing silently. An account with only an email and a 2FA secret still uses `email--------2FA-secret` for an empty password; `email----password--------2FA-secret` is also parsed correctly. With only an email, one Base32 field, and an email API, the Base32 field is kept as the password before the API and treated as the 2FA secret after it; if another plain field is also present, the Base32 field is the 2FA secret. A lone `http://` or `https://` field is treated as the email API; a "URL-shaped password" is not auto-detected. Emails support multi-level domains and common prefixes with dots, hyphens, underscores, and plus signs, and are not limited to a `.com` suffix. The email is the only key, so re-importing updates the existing task.
 
-## 接码平台配置
+## SMS provider config
 
-网页顶部的“接码平台”区域可以打开统一配置页面。每个平台拥有独立配置，保存后写入当前浏览器的 localStorage（本地存储）；服务端不会持久保存 API Key（接口密钥）。
+The "SMS platform" area at the top of the page opens a shared config screen. Each platform is configured separately and saved to the current browser's `localStorage`; the server does not persist API keys.
 
-目前支持：
+Supported today:
 
-- LubanSMS：填写 API Key 和供应商编号。
-- SMSBower：填写 API Key 后手动点击“查询价格”，再从下拉框选择国家。列表按价格从低到高显示中文国家名称、价格和库存，不显示国家缩写和国际区号。
-- 自定义接码：每行填写 `+国际手机号----接码API`，一次最多 500 条。重复手机号以最后一行为准，并发任务按顺序获取未分配号码。
+- LubanSMS: enter the API key and the service id.
+- SMSBower: enter the API key, click "check prices", then pick a country from the dropdown. The list shows country names, prices, and stock, sorted by price.
+- Custom code API: one `+phone----code-api` per line, up to 500 at once. Duplicate numbers keep the last line, and parallel tasks take unassigned numbers in order.
 
 ```text
 +8613711111111----https://example.com/messages/13711111111
 +8613822222222----https://example.com/messages/13822222222
 ```
 
-任务到达手机号步骤后，可以使用当前选中的平台取号。SMSBower 取号时会带上用户选择时的最高价格，避免实时价格上涨后按更高价格购买。自定义接码在发送短信前会先记录接口中的旧验证码，只提交之后出现的新验证码。服务端会自动轮询短信、提取独立的 6 位数字验证码并提交。手动手机号和手动验证码流程始终保留。
+When a task reaches the phone step it rents a number from the selected platform. SMSBower rental carries the highest price you chose, so a later price rise does not buy at a higher one. The custom code API records the existing code before sending an SMS and only submits a newer one. The server polls SMS automatically, extracts the standalone 6-digit code, and submits it. Manual number and manual code flows are always available.
 
-新增平台时，通过统一 SmsProvider（短信平台适配器）接入，不需要复制任务轮询和状态处理代码。
+API keys are sent to the local service only with a rental request; they are never written to task metadata, the protocol log, or export files.
 
-API Key 只会随取号请求临时发送给本地服务，不会写入任务元数据、协议日志或导出文件。
+## Upload straight to Sub2API
 
-## 直接上传到 Sub2API
+When a task finishes, use the "upload" button on a single task, or "upload to Sub2API" in the top bulk actions, to write the generated OAuth account straight into a chosen Sub2API pool.
 
-任务完成后，可以在单个任务的“上传”按钮，或顶部批量操作中使用“上传到 Sub2API”，把生成的 OAuth（授权）账号直接写入指定的 Sub2API 后端号池。
+On first use, fill in the "Sub2API" config area:
 
-首次使用时，在页面的“Sub2API”配置区域填写：
+- The Sub2API backend address, for example `http://127.0.0.1:8080`.
+- The admin API key, sent in the `x-api-key` header.
+- Click "read config" to load the target pools and proxy list. Pools support multi-select; with none chosen, the backend's default pool is used.
+- Optionally set a shared proxy IP, concurrency, load factor, and priority. Leave a number blank to keep each account's own value.
+- Optionally list allowed models, one per line or comma-separated, for example `gpt-5`, `gpt-5-mini`.
 
-- Sub2API 后端地址，例如 `http://127.0.0.1:8080`。
-- 管理员 API Key（管理员接口密钥）。请求时通过 `x-api-key` 请求头发送。
-- 点击“读取配置”后读取目标号池和代理列表。号池支持多选；不选择具体分组时使用后端默认号池。
-- 可以统一指定代理 IP、并发数、负载因子和优先级。数字参数留空时保留每个账号原来的配置。
-- 可以填写允许使用的模型，每行一个，也支持逗号分隔，例如 `gpt-5`、`gpt-5-mini`。
+Upload options are saved to the current browser's `localStorage`. In a bulk upload, unfinished tasks are skipped, and the backend's reported failure count is shown in the console.
 
-上传选项会保存在当前浏览器的 `localStorage`（本地存储）。批量上传时，未完成的任务会自动跳过；服务端返回的创建失败数量会显示在控制台中。
+### Sub2API pool watch
 
-### Sub2API 号池监控
+With "watch faulty accounts every 5 minutes" enabled in the Sub2API config, the local service reads `error`-status accounts on the `openai` platform page by page, extracts the email, and matches a local task. With pools configured it checks only the selected pools; otherwise it checks all OpenAI accounts.
 
-在 Sub2API 配置中启用“每 5 分钟监控异常账号”后，本机服务会按页读取 `openai` 平台中状态为 `error` 的账号，提取邮箱并匹配本地任务。如果配置了号池，只检查所选号池；没有选择时检查全部 OpenAI 账号。
+A task is re-logged-in and re-authorized automatically only when all of these hold:
 
-只有同时满足以下条件的任务才会自动重新登录并授权：
+- The last full login succeeded, and the password, email code, and login 2FA were none of them entered by hand.
+- The last password and 2FA secret are still readable from the system credential store, and the email code API still exists.
+- The task is not currently running, queued, or doing something else.
 
-- 上次完整登录已成功，且密码、邮箱验证码、登录 2FA 均未由用户手动输入。
-- 上次用到的密码和 2FA 密钥仍能从系统凭据存储读取，邮箱收码 API 仍存在。
-- 任务当前没有运行、排队或执行其他操作。
+A manually entered phone binding or phone code does not affect eligibility, since an account usually only needs to bind once. After a successful re-authorization, toSub2 updates the credential by the Sub2API remote account id rather than creating a duplicate through the bulk-create endpoint; non-sensitive settings such as remote model mappings are preserved, and the account is restored to a schedulable state.
 
-手动输入绑定手机号或手机验证码不影响自动修复资格，因为账号通常只需绑定一次。自动授权成功后，toSub2 会按 Sub2API 远端账号 ID 更新凭据，不会通过批量创建接口新增重复账号；远端的模型映射等非敏感配置会保留，同时恢复账号为启用调度状态。
+A temporary network error, proxy risk control, `429`, or a brief Sub2API outage only triggers a 5-minute cooldown. If login returns a clear `account_deactivated`, `account_deleted`, or similar permanent status, the task is marked permanently skipped and not retried on the next pass. You can still click "re-login and authorize" to re-check an account by hand.
 
-临时网络错误、代理风控、`429` 或 Sub2API 短时不可用只会进入 5 分钟冷却。如果登录返回明确的 `account_deactivated`、`account_deleted` 或同类永久停用信息，任务会被标记为永久跳过，下次巡检不再重试。用户仍可手动点击“重新登录并授权”重新确认账号状态。
+With the watch on, the Sub2API backend address and admin API key are saved by the local service in `sub2api-monitor.json` in the data directory, but never in task metadata, the protocol log, the status endpoint, or export files.
 
-启用监控后，Sub2API 后端地址和管理员 API Key 会由本机服务保存在运行数据目录的 `sub2api-monitor.json` 中，但不会写入账号任务元数据、协议日志、状态接口或导出文件。
+## Output files
 
-## 输出文件
-
-任务运行数据默认保存在：
+Task run data is saved by default under:
 
 ```text
-tmp/chatgpt-onboarding-console/<任务 ID>/
+tmp/chatgpt-onboarding-console/<task-id>/
 ```
 
-每个完成任务会生成 `sub2api-import-oauth.json`。单账号和批量下载均输出标准 `sub2api-data` 格式。
+Each finished task produces `sub2api-import-oauth.json`. Single and bulk downloads both output the standard `sub2api-data` format.
 
-也可以直接使用 CLI（命令行工具）：
+You can also use the CLI directly:
 
 ```bash
 node src/protocol-login.mjs --email you@example.com --verbose
 ```
 
-查看全部参数：
+See all options:
 
 ```bash
 node src/protocol-login.mjs --help
 ```
 
-## 安全说明
+## Security notes
 
-- `tmp/` 中包含 Cookie（登录凭证）、OAuth Token（授权令牌）和登录检查点，禁止提交或分享。
-- Windows 保存的密码和 2FA 密钥由 DPAPI（数据保护接口）按当前用户加密，不会以明文写入任务目录。
-- sub2api 导入文件包含可用的授权令牌，应当按密码文件保护。
-- 不要把 API Key、密码、2FA 密钥、验证码、Cookie 或 Token 提交到 Git 仓库。
-- 网页控制台用于本机或可信局域网，不提供公网部署所需的身份认证。
-- 只处理你本人持有或已获得明确授权的账号。
+- `tmp/` holds cookies, OAuth tokens, and login checkpoints. Never commit or share it.
+- On Windows, saved passwords and 2FA secrets are encrypted for the current user with DPAPI and are not written in plaintext to the task directory.
+- A sub2api import file contains usable authorization tokens; protect it like a password file.
+- Never commit API keys, passwords, 2FA secrets, verification codes, cookies, or tokens to a Git repository.
+- The web console is for local or trusted-LAN use; it has no authentication for a public deployment.
+- Only work with accounts you own or are clearly authorized to manage.
 
-## 免责声明
+## Disclaimer
 
-本项目仅供学习、研究和管理本人账号使用，不隶属于 OpenAI，也未获得 OpenAI 背书。使用者应自行遵守 OpenAI 服务条款、相关平台规则以及所在地法律法规。因接口变更、账号限制、数据泄露或不当使用造成的后果由使用者自行承担。
+This project is for learning, research, and managing your own accounts. It is not affiliated with or endorsed by OpenAI. You are responsible for following OpenAI's terms, the relevant platform rules, and your local laws. Any consequences of endpoint changes, account limits, data leaks, or misuse are your own.
 
-## 更新日志
+## Changelog
 
-版本变化和升级说明请查看 [CHANGELOG.md](CHANGELOG.md)。
+See [CHANGELOG.md](CHANGELOG.md) for version history and upgrade notes.
 
-## License（开源许可证）
+## License
 
 [MIT](LICENSE)
+
+toSub2 was originally created by [poxiao33](https://github.com/poxiao33). Thank you to the original author for the project this fork builds on.
