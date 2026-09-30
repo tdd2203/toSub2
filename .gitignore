@@ -1,15 +1,38 @@
+# Dependencies / build output
 node_modules/
 __pycache__/
 *.py[cod]
 web/dist/
+.venv/
+
+# Runtime working data (may contain real emails, checkpoints, OAuth tokens)
 tmp/
+*.log
+
+# Secrets & credentials — never commit these
 .env
 .env.*
 !.env.example
-*.log
-.DS_Store
+*.pem
+*.key
+*.p12
+*.pfx
+*.dpapi
+*.enc
+credentials/
+secrets.json
+*.secret
+
+# Job / session artifacts produced at runtime
 chatgpt-protocol-session.json
 sub2api-import*.json
 login-checkpoint.json
+*-checkpoint.json
 job-meta.json
-.venv/
+password-add-result.json
+
+# OS / editor / local tooling
+.DS_Store
+.vscode/
+.idea/
+.claude/
