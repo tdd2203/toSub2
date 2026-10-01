@@ -11,6 +11,8 @@ const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "
 const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-sms-provider-"));
 const smsActions = [];
 let smsChecks = 0;
+let smsOrders = 0; // each getNumber must return a distinct number (the console now rejects reuse)
+let forceNextNumber = null; // when set, the next getNumber returns this exact ACCESS_NUMBER body (to simulate a used/duplicate number)
 let customInboxChecks = 0;
 const smsServer = http.createServer((req, res) => {
   const url = new URL(req.url || "/", "http://127.0.0.1");
@@ -29,7 +31,10 @@ const smsServer = http.createServer((req, res) => {
   const action = url.searchParams.get("action");
   smsActions.push({ action, status: url.searchParams.get("status"), maxPrice: url.searchParams.get("maxPrice") });
   let body = "BAD_ACTION";
-  if (action === "getNumber") body = "ACCESS_NUMBER:mock-activation:60123456789";
+  if (action === "getNumber") {
+    if (forceNextNumber) { body = forceNextNumber; forceNextNumber = null; }
+    else { smsOrders += 1; body = `ACCESS_NUMBER:mock-activation-${smsOrders}:60${String(1000000000 + smsOrders)}`; }
+  }
   if (action === "getStatus") body = ++smsChecks < 2 ? "STATUS_WAIT_CODE" : "STATUS_OK:654321";
   if (action === "getPrices") body = JSON.stringify({
     1001: { dr: { cost: 0.42, count: 12 } },
@@ -74,7 +79,7 @@ const childExit = new Promise((resolve) => child.once("exit", resolve));
 
 try {
   const bootstrap = await waitForJson(`${baseUrl}/api/bootstrap`);
-  assert.deepEqual(bootstrap.features.smsProviders.map((provider) => provider.id), ["luban", "smsbower", "custom"]);
+  assert.deepEqual(bootstrap.features.smsProviders.map((provider) => provider.id), ["luban", "smsbower", "viotp", "custom"]);
   const headers = { "content-type": "application/json", "x-console-token": bootstrap.token };
   const optionsResponse = await fetch(`${baseUrl}/api/sms-providers/smsbower/options`, {
     method: "POST",
@@ -147,6 +152,33 @@ try {
     smsActions.filter((item) => item.action === "setStatus" && item.status === "8").length,
     releasedOrderCount + 1,
   );
+
+  // ---- Phone-number reuse filter (each number used at most `maxUses` times) ----
+  const usageCfg = await (await fetch(`${baseUrl}/api/sms/number-usage`, { headers })).json();
+  assert.equal(usageCfg.maxUses, 1, "default per-number cap is 1");
+
+  // Account A takes a known number; it is now recorded as used (uses=1, cap=1).
+  forceNextNumber = "ACCESS_NUMBER:dup-activation-a:60999000111";
+  const filterA = await (await fetch(`${baseUrl}/api/jobs`, { method: "POST", headers, body: JSON.stringify({ email: "phone-filter-a@example.com" }) })).json();
+  await waitForJob(headers, filterA.job.id, (job) => job.status === "phone");
+  await fetch(`${baseUrl}/api/jobs/${filterA.job.id}/sms-number`, { method: "POST", headers, body: JSON.stringify({ providerId: "smsbower", config: { apiKey: "test-api-key", service: "dr", country: "1001", maxPrice: "0.42" } }) });
+  await waitForJob(headers, filterA.job.id, (job) => job.status === "completed");
+
+  // Account B: the provider first hands back the SAME (used-up) number, so the
+  // console must skip it and fetch another before submitting → 2 getNumber calls.
+  const getNumberBefore = smsActions.filter((i) => i.action === "getNumber").length;
+  forceNextNumber = "ACCESS_NUMBER:dup-activation-b:60999000111";
+  const filterB = await (await fetch(`${baseUrl}/api/jobs`, { method: "POST", headers, body: JSON.stringify({ email: "phone-filter-b@example.com" }) })).json();
+  await waitForJob(headers, filterB.job.id, (job) => job.status === "phone");
+  await fetch(`${baseUrl}/api/jobs/${filterB.job.id}/sms-number`, { method: "POST", headers, body: JSON.stringify({ providerId: "smsbower", config: { apiKey: "test-api-key", service: "dr", country: "1001", maxPrice: "0.42" } }) });
+  await waitForJob(headers, filterB.job.id, (job) => job.status === "completed");
+  const getNumberAfter = smsActions.filter((i) => i.action === "getNumber").length;
+  assert.ok(getNumberAfter - getNumberBefore >= 2, "console must skip a used number and fetch another");
+
+  // The configurable cap persists via the server endpoint (not the browser).
+  const bumped = await (await fetch(`${baseUrl}/api/sms/number-usage`, { method: "POST", headers, body: JSON.stringify({ maxUses: 3 }) })).json();
+  assert.equal(bumped.maxUses, 3);
+  await fetch(`${baseUrl}/api/sms/number-usage`, { method: "POST", headers, body: JSON.stringify({ maxUses: 1 }) });
 
   const customCreatedResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",

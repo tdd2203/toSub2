@@ -1,6 +1,15 @@
 import { createLubanSmsClient } from "./luban-sms.mjs";
 import { createSmsBowerClient } from "./smsbower.mjs";
+import { createViOtpClient } from "./viotp-sms.mjs";
 import { createCustomSmsClient } from "./custom-sms.mjs";
+
+// How far above the chosen tier's price a fallback purchase may go when that tier
+// is out of stock. Override with SMSBOWER_FALLBACK_PRICE_MULTIPLIER (>= 1).
+const DEFAULT_SMSBOWER_FALLBACK_MULTIPLIER = 2;
+function smsbowerFallbackMultiplier(options = {}) {
+  const raw = Number(options.smsBowerFallbackMultiplier ?? process.env.SMSBOWER_FALLBACK_PRICE_MULTIPLIER);
+  return Number.isFinite(raw) && raw >= 1 ? raw : DEFAULT_SMSBOWER_FALLBACK_MULTIPLIER;
+}
 
 export const SMS_PROVIDER_DEFINITIONS = [
   {
@@ -23,6 +32,21 @@ export const SMS_PROVIDER_DEFINITIONS = [
       { key: "country", label: "国家与价格", type: "price-select", defaultValue: "1001", summaryKey: "countryLabel" },
       { key: "maxPrice", label: "最高价格", type: "hidden", required: false },
       { key: "countryLabel", label: "国家名称", type: "hidden", required: false },
+    ],
+  },
+  {
+    id: "viotp",
+    name: "ViOTP",
+    description: "越南/老挝接码平台 (api.viotp.com)",
+    optionsEndpoint: "/api/sms-providers/viotp/options",
+    fields: [
+      { key: "apiKey", label: "API Token", type: "password", placeholder: "输入 ViOTP API Token" },
+      { key: "country", label: "国家", type: "select", defaultValue: "vn", options: [
+        { value: "vn", label: "越南" },
+        { value: "la", label: "老挝" },
+      ]},
+      { key: "serviceId", label: "服务与价格", type: "price-select", defaultValue: "", summaryKey: "serviceLabel" },
+      { key: "serviceLabel", label: "服务名称", type: "hidden", required: false },
     ],
   },
   {
@@ -72,10 +96,21 @@ export function createSmsProvider(providerIdValue, configValue = {}, options = {
     const service = String(config.service || "dr").trim().toLowerCase();
     const country = String(config.country || "").trim();
     const maxPrice = String(config.maxPrice || "").trim();
+    const agentId = String(config.smsAgentId || "").trim();
     if (!/^[a-z0-9_]{1,32}$/.test(service)) throw new Error("请输入有效的 SMSBower 服务代码");
     if (!/^\d{1,5}$/.test(country)) throw new Error("请输入有效的 SMSBower 国家 ID");
     if (maxPrice && (!/^\d+(?:\.\d{1,6})?$/.test(maxPrice) || Number(maxPrice) <= 0)) {
       throw new Error("请重新查询 SMSBower 国家价格");
+    }
+    if (agentId && !/^\d{1,10}$/.test(agentId)) throw new Error("请重新选择 SMSBower 号码质量档位");
+    // agentId "0" means the catalog had no agent for that tier → do not pin a provider.
+    const providerIds = agentId && Number(agentId) > 0 ? agentId : "";
+    // When the pinned tier runs out, allow buying another tier in the same country
+    // up to (chosen price × multiplier) so a replacement never overpays the budget.
+    let fallbackMaxPrice = "";
+    if (providerIds && /^\d+(?:\.\d{1,6})?$/.test(maxPrice) && Number(maxPrice) > 0) {
+      const capped = Number(maxPrice) * smsbowerFallbackMultiplier(options);
+      fallbackMaxPrice = String(Number(capped.toFixed(6)));
     }
     const client = createSmsBowerClient({ apiKey, apiBase: options.smsBowerApiBase, fetchImpl: options.fetchImpl });
     return {
@@ -83,11 +118,29 @@ export function createSmsProvider(providerIdValue, configValue = {}, options = {
       name: "SMSBower",
       apiKey,
       serviceLabel: config.countryLabel || `${service} / ${country}`,
-      getNumber: () => client.getNumber(service, country, maxPrice),
+      getNumber: () => client.getNumber(service, country, maxPrice, { providerIds, fallbackMaxPrice }),
       listNumberOptions: () => client.getPriceOptions(service),
       getSms: (requestId) => client.getSms(requestId),
       markReady: (requestId) => client.markReady(requestId),
       complete: (requestId) => client.complete(requestId),
+      release: (requestId) => client.release(requestId),
+    };
+  }
+
+  if (providerId === "viotp") {
+    const apiKey = validateApiKey(config.apiKey, "ViOTP");
+    const serviceId = String(config.serviceId || "").trim();
+    if (!/^\d{1,10}$/.test(serviceId)) throw new Error("请选择 ViOTP 服务");
+    const country = String(config.country || "vn").trim().toLowerCase();
+    const client = createViOtpClient({ apiKey, apiBase: options.viOtpApiBase, fetchImpl: options.fetchImpl });
+    return {
+      id: "viotp",
+      name: "ViOTP",
+      apiKey,
+      serviceLabel: config.serviceLabel || serviceId,
+      getNumber: () => client.getNumber(serviceId, { country }),
+      listNumberOptions: () => client.listServiceOptions(country),
+      getSms: (requestId) => client.getSms(requestId),
       release: (requestId) => client.release(requestId),
     };
   }

@@ -72,7 +72,7 @@ await assert.rejects(
 );
 
 const definitions = publicSmsProviderDefinitions();
-assert.deepEqual(definitions.map((provider) => provider.id), ["luban", "smsbower", "custom"]);
+assert.deepEqual(definitions.map((provider) => provider.id), ["luban", "smsbower", "viotp", "custom"]);
 const provider = createSmsProvider("smsbower", {
   apiKey: "test-api-key",
   service: "dr",
@@ -84,6 +84,63 @@ assert.equal(provider.name, "SMSBower");
 assert.equal(provider.serviceLabel, "日本");
 assert.deepEqual(await provider.getNumber(), { requestId: "activation-1", number: "+60123456789" });
 assert.equal((await provider.listNumberOptions())[0].country, "12");
+
+// A configured quality tier (smsAgentId) must pin the buy to that provider/agent.
+const lastGetNumber = () => [...requests].reverse().find((url) => url.searchParams.get("action") === "getNumber");
+assert.equal(lastGetNumber().searchParams.get("providerIds"), null, "no agent selected → no providerIds");
+const pinnedProvider = createSmsProvider("smsbower", {
+  apiKey: "test-api-key",
+  service: "dr",
+  country: "1001",
+  maxPrice: "0.42",
+  smsAgentId: "2295",
+}, { fetchImpl });
+await pinnedProvider.getNumber();
+assert.equal(lastGetNumber().searchParams.get("providerIds"), "2295", "selected agent → providerIds pinned");
+// agentId "0" means the catalog had no agent for that tier → do not pin.
+const zeroAgentProvider = createSmsProvider("smsbower", {
+  apiKey: "test-api-key", service: "dr", country: "1001", maxPrice: "0.42", smsAgentId: "0",
+}, { fetchImpl });
+await zeroAgentProvider.getNumber();
+assert.equal(lastGetNumber().searchParams.get("providerIds"), null, "agent 0 → no providerIds");
+assert.throws(
+  () => createSmsProvider("smsbower", { apiKey: "test-api-key", service: "dr", country: "1001", smsAgentId: "abc" }),
+  /号码质量档位/,
+);
+
+// Fallback: pinned tier out of stock → retry any tier, capped at price × multiplier.
+const fallbackRequests = [];
+const fallbackFetch = async (url) => {
+  const requestUrl = new URL(url);
+  fallbackRequests.push(requestUrl);
+  if (requestUrl.searchParams.get("action") !== "getNumber") return new Response("BAD_ACTION", { status: 200 });
+  // The pinned attempt carries providerIds and must report no stock.
+  if (requestUrl.searchParams.get("providerIds")) return new Response("NO_NUMBERS", { status: 200 });
+  return new Response("ACCESS_NUMBER:activation-fb:60987654321", { status: 200 });
+};
+const fallbackProvider = createSmsProvider("smsbower", {
+  apiKey: "test-api-key", service: "dr", country: "1001", maxPrice: "0.42", smsAgentId: "2295",
+}, { fetchImpl: fallbackFetch, smsBowerFallbackMultiplier: 2 });
+assert.deepEqual(await fallbackProvider.getNumber(), { requestId: "activation-fb", number: "+60987654321" });
+const fbGetNumbers = fallbackRequests.filter((url) => url.searchParams.get("action") === "getNumber");
+assert.equal(fbGetNumbers.length, 2, "one pinned attempt, then one fallback");
+assert.equal(fbGetNumbers[0].searchParams.get("providerIds"), "2295");
+assert.equal(fbGetNumbers[0].searchParams.get("maxPrice"), "0.42");
+assert.equal(fbGetNumbers[1].searchParams.get("providerIds"), null, "fallback drops the tier lock");
+assert.equal(fbGetNumbers[1].searchParams.get("maxPrice"), "0.84", "fallback cap = chosen price × 2");
+
+// A non-stock error (e.g. bad key) must NOT trigger the fallback.
+let pinnedCalls = 0;
+const badKeyFetch = async (url) => {
+  if (new URL(url).searchParams.get("action") === "getNumber") pinnedCalls += 1;
+  return new Response("BAD_KEY", { status: 200 });
+};
+const badKeyProvider = createSmsProvider("smsbower", {
+  apiKey: "test-api-key", service: "dr", country: "1001", maxPrice: "0.42", smsAgentId: "2295",
+}, { fetchImpl: badKeyFetch });
+await assert.rejects(() => badKeyProvider.getNumber(), /API Key/);
+assert.equal(pinnedCalls, 1, "no fallback on non-stock errors");
+
 assert.throws(() => createSmsProvider("smsbower", { apiKey: "short", service: "dr", country: "1001" }), /API Key/);
 assert.deepEqual(parseCustomSmsEntries([
   "+8613711111111----https://sms.example/first",

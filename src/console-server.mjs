@@ -11,6 +11,11 @@ import react from "@vitejs/plugin-react";
 import { createServer as createViteServer } from "vite";
 import { createCredentialStore } from "./credential-store.mjs";
 import {
+  getDb, closeDb, jobDao, usedProxyDao, proxyPoolDao,
+  deactivatedEmailDao, usedPhoneDao, sub2apiMonitorDao,
+  settingsDao, smsCostDao, migrateFromJsonFiles,
+} from "./db.mjs";
+import {
   fetchMailboxOtpCandidates,
   filterMailboxOtpCandidatesByRequestTime,
   validateMailApiUrl,
@@ -35,6 +40,10 @@ const LOGIN_CHECKPOINT_FILENAME = "login-checkpoint.json";
 const TOTP_SETUP_RESULT_FILENAME = "totp-setup-result.json";
 const PASSWORD_ADD_RESULT_FILENAME = "password-add-result.json";
 const SUB2API_MONITOR_FILENAME = "sub2api-monitor.json";
+const USED_PROXIES_FILENAME = "used-proxies.json";
+const PROXY_POOL_FILENAME = "proxy-pool.json";
+const DEACTIVATED_EMAILS_FILENAME = "deactivated-emails.json";
+const USED_PHONES_FILENAME = "used-phones.json";
 const SUB2API_MONITOR_INTERVAL_MS = readDurationEnv("SUB2API_MONITOR_INTERVAL_MS", 5 * 60_000, 1_000);
 const SUB2API_AUTO_REPAIR_COOLDOWN_MS = readDurationEnv("SUB2API_AUTO_REPAIR_COOLDOWN_MS", 5 * 60_000, 0);
 const MAIL_POLL_INTERVAL_MS = 2_500;
@@ -64,6 +73,11 @@ const OUTPUT_ROOT = path.resolve(
   process.env.ONBOARDING_OUTPUT_ROOT || path.join(WORKSPACE_ROOT, "tmp", "chatgpt-onboarding-console"),
 );
 const SUB2API_MONITOR_PATH = path.join(OUTPUT_ROOT, SUB2API_MONITOR_FILENAME);
+const USED_PROXIES_PATH = path.join(OUTPUT_ROOT, USED_PROXIES_FILENAME);
+const PROXY_POOL_PATH = path.join(OUTPUT_ROOT, PROXY_POOL_FILENAME);
+const DEACTIVATED_EMAILS_PATH = path.join(OUTPUT_ROOT, DEACTIVATED_EMAILS_FILENAME);
+const USED_PHONES_PATH = path.join(OUTPUT_ROOT, USED_PHONES_FILENAME);
+const DEFAULT_PHONE_MAX_USES = 1;
 const credentialStore = createCredentialStore();
 const consoleToken = crypto.randomBytes(24).toString("base64url");
 const jobs = new Map();
@@ -77,6 +91,30 @@ let shutdownPromise = null;
 let sub2ApiMonitorConfig = null;
 let sub2ApiMonitorTimer = null;
 let sub2ApiMonitorPromise = null;
+// Persistent ledger of every proxy connection-credential ever assigned to an
+// account (keyed by session-independent identity), plus the pool of proxies the
+// operator has loaded into the system to pick replacements from. Both survive
+// restarts and mirror the sub2api-monitor JSON-state pattern.
+const usedProxyLedger = new Map(); // identityKey -> { label, protocol, host, port, firstUsedAt, lastUsedAt, emails: [] }
+const proxyPool = new Map(); // identityKey -> { label, protocol, host, port, username, password, url, addedAt }
+let usedProxyLedgerWritePromise = Promise.resolve();
+let proxyPoolWritePromise = Promise.resolve();
+// Persistent registry of ChatGPT accounts confirmed deactivated/banned/deleted
+// (keyed by lowercased email). The console can't rely on receiving a deactivation
+// email, so the moment a permanent failure is confirmed the account is recorded
+// here, its task is removed, and only the mailbox stays in "Danh sách email"
+// flagged as deactivated — so the operator can see which accounts to remove from
+// the workspace. Survives restarts, mirrors the used-proxy ledger pattern.
+const deactivatedEmails = new Map(); // email(lowercase) -> { email, reason, at }
+let deactivatedEmailsWritePromise = Promise.resolve();
+// Persistent registry of phone numbers already used for SMS verification, plus
+// numbers the platform's risk control rejected. Keyed by digits-only number.
+// Used to (a) cap how many times a number may be reused (phoneMaxUses, default 1)
+// and (b) permanently avoid risk-flagged numbers when picking the next one.
+// Saved to a file on this machine (never the browser), mirroring the proxy ledger.
+const usedPhoneLedger = new Map(); // digits -> { number, uses, blocked, blockedReason, firstUsedAt, lastUsedAt, emails: [] }
+let usedPhoneLedgerWritePromise = Promise.resolve();
+let phoneMaxUses = DEFAULT_PHONE_MAX_USES; // 0 = unlimited reuse (the block-list still applies)
 let mailRequestConfig = { method: "GET", url: null, headers: {} };
 
 // ---- Native temp-mail (magicskill) integration: read the API key from the
@@ -168,6 +206,19 @@ async function checkProxyExitIp(proxyUrl) {
   }
 }
 
+// Cache the exit-IP probe per proxy host so the proxy-list overview can be
+// polled frequently (for real-time registration counts) without re-hitting the
+// network each time. A fresh probe is forced via { force: true }.
+const proxyExitIpCache = new Map(); // host -> { at, result }
+const PROXY_EXIT_IP_TTL_MS = 45_000;
+async function checkProxyExitIpCached(url, host, { force = false } = {}) {
+  const cached = proxyExitIpCache.get(host);
+  if (!force && cached && Date.now() - cached.at < PROXY_EXIT_IP_TTL_MS) return cached.result;
+  const result = await checkProxyExitIp(url);
+  proxyExitIpCache.set(host, { at: Date.now(), result });
+  return result;
+}
+
 // SMSBower price catalog per service, cached briefly (the raw response is large).
 const smsBowerCatalogCache = new Map(); // serviceId -> { at, data }
 async function fetchSmsBowerCatalogCached(serviceId) {
@@ -225,9 +276,34 @@ if (!Number.isInteger(requestedPort) || requestedPort < 1 || requestedPort > 655
   throw new Error("--port must be an integer between 1 and 65535");
 }
 
+// Proxy session-token patterns — declared before the startup init block below
+// because backfillUsedProxiesFromJobs() → stripProxySession() runs at load time.
+const PROXY_SID_PATTERN = /(^|-)sid-[A-Za-z0-9]+(?=-|$)/;
+const PROXY_KOOKEEY_PATTERN = /^(.*-[A-Za-z]{2})-([0-9]{8})-(\d+m)$/i;
+
 await fs.mkdir(OUTPUT_ROOT, { recursive: true });
+
+// ---- SQLite database init (replaces JSON file persistence for ledger data) ----
+const db = getDb();
+{
+  const dbJobCount = db.prepare("SELECT COUNT(*) as c FROM jobs").get().c;
+  if (dbJobCount === 0) {
+    console.log("[db] Empty database detected, auto-migrating from JSON files...");
+    const migrated = migrateFromJsonFiles();
+    console.log(`[db] Migrated: ${migrated.jobs} jobs, ${migrated.proxies} proxies, ${migrated.phones} phones, ${migrated.deactivated} deactivated`);
+  }
+  const savedMaxUses = settingsDao.get("phone_max_uses");
+  if (savedMaxUses !== null) phoneMaxUses = Number(savedMaxUses) || DEFAULT_PHONE_MAX_USES;
+}
+
 await loadSub2ApiMonitorConfiguration();
+await loadUsedProxyLedger();
+await loadProxyPool();
+await loadDeactivatedEmails();
+await loadUsedPhoneLedger();
 await syncCompletedOutputs(true);
+backfillUsedProxiesFromJobs();
+await backfillDeactivatedFromJobs();
 scheduleQueuedJobs();
 scheduleSub2ApiMonitor();
 
@@ -346,7 +422,10 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/query") {
     const body = await readJson(req);
     const requestedPage = Math.max(1, Number.parseInt(body.page || "1", 10) || 1);
-    await sendJobsPage(res, requestedPage, normalizeEmailFilter(body.emails));
+    const search = typeof body.search === "string" ? body.search.slice(0, 200) : "";
+    // emails is the (optional) bulk list filter; search is the optional quick substring.
+    const emails = Array.isArray(body.emails) && body.emails.length ? normalizeEmailFilter(body.emails) : null;
+    await sendJobsPage(res, requestedPage, emails, search);
     return;
   }
 
@@ -400,53 +479,111 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
-  // Proxy IP list overview: for each configured proxy, report connection status,
-  // exit IP, the mailboxes registered through that proxy (grouped by host:port),
-  // and how many more accounts it can still register (limitPerIp − used).
+  // The pool of proxies loaded into the system, each annotated with whether the
+  // connection credential has ever been used / is currently in use. The
+  // change-proxy picker shows the never-used ones.
+  if (req.method === "GET" && requestUrl.pathname === "/api/proxy-pool") {
+    sendJson(res, 200, { proxies: publicProxyPool() });
+    return;
+  }
+  if (req.method === "POST" && requestUrl.pathname === "/api/proxy-pool/import") {
+    const body = await readJson(req);
+    const result = importProxiesIntoPool(body.text);
+    await persistProxyPool();
+    sendJson(res, 200, { ...result, proxies: publicProxyPool() });
+    return;
+  }
+
+  // Proxy IP list overview: for each proxy IP (configured now, plus the older IPs
+  // that previously registered accounts), report connection status, exit IP, the
+  // mailboxes registered through that IP, and how many more accounts it can still
+  // register (limitPerIp − used). Everything is grouped per IP (host).
   if (req.method === "POST" && requestUrl.pathname === "/api/proxies/status") {
     const body = await readJson(req);
     const limitPerIp = Math.min(999, Math.max(1, Math.trunc(Number(body.limitPerIp)) || 15));
     const mode = body.mode === "batch" ? "batch" : "single";
     let urls = [];
     if (mode === "batch") {
-      urls = parseProxyList(body.proxies).map(proxyObjToUrl);
+      // Mỗi IP (host) chỉ tính 1 lần — tránh 1 IP hiện thành 2 dòng (HTTP + SOCKS5).
+      const seenHosts = new Set();
+      urls = parseProxyList(body.proxies)
+        .filter((p) => (seenHosts.has(p.host) ? false : (seenHosts.add(p.host), true)))
+        .map(proxyObjToUrl);
     } else {
       const one = normalizeProxyUrl(body.proxies);
       if (one) urls = [one];
     }
-    // Group existing jobs by their proxy's host:port (the proxy "IP").
-    const emailsByKey = new Map();
+    // Group existing jobs by their proxy's IP (host). Keep a representative URL so
+    // even an IP that is no longer in the configured list can still be health-checked.
+    const jobsByHost = new Map(); // host -> { url, emails: [{email,status,registered}] }
+    const consumedByHost = proxyConsumedByHost(); // registered-or-running, minus deactivated
     for (const job of listUniqueJobs()) {
       if (job.deleted || !job.proxyUrl) continue;
       const parsed = parseProxyUrlForSub2Api(job.proxyUrl);
       if (!parsed) continue;
-      const key = `${parsed.host}:${parsed.port}`;
-      if (!emailsByKey.has(key)) emailsByKey.set(key, []);
-      emailsByKey.get(key).push({ email: job.email, status: job.status });
+      if (!jobsByHost.has(parsed.host)) jobsByHost.set(parsed.host, { url: job.proxyUrl, emails: [] });
+      jobsByHost.get(parsed.host).emails.push({
+        email: job.email,
+        status: job.status,
+        registered: Boolean(job.registrationSucceeded),
+      });
     }
-    const proxies = await mapWithConcurrency(urls, 6, async (url) => {
+    // Build the list of IPs to report: configured first, then older IPs from jobs.
+    const targets = [];
+    const seen = new Set();
+    for (const url of urls) {
       const parsed = parseProxyUrlForSub2Api(url);
-      const key = parsed ? `${parsed.host}:${parsed.port}` : url;
-      const emails = emailsByKey.get(key) || [];
-      const check = await checkProxyExitIp(url);
+      if (!parsed || seen.has(parsed.host)) continue;
+      seen.add(parsed.host);
+      targets.push({ host: parsed.host, url, configured: true });
+    }
+    for (const [host, info] of jobsByHost) {
+      if (seen.has(host)) continue;
+      seen.add(host);
+      targets.push({ host, url: info.url, configured: false });
+    }
+    // A live exit-IP probe is slow, so cache it per host — this lets the client
+    // poll frequently for real-time registration counts without re-checking the
+    // network every time. The manual refresh button forces a fresh probe.
+    const forceCheck = body.refresh === true;
+    const proxies = await mapWithConcurrency(targets, 6, async (target) => {
+      const parsed = parseProxyUrlForSub2Api(target.url);
+      const emails = jobsByHost.get(target.host)?.emails || [];
+      const check = await checkProxyExitIpCached(target.url, target.host, { force: forceCheck });
       const emailCount = emails.length;
+      // "đăng ký thành công" = đã qua email OTP và tới bước SMS. Một slot bị chiếm
+      // bởi tài khoản đã đăng ký (chưa vô hiệu hoá) HOẶC đang chạy; job chờ khởi
+      // động không trừ IP.
+      const registeredCount = emails.filter((e) => e.registered).length;
+      const consumedCount = consumedByHost.get(target.host) || 0;
+      const remaining = Math.max(0, limitPerIp - consumedCount);
       return {
-        host: parsed?.host || "",
+        host: parsed?.host || target.host,
         port: parsed?.port || 0,
         protocol: parsed?.protocol || "",
-        label: parsed ? `${parsed.host}:${parsed.port}` : url,
+        label: parsed ? `${parsed.host}:${parsed.port}` : target.url,
+        configured: target.configured,
         connected: check.ok,
         ip: check.ip || "",
         error: check.ok ? "" : (check.error || ""),
         emails: emails.map((e) => e.email),
         completed: emails.filter((e) => e.status === "completed").length,
         emailCount,
-        remaining: Math.max(0, limitPerIp - emailCount),
+        registeredCount,
+        consumedCount,
+        remaining,
+        // usage: "unused" = chưa chiếm chỗ · "inuse" = còn lượt · "used" = hết lượt
+        usage: consumedCount === 0 ? "unused" : (remaining > 0 ? "inuse" : "used"),
       };
     });
     const activeCount = proxies.filter((p) => p.connected).length;
     const remaining = proxies.filter((p) => p.connected).reduce((sum, p) => sum + p.remaining, 0);
-    sendJson(res, 200, { limitPerIp, mode, totalCount: proxies.length, activeCount, remaining, proxies });
+    const usageCounts = {
+      unused: proxies.filter((p) => p.usage === "unused").length,
+      inuse: proxies.filter((p) => p.usage === "inuse").length,
+      used: proxies.filter((p) => p.usage === "used").length,
+    };
+    sendJson(res, 200, { limitPerIp, mode, totalCount: proxies.length, activeCount, remaining, usageCounts, proxies });
     return;
   }
 
@@ -489,8 +626,19 @@ async function handleApi(req, res, requestUrl) {
       const email = mb.email;
       const otpUrl = `${MAIL_API_BASE}/mailboxes/${encodeURIComponent(email)}/otp`;
       // Has this mailbox already been used to onboard a ChatGPT account?
+      // "Created" = a ChatGPT account already exists for this mailbox: either the
+      // onboarding finished (completed), or sign-up + email verification succeeded
+      // (a login checkpoint was saved) and only later steps such as SMS verification
+      // are still pending — those must NOT be shown as "uncreated".
       const job = findJobByEmail(email);
-      const accountCreated = job?.status === "completed";
+      const accountCreated = Boolean(job) && (
+        job.status === "completed"
+        || Boolean(job.loginCheckpointAvailable)
+        || ["phone", "phone_otp"].includes(job.status) // account exists, SMS verification pending
+      );
+      // A deactivated account's task is removed, so the mailbox's deactivated
+      // state lives only in the registry — surface it here for the email list.
+      const deactivation = deactivatedEmails.get(String(email).toLowerCase()) || null;
       return {
         id: mb.id,
         email,
@@ -502,19 +650,36 @@ async function handleApi(req, res, requestUrl) {
         domain: String(email || "").split("@")[1] || "",
         accountCreated,
         accountStatus: job?.status || null,
+        deactivated: Boolean(deactivation),
+        deactivatedReason: deactivation?.reason || null,
+        deactivatedAt: deactivation?.at || null,
         otpUrl,
         line: `${email}----${otpUrl}`,
       };
     });
     if (tagFilter) list = list.filter((m) => (m.tag || "") === tagFilter);
     if (domainFilter) list = list.filter((m) => m.domain === domainFilter || m.domain.endsWith(`.${domainFilter}`));
-    // Mailboxes already used for an account sink to the bottom; within each
-    // group, newest first so freshly created ones are easy to find.
+    // Deactivated mailboxes sink to the very bottom, then mailboxes already used
+    // for an account; within each group, newest first so freshly created ones are
+    // easy to find.
     list.sort((a, b) => {
+      if (a.deactivated !== b.deactivated) return a.deactivated ? 1 : -1;
       if (a.accountCreated !== b.accountCreated) return a.accountCreated ? 1 : -1;
       return String(b.created_at || "").localeCompare(String(a.created_at || ""));
     });
-    sendJson(res, 200, { mailboxes: list, total: list.length });
+    // Count emails with jobs (in step 4) and active/stable ones
+    const totalInStep4 = list.filter((m) => m.accountCreated).length;
+    const totalActiveStable = list.filter((m) => m.accountCreated && !m.deactivated).length;
+    const totalDeactivated = list.filter((m) => m.deactivated).length;
+    const totalUncreated = list.filter((m) => !m.accountCreated && !m.deactivated).length;
+    sendJson(res, 200, {
+      mailboxes: list,
+      total: list.length,
+      totalInStep4,
+      totalActiveStable,
+      totalDeactivated,
+      totalUncreated,
+    });
     return;
   }
 
@@ -530,7 +695,73 @@ async function handleApi(req, res, requestUrl) {
       sendJson(res, r.status, { error: (r.json && r.json.detail) || `HTTP ${r.status}` });
       return;
     }
+    clearEmailDeactivated(email); // mailbox gone → drop its deactivated flag
     sendJson(res, 200, { status: (r.json && r.json.status) || "deleted", email });
+    return;
+  }
+
+  // Tag a single existing mailbox.
+  if (req.method === "PATCH" && requestUrl.pathname === "/api/mail/tag") {
+    const body = await readJson(req);
+    const email = String(body.email || "").trim();
+    const tag = String(body.tag || "").trim();
+    if (!email) { sendJson(res, 400, { error: "Thiếu email" }); return; }
+    const r = await mailApi(`/mailboxes/${encodeURIComponent(email)}/tag`, {
+      method: "PATCH",
+      body: JSON.stringify({ tag }),
+    });
+    if (!r.ok) {
+      sendJson(res, r.status, { error: (r.json && r.json.detail) || `HTTP ${r.status}` });
+      return;
+    }
+    sendJson(res, 200, { email, tag, ok: true });
+    return;
+  }
+
+  // Tag multiple mailboxes at once.
+  if (req.method === "POST" && requestUrl.pathname === "/api/mail/batch-tag") {
+    const body = await readJson(req);
+    const emails = Array.isArray(body.emails) ? body.emails.map(e => String(e).trim()).filter(Boolean) : [];
+    const tag = String(body.tag || "").trim();
+    if (!emails.length) { sendJson(res, 400, { error: "Thiếu danh sách email" }); return; }
+    if (!tag) { sendJson(res, 400, { error: "Thiếu tag" }); return; }
+    // Use hostmail batch-tag endpoint
+    const r = await mailApi("/mailboxes/batch-tag", {
+      method: "POST",
+      body: JSON.stringify({ emails, tag }),
+    });
+    if (!r.ok) {
+      sendJson(res, r.status, { error: (r.json && r.json.detail) || `HTTP ${r.status}` });
+      return;
+    }
+    sendJson(res, 200, r.json || { tagged: 0, errors: [] });
+    return;
+  }
+
+  // Mark ChatGPT Team emails without jobs as deactivated.
+  if (req.method === "POST" && requestUrl.pathname === "/api/mail/deactivate-orphans") {
+    const reason = "Email có tag ChatGPT Team nhưng không có tác vụ trong bước 4";
+    // Fetch all mailboxes
+    const r = await mailApi("/mailboxes");
+    if (!r.ok) {
+      sendJson(res, r.status, { error: (r.json && r.json.detail) || `HTTP ${r.status}` });
+      return;
+    }
+    let deactivated = 0;
+    let skipped = 0;
+    const details = [];
+    for (const mb of (r.json.mailboxes || [])) {
+      const email = mb.email;
+      const tag = mb.tag || "";
+      if (!/chatgpt/i.test(tag)) { continue; } // not ChatGPT Team tagged
+      const job = findJobByEmail(email);
+      if (job) { skipped++; continue; } // has a task in step 4
+      if (deactivatedEmails.has(String(email).toLowerCase())) { skipped++; continue; } // already deactivated
+      markEmailDeactivated(email, reason);
+      deactivated++;
+      details.push(email);
+    }
+    sendJson(res, 200, { deactivated, skipped, details });
     return;
   }
 
@@ -543,17 +774,28 @@ async function handleApi(req, res, requestUrl) {
     }
     const hasCredentialUpdate = ["password", "mailApiUrl", "mailRequestBody", "totpSecret"].some((key) => Object.hasOwn(body, key));
     const credentials = normalizeLoginCredentials(body);
+    const batchMode = body.proxyMode === "batch";
     const hasProxyUpdate = Object.hasOwn(body, "proxyUrl");
     const proxyUrl = hasProxyUpdate ? normalizeProxyUrl(body.proxyUrl) : null;
     const result = await withEmailJobLock(email, async () => {
       const existing = findJobByEmail(email);
       if (existing) {
+        // Ở chế độ nhiều IP: giữ nguyên proxy đã gán cho tài khoản, không gán lại.
         if (hasCredentialUpdate) await updateJobCredentials(existing, credentials, { proxyUrl, hasProxyUpdate });
         else if (hasProxyUpdate) await updateJobProxy(existing, proxyUrl);
         return { job: existing, created: false, updated: hasCredentialUpdate || hasProxyUpdate };
       }
-      return { job: await startJob(email, credentials, proxyUrl), created: true, updated: false };
+      let assignedProxy = proxyUrl;
+      if (batchMode) {
+        assignedProxy = makeProxyAllocator(body.proxies, body.limitPerIp).next();
+        if (!assignedProxy) return { poolFull: true };
+      }
+      return { job: await startJob(email, credentials, assignedProxy), created: true, updated: false };
     });
+    if (result.poolFull) {
+      sendJson(res, 400, { error: "所有代理 IP 已达上限，请在“代理 IP 列表”中添加新 IP" });
+      return;
+    }
     sendJson(res, result.created ? 201 : 200, { ...result, job: publicJob(result.job) });
     return;
   }
@@ -561,19 +803,124 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/batch") {
     const body = await readJson(req);
     const entries = parseBatchEntries(body.text, mailRequestConfig);
+    const batchMode = body.proxyMode === "batch";
+    const allocator = batchMode ? makeProxyAllocator(body.proxies, body.limitPerIp) : null;
     const proxyUrl = normalizeProxyUrl(body.proxyUrl);
+    // Ở chế độ nhiều IP: chạy đủ số chỗ còn lại của các IP; tài khoản dư (không
+    // còn chỗ) được tạo rồi huỷ tác vụ ngay, không từ chối cả lô.
     const results = await Promise.all(entries.map((entry) => withEmailJobLock(entry.email, async () => {
       const existing = findJobByEmail(entry.email);
       if (existing) {
-        await updateJobCredentials(existing, entry, { proxyUrl, hasProxyUpdate: true });
+        // Ở chế độ nhiều IP: giữ nguyên proxy đã gán, không gán lại.
+        await updateJobCredentials(existing, entry, batchMode ? { hasProxyUpdate: false } : { proxyUrl, hasProxyUpdate: true });
+        // Creating a task means "run it" — a staged (idle) job gets started here.
+        if (existing.status === "idle") enqueueJob(existing, "full", "正在建立登录会话");
         return { job: existing, updated: true };
+      }
+      if (allocator) {
+        const assignedProxy = allocator.next();
+        if (!assignedProxy) {
+          // IP đã đủ giới hạn đăng ký → tạo tác vụ rồi huỷ ngay.
+          const job = await startJob(entry.email, entry, null, { staged: true });
+          cancelForProxyCapacity(job);
+          return { job, updated: false, canceled: true };
+        }
+        return { job: await startJob(entry.email, entry, assignedProxy), updated: false };
       }
       return { job: await startJob(entry.email, entry, proxyUrl), updated: false };
     })));
     sendJson(res, 201, {
       jobs: results.map((item) => publicJob(item.job)),
-      created: results.filter((item) => !item.updated).length,
+      created: results.filter((item) => !item.updated && !item.canceled).length,
       updated: results.filter((item) => item.updated).length,
+      canceled: results.filter((item) => item.canceled).length,
+    });
+    return;
+  }
+
+  // Stage mailboxes into the run list without starting them ("待启动"/idle).
+  // Used right after "创建邮箱" so freshly created emails appear in the list and
+  // can be launched later with /api/jobs/start-batch.
+  if (req.method === "POST" && requestUrl.pathname === "/api/jobs/stage") {
+    const body = await readJson(req);
+    const entries = parseBatchEntries(body.text, mailRequestConfig);
+    const batchMode = body.proxyMode === "batch";
+    const proxyUrl = normalizeProxyUrl(body.proxyUrl);
+    // Staged jobs are idle and do NOT consume a slot, so stage everything and
+    // just distribute them round-robin across the configured IPs. The per-IP
+    // registration limit is enforced later, when the jobs are actually started.
+    let hostUrls = [];
+    if (batchMode) {
+      const seenHosts = new Set();
+      hostUrls = parseProxyList(body.proxies)
+        .filter((p) => (seenHosts.has(p.host) ? false : (seenHosts.add(p.host), true)))
+        .map(proxyObjToUrl);
+    }
+    let cursor = 0;
+    const results = await Promise.all(entries.map((entry) => withEmailJobLock(entry.email, async () => {
+      const existing = findJobByEmail(entry.email);
+      if (existing) return { job: existing, created: false };
+      const assignedProxy = batchMode
+        ? (hostUrls.length ? hostUrls[cursor++ % hostUrls.length] : null)
+        : proxyUrl;
+      return { job: await startJob(entry.email, entry, assignedProxy, { staged: true }), created: true };
+    })));
+    sendJson(res, 201, {
+      jobs: results.map((item) => publicJob(item.job)),
+      created: results.filter((item) => item.created).length,
+      skipped: results.filter((item) => !item.created).length,
+    });
+    return;
+  }
+
+  // Start selected staged (idle) jobs: apply the current proxy, then enqueue them.
+  // "khi bấm chạy tác vụ cần phải xem số lượng có thể tạo với IP có trước": in
+  // batch mode, respect each IP's remaining registration slots — start only as
+  // many as fit, and cancel the overflow accounts.
+  if (req.method === "POST" && requestUrl.pathname === "/api/jobs/start-batch") {
+    const body = await readJson(req);
+    const selected = resolveSelectedJobs(body.ids);
+    const proxyUrl = normalizeProxyUrl(body.proxyUrl);
+    const hasProxyUpdate = Object.hasOwn(body, "proxyUrl");
+    const hasLimit = body.limitPerIp !== undefined && body.limitPerIp !== null;
+    const limitPerIp = hasLimit
+      ? Math.min(999, Math.max(1, Math.trunc(Number(body.limitPerIp)) || 15))
+      : null;
+
+    // Synchronous pre-pass decides start vs cancel per job so the per-IP counters
+    // stay consistent regardless of async interleaving.
+    const consumed = hasLimit ? proxyConsumedByHost() : null;
+    const startedByHost = new Map();
+    const decisions = selected.map((job) => {
+      if (job.status !== "idle") return { job, action: "skip" };
+      if (!hasLimit) return { job, action: "start" };
+      const effectiveProxy = hasProxyUpdate ? proxyUrl : job.proxyUrl;
+      const parsed = effectiveProxy ? parseProxyUrlForSub2Api(effectiveProxy) : null;
+      if (!parsed) return { job, action: "cancel" };
+      const used = (consumed.get(parsed.host) || 0) + (startedByHost.get(parsed.host) || 0);
+      if (used >= limitPerIp) return { job, action: "cancel" };
+      startedByHost.set(parsed.host, (startedByHost.get(parsed.host) || 0) + 1);
+      return { job, action: "start" };
+    });
+
+    const applied = await Promise.all(decisions.map((d) => withEmailJobLock(d.job.email, async () => {
+      if (d.action === "skip" || d.job.status !== "idle") return { skipped: true };
+      if (d.action === "cancel") {
+        cancelForProxyCapacity(d.job);
+        return { canceled: true, job: d.job };
+      }
+      if (hasProxyUpdate) await updateJobProxy(d.job, proxyUrl);
+      enqueueJob(d.job, "full", "正在建立登录会话");
+      return { started: true, job: d.job };
+    })));
+    const startedJobs = applied.filter((a) => a.started).map((a) => a.job);
+    const canceledJobs = applied.filter((a) => a.canceled).map((a) => a.job);
+    if (!startedJobs.length && !canceledJobs.length) throw httpError(409, "选中的任务都不是待启动状态");
+    sendJson(res, 200, {
+      jobs: [...startedJobs, ...canceledJobs].map(publicJob),
+      started: startedJobs.length,
+      canceled: canceledJobs.length,
+      skipped: applied.filter((a) => a.skipped).length,
     });
     return;
   }
@@ -893,6 +1240,21 @@ async function handleApi(req, res, requestUrl) {
   }
 
   // Public SMSBower price catalog (country -> quality/rank positions) for the picker.
+  // Phone-number usage filter: configurable per-number reuse cap + ledger stats.
+  // The cap and the ledger are stored on this machine (not the browser).
+  if (requestUrl.pathname === "/api/sms/number-usage") {
+    if (req.method === "GET") {
+      sendJson(res, 200, phoneLedgerStats());
+      return;
+    }
+    if (req.method === "POST") {
+      const body = await readJson(req);
+      const maxUses = setPhoneMaxUses(body.maxUses);
+      sendJson(res, 200, { ...phoneLedgerStats(), maxUses });
+      return;
+    }
+  }
+
   if (req.method === "GET" && requestUrl.pathname === "/api/sms-providers/smsbower/catalog") {
     const serviceId = /^\d{1,6}$/.test(requestUrl.searchParams.get("serviceId") || "")
       ? requestUrl.searchParams.get("serviceId")
@@ -911,6 +1273,7 @@ async function handleApi(req, res, requestUrl) {
       smsClient = createSmsProvider(providerOptionsMatch[1], body.config, {
         lubanApiBase: process.env.LUBAN_SMS_API_BASE,
         smsBowerApiBase: process.env.SMSBOWER_API_BASE,
+        viOtpApiBase: process.env.VIOTP_API_BASE,
       });
       if (!smsClient.listNumberOptions) throw httpError(400, "该接码平台不支持价格查询");
       const options = await smsClient.listNumberOptions();
@@ -922,7 +1285,7 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
-  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|relogin|setup-2fa|add-password|logs|download|sms-number|luban-number))?$/.exec(requestUrl.pathname);
+  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|relogin|setup-2fa|add-password|change-proxy|reconnect-proxy|logs|download|sms-number|luban-number))?$/.exec(requestUrl.pathname);
   if (!match) {
     sendJson(res, 404, { error: "Not found" });
     return;
@@ -994,17 +1357,33 @@ async function handleApi(req, res, requestUrl) {
     sendJson(res, 200, { job: publicJob(job) });
     return;
   }
+  if (req.method === "POST" && action === "change-proxy") {
+    const body = await readJson(req);
+    const result = await withEmailJobLock(job.email, () => changeJobProxy(job, body));
+    sendJson(res, result.status || 200, { ...result.payload, job: publicJob(job) });
+    return;
+  }
+  if (req.method === "POST" && action === "reconnect-proxy") {
+    const result = await withEmailJobLock(job.email, () => reconnectJobProxy(job));
+    sendJson(res, result.status || 200, { ...result.payload, job: publicJob(job) });
+    return;
+  }
 
   sendJson(res, 405, { error: "Method not allowed" });
 }
 
-async function sendJobsPage(res, requestedPage, emailFilter = null) {
+async function sendJobsPage(res, requestedPage, emailFilter = null, search = "") {
   await syncCompletedOutputs();
+  // Sắp xếp theo thời điểm tạo, mới nhất lên đầu (cách sắp xếp cũ). Không dồn tài khoản "Hoàn tất"
+  // xuống cuối — chúng vẫn cần được tải lên Sub2API nên phải giữ nguyên vị trí theo thứ tự tạo.
   const allJobs = listUniqueJobs();
   const emailSet = emailFilter?.length ? new Set(emailFilter) : null;
-  const visibleJobs = emailSet
+  const term = String(search || "").trim().toLowerCase();
+  let visibleJobs = emailSet
     ? allJobs.filter((job) => emailSet.has(job.email.toLowerCase()))
     : allJobs;
+  // Quick email search (substring, across every page), combinable with the list filter.
+  if (term) visibleJobs = visibleJobs.filter((job) => job.email.toLowerCase().includes(term));
   const total = visibleJobs.length;
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const page = Math.min(requestedPage, totalPages);
@@ -1013,11 +1392,12 @@ async function sendJobsPage(res, requestedPage, emailFilter = null) {
     jobs: visibleJobs.slice(start, start + PAGE_SIZE).map(publicJob),
     selection: visibleJobs.map(publicSelectionJob),
     pagination: { page, pageSize: PAGE_SIZE, total, totalPages, totalAll: allJobs.length },
-    filter: { active: Boolean(emailSet), requested: emailFilter?.length || 0, matched: total },
+    filter: { active: Boolean(emailSet) || Boolean(term), requested: emailFilter?.length || 0, matched: total, search: term || null },
     stats: {
       active: allJobs.filter(occupiesActiveSlot).length,
       queued: allJobs.filter((job) => job.status === "queued").length,
       completed: allJobs.filter((job) => job.status === "completed").length,
+      idle: allJobs.filter((job) => job.status === "idle").length,
     },
   });
 }
@@ -1034,9 +1414,12 @@ function normalizeEmailFilter(value) {
   return [...unique];
 }
 
-async function startJob(email, credentials = {}, proxyUrl = null) {
+async function startJob(email, credentials = {}, proxyUrl = null, options = {}) {
+  const staged = Boolean(options.staged);
+  clearEmailDeactivated(email); // operator is re-registering this mailbox → clear any stale deactivated flag
   const { loginMode, mailApiUrl, mailRequestBody, password, totpSecret } = normalizeLoginCredentials(credentials);
   await saveStoredLoginCredentials(email, { password, totpSecret, proxyUrl });
+  if (proxyUrl) recordProxyUsage(proxyUrl, email);
   const id = crypto.randomUUID();
   const outputDir = path.join(OUTPUT_ROOT, id);
   const outputPath = path.join(outputDir, "sub2api-import-oauth.json");
@@ -1049,8 +1432,8 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
   const job = {
     id,
     email,
-    status: "queued",
-    prompt: "已加入任务队列",
+    status: staged ? "idle" : "queued",
+    prompt: staged ? "待启动，选中后点击“开始运行”即可加入队列" : "已加入任务队列",
     createdAt,
     updatedAt: createdAt,
     lastOperationAt: createdAt,
@@ -1106,6 +1489,10 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
     proxyRiskRetryCount: 0,
     proxyConnectionFailureCount: 0,
     proxyRiskRestarting: false,
+    proxyConnectionError: false,
+    failedProxyLabel: null,
+    registrationSucceeded: false,
+    registeredAt: null,
     proxySessionAttemptIds: new Set(),
     proxyAttemptParserTail: "",
     queueRunId: null,
@@ -1130,7 +1517,9 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
   beginAuthorizationAutomationAttempt(job, "initial");
   jobs.set(id, job);
   await saveJobMetadata(job);
-  scheduleQueuedJobs();
+  // Staged ("idle") jobs sit in the run list without consuming a slot; they only
+  // enter the queue once the user starts them, so skip scheduling here.
+  if (!staged) scheduleQueuedJobs();
   return job;
 }
 
@@ -1311,6 +1700,7 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
   }
   if (code === 0 && job.resultSaved && (await fileExists(job.outputPath))) {
     if (mode === "full") completeAuthorizationAutomationAttempt(job);
+    markRegistrationSucceeded(job);
     job.loginCheckpointAvailable = false;
     job.status = "completed";
     job.prompt = "授权完成，可以下载导入文件";
@@ -2003,6 +2393,8 @@ function consumeOutput(job, rawText) {
     const latest = sendFailures.at(-1);
     job.currentPhone = latest[1];
     job.phoneError = friendlyPhoneError(latest[2]);
+    // Risk control / unusable number → block it so the next change-phone avoids it.
+    if (isPhonePermanentlyBad(latest[2])) markPhoneBlocked(latest[1], latest[2], job.email);
     if (job.smsOrderId && job.smsNumber === job.currentPhone) {
       releaseSmsNumber(job, "error", "该平台手机号无法接收验证码，请重新取号或手动输入其他手机号");
     }
@@ -2025,6 +2417,10 @@ function consumeOutput(job, rawText) {
     );
     if (shouldChangePhoneAfterOtpFailure(validationMessage)) {
       job.smsError = job.phoneError;
+      // The server rejected this number (e.g. recently used / in use) → block it.
+      if (isPhonePermanentlyBad(validationMessage) && job.currentPhone) {
+        markPhoneBlocked(job.currentPhone, validationMessage, job.email);
+      }
       appendJobLog(job, "[sms] 当前手机号已被服务端拒绝，停止提交旧验证码并自动返回换号步骤。\n");
       void submitJobInput(job, { action: "change_phone", value: "" }, {
         preservePhoneError: true,
@@ -2071,6 +2467,13 @@ async function restartAfterProxyRisk(job, options = {}) {
   job.proxyRiskRestarting = true;
   const mode = job.runMode || job.queuedMode || "full";
   try {
+    // A dead/unreachable proxy (connection failure) must stop immediately in a
+    // proxy_error state that names the failing proxy — regardless of whether the
+    // proxy supports session rotation. Never auto-rotate or auto-switch.
+    if (options.connectionFailure && job.proxyUrl) {
+      failProxyConnection(job);
+      return;
+    }
     if (!job.proxyUrl) {
       if (job.directTlsFallbackAttempted) {
         finishProxyRiskRetries(job, "Cloudflare 安全校验未能完成，直连 TLS 指纹筛选已经使用过，请稍后重试");
@@ -2089,16 +2492,6 @@ async function restartAfterProxyRisk(job, options = {}) {
     if ((job.proxyRiskRetryCount || 0) >= MAX_PROXY_RISK_RETRIES) {
       finishProxyRiskRetries(job, `代理会话已自动更换 ${MAX_PROXY_RISK_RETRIES} 次，仍然触发安全校验`);
       return;
-    }
-    if (options.connectionFailure) {
-      job.proxyConnectionFailureCount = (job.proxyConnectionFailureCount || 0) + 1;
-      if (job.proxyConnectionFailureCount >= MAX_PROXY_CONNECTION_FAILURES) {
-        finishProxyRiskRetries(
-          job,
-          `代理连接连续失败 ${MAX_PROXY_CONNECTION_FAILURES} 次，已停止自动重试`,
-        );
-        return;
-      }
     }
 
     stopMailPolling(job);
@@ -2145,6 +2538,38 @@ async function restartAfterProxyRisk(job, options = {}) {
   } finally {
     job.proxyRiskRestarting = false;
   }
+}
+
+// A proxy connection failure (dead/unreachable proxy). Stop the job in a
+// terminal "proxy_error" state, name the failing proxy, and wait for the
+// operator to pick a replacement — never auto-rotate or auto-switch here.
+function failProxyConnection(job) {
+  job.proxyRiskRestarting = false;
+  if (isTerminalStatus(job.status)) return;
+  stopMailPolling(job);
+  stopSmsPolling(job);
+  releaseSmsNumber(job, "idle");
+  job.queueRunId = null;
+  // Invalidate the current run so the child's close handler bails (mirrors the
+  // session-rotation path) and cannot overwrite proxy_error with failed/resume.
+  job.runId = crypto.randomUUID();
+  job.child?.kill("SIGTERM");
+  job.child = null;
+  job.currentPhone = null;
+  job.phoneError = null;
+  job.securityCheckRequired = false;
+  job.restartRequired = false;
+  job.proxyConnectionError = true;
+  const identity = job.proxyUrl ? proxyConnectionIdentity(job.proxyUrl) : null;
+  job.failedProxyLabel = identity?.label || null;
+  job.status = "proxy_error";
+  job.prompt = "代理连接失败，请更换代理";
+  job.lastError = identity?.label
+    ? `代理连接失败：${identity.label} 无法连接，请更换代理`
+    : "代理连接失败：当前代理无法连接，请更换代理";
+  touch(job);
+  void saveJobMetadata(job).catch(() => {});
+  scheduleQueuedJobs();
 }
 
 function finishProxyRiskRetries(job, message) {
@@ -2309,6 +2734,7 @@ async function acquireSmsNumber(job, providerId, config) {
     smsClient = createSmsProvider(providerId, config, {
       lubanApiBase: process.env.LUBAN_SMS_API_BASE,
       smsBowerApiBase: process.env.SMSBOWER_API_BASE,
+      viOtpApiBase: process.env.VIOTP_API_BASE,
       acquireCustomSmsEntry,
     });
   } catch (error) {
@@ -2326,15 +2752,36 @@ async function acquireSmsNumber(job, providerId, config) {
 
   let order;
   try {
-    order = await smsClient.getNumber();
-    if (job.status !== "phone" || !job.child) {
+    // Phone-number filter: before submitting a number to the verification API,
+    // skip any number already used up (reuse cap) or risk-blocked, and fetch
+    // another. The blocked list and use counts live in the on-disk ledger.
+    const maxAttempts = 25;
+    let attempt = 0;
+    let rejected = 0;
+    while (true) {
+      attempt += 1;
+      order = await smsClient.getNumber();
+      if (job.status !== "phone" || !job.child) {
+        void smsClient.release(order.requestId).catch(() => {});
+        throw httpError(409, "任务已经不在手机号输入步骤，平台号码已释放");
+      }
+      if (isPhoneAvailable(order.number)) break;
+      const why = phoneUnavailableReason(order.number) === "risk"
+        ? "曾被风控或判定不可用"
+        : `已达使用次数上限（${phoneMaxUses}）`;
+      rejected += 1;
       void smsClient.release(order.requestId).catch(() => {});
-      throw httpError(409, "任务已经不在手机号输入步骤，平台号码已释放");
+      appendJobLog(job, `[sms] 号码 ${order.number} ${why}，已跳过并重新取号。\n`);
+      if (attempt >= maxAttempts) {
+        throw httpError(409, `连续获取到 ${rejected} 个已用过或被风控的号码，请补充新号码或调整使用次数上限`);
+      }
     }
     job.smsOrderId = order.requestId;
     job.smsNumber = order.number;
     job.smsStatus = "number_acquired";
     job.smsError = null;
+    // Reserve the number now so it is not reused beyond the configured cap.
+    recordPhoneUsage(order.number, job.email);
     // Cost ledger: a number was taken → money is held until the code verifies
     // (success = charged) or the number is released (cancel = refunded).
     const smsPrice = Number(config?.maxPrice);
@@ -2694,8 +3141,24 @@ async function cancelJob(job) {
   scheduleQueuedJobs();
 }
 
+// Cancel a job because its proxy IP has no registration slot left. Used for the
+// overflow accounts when the user starts more than the IP capacity allows.
+function cancelForProxyCapacity(job) {
+  stopMailPolling(job);
+  releaseSmsNumber(job, "idle");
+  job.status = "canceled";
+  job.prompt = "代理 IP 注册名额已满，已自动取消该任务";
+  job.lastError = null;
+  job.queueRunId = null;
+  job.child?.kill("SIGTERM");
+  job.child = null;
+  touch(job);
+  void saveJobMetadata(job).catch(() => {});
+}
+
 async function cancelAllJobs() {
-  const activeJobs = [...jobs.values()].filter((job) => isActive(job.status));
+  // "Stop all" targets running/queued work only; staged (idle) jobs stay in the list.
+  const activeJobs = [...jobs.values()].filter((job) => isActive(job.status) && job.status !== "idle");
   if (!activeJobs.length) return 0;
   queueSchedulingPaused = true;
   try {
@@ -2857,6 +3320,428 @@ function parseProxyList(text) {
 function proxyObjToUrl(p) {
   const auth = p.username ? `${encodeURIComponent(p.username)}:${encodeURIComponent(p.password || "")}@` : "";
   return `${p.protocol}://${auth}${p.host}:${p.port}`;
+}
+
+// A proxy "connection identity" ignores the rotating session segment so that a
+// single credential (which may exit from many IPs) counts as one proxy. This is
+// what "đã từng sử dụng" / "chưa từng sử dụng" is measured against. The rotation
+// tokens mirror rotateProxySession/maskSession in tls-transport.mjs: "-sid-XXXX"
+// in the username, and the kookeey numeric session in the password.
+// (PROXY_SID_PATTERN / PROXY_KOOKEEY_PATTERN are hoisted above the startup init block.)
+function stripProxySession(username, password) {
+  const canonicalUser = PROXY_SID_PATTERN.test(username)
+    ? username.replace(PROXY_SID_PATTERN, "$1sid-*")
+    : username;
+  const canonicalPass = PROXY_KOOKEEY_PATTERN.test(password)
+    ? password.replace(PROXY_KOOKEEY_PATTERN, "$1-*-$3")
+    : password;
+  return { canonicalUser, canonicalPass };
+}
+
+// Returns { key, label } for a proxy URL, or null when it cannot be parsed.
+// `key` is session-independent and credential-bearing, so it stays local (the
+// ledger/pool files are mode 0600). `label` is safe to show in the UI (host:port).
+function proxyConnectionIdentity(value) {
+  const parsed = parseProxyUrlForSub2Api(value);
+  if (!parsed) return null;
+  const { canonicalUser, canonicalPass } = stripProxySession(parsed.username, parsed.password);
+  const raw = `${parsed.protocol}|${parsed.host.toLowerCase()}|${parsed.port}|${canonicalUser}|${canonicalPass}`;
+  const key = crypto.createHash("sha256").update(raw).digest("hex").slice(0, 24);
+  return { key, label: `${parsed.host}:${parsed.port}`, protocol: parsed.protocol, host: parsed.host, port: parsed.port };
+}
+
+// ---- Used-proxy ledger (persistent, session-independent) ----
+async function loadUsedProxyLedger() {
+  usedProxyLedger.clear();
+  try {
+    const rows = usedProxyDao.getAll();
+    for (const row of rows) {
+      usedProxyLedger.set(row.identity_key, {
+        label: row.label,
+        protocol: row.protocol || "",
+        host: row.host || "",
+        port: row.port || 0,
+        firstUsedAt: row.first_used_at || null,
+        lastUsedAt: row.last_used_at || null,
+        emails: row.emails || [],
+      });
+    }
+  } catch (error) {
+    console.warn(`[warn] 代理使用记录无法读取：${String(error?.message || error).slice(0, 180)}`);
+  }
+}
+
+async function persistUsedProxyLedger() {
+  // DB writes happen inline at each mutation — this is now a no-op.
+}
+
+// ---- Deactivated-account registry (persistent, session-independent) ----
+// The console confirms deactivation from a permanent login/auth failure (it does
+// not wait for a deactivation email). A confirmed account is recorded here so its
+// mailbox stays in "Danh sách email" flagged as deactivated after the task is
+// removed, giving the operator the list to clean up on the workspace.
+async function loadDeactivatedEmails() {
+  deactivatedEmails.clear();
+  try {
+    const rows = deactivatedEmailDao.getAll();
+    for (const row of rows) {
+      deactivatedEmails.set(row.email.toLowerCase(), {
+        email: row.email,
+        reason: row.reason || null,
+        at: row.at || null,
+      });
+    }
+  } catch (error) {
+    console.warn(`[warn] 停用账号记录无法读取：${String(error?.message || error).slice(0, 180)}`);
+  }
+}
+
+async function persistDeactivatedEmails() {
+  // DB writes happen inline at each mutation — this is now a no-op.
+}
+
+// Flag an email as deactivated (idempotent). Keeps the first-seen timestamp and
+// fills in a reason when one becomes known.
+function markEmailDeactivated(email, reason) {
+  const key = String(email || "").trim().toLowerCase();
+  if (!key) return false;
+  const existing = deactivatedEmails.get(key);
+  deactivatedEmails.set(key, {
+    email: existing?.email || String(email).trim(),
+    reason: reason ? String(reason).slice(0, 500) : existing?.reason || null,
+    at: existing?.at || new Date().toISOString(),
+  });
+  try { deactivatedEmailDao.upsert(key, reason, existing?.at); } catch {}
+  return true;
+}
+
+// Drop the deactivated flag — the mailbox was deleted, or reused for a fresh
+// account that registered successfully.
+function clearEmailDeactivated(email) {
+  const key = String(email || "").trim().toLowerCase();
+  if (!deactivatedEmails.delete(key)) return;
+  try { deactivatedEmailDao.remove(key); } catch {}
+}
+
+// ---- Used / risk-flagged phone-number ledger (persistent, on this machine) ----
+// Normalize to a digits-only key so "+1 202-555-0100" and "12025550100" match.
+function normalizePhoneKey(number) {
+  return String(number || "").replace(/\D+/g, "");
+}
+
+async function loadUsedPhoneLedger() {
+  usedPhoneLedger.clear();
+  try {
+    const rows = usedPhoneDao.getAll();
+    for (const row of rows) {
+      usedPhoneLedger.set(row.digits, {
+        number: row.number,
+        uses: row.uses || 0,
+        blocked: Boolean(row.blocked),
+        blockedReason: row.blocked_reason || null,
+        firstUsedAt: row.first_used_at || null,
+        lastUsedAt: row.last_used_at || null,
+        emails: row.emails || [],
+      });
+    }
+  } catch (error) {
+    console.warn(`[warn] 手机号使用记录无法读取：${String(error?.message || error).slice(0, 180)}`);
+  }
+}
+
+async function persistUsedPhoneLedger() {
+  // DB writes happen inline at each mutation — this is now a no-op.
+}
+
+function getPhoneLedgerEntry(number) {
+  return usedPhoneLedger.get(normalizePhoneKey(number)) || null;
+}
+
+// A number may be picked only when it is not risk-blocked and still under the
+// reuse cap (phoneMaxUses === 0 disables the cap but never the block-list).
+function isPhoneAvailable(number) {
+  const digits = normalizePhoneKey(number);
+  if (!digits) return true; // can't key it → don't block the flow
+  const entry = usedPhoneLedger.get(digits);
+  if (!entry) return true;
+  if (entry.blocked) return false;
+  if (phoneMaxUses > 0 && entry.uses >= phoneMaxUses) return false;
+  return true;
+}
+
+function phoneUnavailableReason(number) {
+  const entry = getPhoneLedgerEntry(number);
+  if (!entry) return null;
+  if (entry.blocked) return "risk";
+  if (phoneMaxUses > 0 && entry.uses >= phoneMaxUses) return "max-uses";
+  return null;
+}
+
+// Count a number as used (it was submitted to the verification API). Never
+// removed, so the cap holds across restarts and even after accounts are deleted.
+function recordPhoneUsage(number, email) {
+  const digits = normalizePhoneKey(number);
+  if (!digits) return;
+  const now = new Date().toISOString();
+  const entry = usedPhoneLedger.get(digits) || { number: String(number), uses: 0, blocked: false, blockedReason: null, firstUsedAt: now, lastUsedAt: now, emails: [] };
+  entry.number = String(number) || entry.number;
+  entry.uses += 1;
+  entry.firstUsedAt = entry.firstUsedAt || now;
+  entry.lastUsedAt = now;
+  if (email && !entry.emails.includes(String(email))) entry.emails.push(String(email));
+  usedPhoneLedger.set(digits, entry);
+  try { usedPhoneDao.recordUsage(digits, entry, email); } catch {}
+}
+
+// Permanently block a number the platform's risk control (or an "already used /
+// invalid" rejection) turned down, so the next change-phone skips it.
+function markPhoneBlocked(number, reason, email) {
+  const digits = normalizePhoneKey(number);
+  if (!digits) return;
+  const now = new Date().toISOString();
+  const entry = usedPhoneLedger.get(digits) || { number: String(number), uses: 0, blocked: false, blockedReason: null, firstUsedAt: now, lastUsedAt: now, emails: [] };
+  entry.number = String(number) || entry.number;
+  entry.blocked = true;
+  entry.blockedReason = reason ? String(reason).slice(0, 300) : entry.blockedReason || "风控/号码不可用";
+  entry.lastUsedAt = now;
+  if (email && !entry.emails.includes(String(email))) entry.emails.push(String(email));
+  usedPhoneLedger.set(digits, entry);
+  try { usedPhoneDao.markBlocked(digits, entry.number, entry.blockedReason, email); } catch {}
+}
+
+// A phone rejection that should permanently burn the number: risk control,
+// already-used / in-use, or an invalid/unsupported number. Pure rate-limiting is
+// transient, so it is intentionally excluded.
+function isPhonePermanentlyBad(message) {
+  const text = String(message || "");
+  if (/too many|rate.?limit|HTTP 429/i.test(text) && !/suspicious|risk|used|in.?use|invalid|unsupported|blocked|banned|风控/i.test(text)) {
+    return false;
+  }
+  return /suspicious behavior|风控|fraud|phone_recently_used|phone number was recently used|phone_number_in_use|phone number already in use|already|unsupported|invalid phone|blocked|banned/i.test(text);
+}
+
+function setPhoneMaxUses(value) {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 0 || n > 1000) throw httpError(400, "使用次数上限必须是 0 到 1000 的整数");
+  phoneMaxUses = n;
+  try { settingsDao.set("phone_max_uses", String(n)); } catch {}
+  return phoneMaxUses;
+}
+
+function phoneLedgerStats() {
+  let blocked = 0;
+  let totalUses = 0;
+  for (const entry of usedPhoneLedger.values()) {
+    if (entry.blocked) blocked += 1;
+    totalUses += entry.uses;
+  }
+  return { maxUses: phoneMaxUses, totalNumbers: usedPhoneLedger.size, blocked, totalUses };
+}
+
+// Record that a proxy credential has been assigned to an account. Never removed
+// on account deletion, so the ledger keeps the full history ("kể cả tài khoản đã xóa").
+function recordProxyUsage(proxyUrl, email) {
+  const identity = proxyConnectionIdentity(proxyUrl);
+  if (!identity) return;
+  const now = new Date().toISOString();
+  const existing = usedProxyLedger.get(identity.key);
+  if (existing) {
+    existing.lastUsedAt = now;
+    existing.label = identity.label;
+    existing.protocol = identity.protocol;
+    existing.host = identity.host;
+    existing.port = identity.port;
+    if (email && !existing.emails.includes(email)) existing.emails.push(email);
+  } else {
+    usedProxyLedger.set(identity.key, {
+      label: identity.label,
+      protocol: identity.protocol,
+      host: identity.host,
+      port: identity.port,
+      firstUsedAt: now,
+      lastUsedAt: now,
+      emails: email ? [email] : [],
+    });
+  }
+  try {
+    usedProxyDao.recordUsage(identity.key, {
+      label: identity.label, protocol: identity.protocol,
+      host: identity.host, port: identity.port,
+      firstUsedAt: now, lastUsedAt: now,
+    }, email);
+  } catch (error) {
+    console.warn(`[warn] 代理使用记录写入失败：${String(error?.message || error).slice(0, 180)}`);
+  }
+}
+
+function isProxyEverUsed(key) {
+  return usedProxyLedger.has(key);
+}
+
+// True when some existing (non-deleted) job is currently assigned a proxy with
+// the same connection identity — used to enforce the reuse-confirmation rule.
+function proxyCurrentlyInUse(key, exceptJobId = null) {
+  for (const job of jobs.values()) {
+    if (exceptJobId && job.id === exceptJobId) continue;
+    if (!job.proxyUrl) continue;
+    const identity = proxyConnectionIdentity(job.proxyUrl);
+    if (identity && identity.key === key) return true;
+  }
+  return false;
+}
+
+// On startup, make sure every proxy already assigned to a restored account is in
+// the ledger, so pre-existing accounts count as "đã từng sử dụng" too.
+function backfillUsedProxiesFromJobs() {
+  for (const job of jobs.values()) {
+    if (job.proxyUrl) recordProxyUsage(job.proxyUrl, job.email);
+  }
+}
+
+// Reconcile every already-confirmed-deactivated job (its autoRepairBlocked flag
+// was restored from metadata on load) so the mailbox shows as deactivated in
+// "Danh sách email" right away — without waiting for a fresh failure or a monitor
+// pass. With no Sub2API backend configured the task is also dropped here; with a
+// backend, removal is left to the monitor (disable scheduling first, then drop).
+async function backfillDeactivatedFromJobs() {
+  for (const job of [...jobs.values()].filter((item) => item.autoRepairBlocked)) {
+    await maybeRemoveDeactivatedNow(job.email, job.autoRepairBlockedReason);
+  }
+}
+
+// ---- Proxy pool (proxies loaded into the system to pick replacements from) ----
+async function loadProxyPool() {
+  proxyPool.clear();
+  try {
+    const rows = proxyPoolDao.getAll();
+    for (const row of rows) {
+      proxyPool.set(row.identity_key, {
+        label: row.label || "",
+        protocol: row.protocol || "",
+        host: row.host || "",
+        port: row.port || 0,
+        username: row.username || "",
+        password: row.password || "",
+        url: row.url || "",
+        addedAt: row.added_at || null,
+      });
+    }
+  } catch (error) {
+    console.warn(`[warn] 代理池无法读取：${String(error?.message || error).slice(0, 180)}`);
+  }
+}
+
+async function persistProxyPool() {
+  // DB writes happen inline at each mutation — this is now a no-op.
+}
+
+// Import a newline/comma separated proxy list into the pool. Returns counts.
+function importProxiesIntoPool(text) {
+  const parsed = parseProxyList(text);
+  let added = 0;
+  let skipped = 0;
+  for (const proxy of parsed) {
+    const url = proxyObjToUrl(proxy);
+    const identity = proxyConnectionIdentity(url);
+    if (!identity) {
+      skipped += 1;
+      continue;
+    }
+    if (proxyPool.has(identity.key)) {
+      skipped += 1;
+      continue;
+    }
+    const entry = {
+      label: identity.label,
+      protocol: proxy.protocol,
+      host: proxy.host,
+      port: proxy.port,
+      username: proxy.username || "",
+      password: proxy.password || "",
+      url,
+      addedAt: new Date().toISOString(),
+    };
+    proxyPool.set(identity.key, entry);
+    try { proxyPoolDao.upsert(identity.key, entry); } catch {}
+    added += 1;
+  }
+  return { added, skipped, total: proxyPool.size };
+}
+
+// Public projection of the pool, annotated with used/in-use flags.
+function publicProxyPool() {
+  const out = [];
+  for (const [key, entry] of proxyPool) {
+    out.push({
+      key,
+      label: entry.label,
+      protocol: entry.protocol,
+      host: entry.host,
+      port: entry.port,
+      addedAt: entry.addedAt,
+      used: isProxyEverUsed(key),
+      inUse: proxyCurrentlyInUse(key),
+    });
+  }
+  return out;
+}
+
+// Auto-assign proxies from a configured list when registering accounts in batch
+// mode: round-robin over the IPs (host-deduped) that are still under limitPerIp.
+// Usage counts come from existing jobs grouped by IP (host); IPs that are not in
+// the configured list (e.g. old IPs) are ignored and never picked.
+// A job occupies one registration slot on its proxy IP when it has registered
+// (reached the SMS step) and is not deactivated, OR while it is actively running
+// toward a registration. Queued/idle ("chờ khởi động") jobs, jobs that failed
+// before the SMS step, and deactivated accounts do NOT hold a slot.
+function jobConsumesProxySlot(job) {
+  if (job.deleted || !job.proxyUrl) return false;
+  if (job.autoRepairBlocked) return false; // account deactivated → slot freed
+  return Boolean(job.registrationSucceeded) || occupiesActiveSlot(job);
+}
+
+// Map of proxy IP (host) -> number of registration slots currently occupied.
+function proxyConsumedByHost() {
+  const usage = new Map();
+  for (const job of listUniqueJobs()) {
+    if (!jobConsumesProxySlot(job)) continue;
+    const parsed = parseProxyUrlForSub2Api(job.proxyUrl);
+    if (!parsed) continue;
+    usage.set(parsed.host, (usage.get(parsed.host) || 0) + 1);
+  }
+  return usage;
+}
+
+function makeProxyAllocator(proxiesText, limitPerIpRaw) {
+  const limitPerIp = Math.min(999, Math.max(1, Math.trunc(Number(limitPerIpRaw)) || 15));
+  const list = [];
+  const seen = new Set();
+  for (const p of parseProxyList(proxiesText)) {
+    if (seen.has(p.host)) continue;
+    seen.add(p.host);
+    list.push({ host: p.host, url: proxyObjToUrl(p) });
+  }
+  // Only registered-or-running (non-deactivated) jobs occupy a slot; queued/idle
+  // and pre-SMS failures do not — so freshly staged accounts don't pre-reserve.
+  const usage = proxyConsumedByHost();
+  for (const item of list) if (!usage.has(item.host)) usage.set(item.host, 0);
+  let cursor = 0;
+  return {
+    limitPerIp,
+    count: list.length,
+    remainingCapacity: () => list.reduce((sum, it) => sum + Math.max(0, limitPerIp - (usage.get(it.host) || 0)), 0),
+    next: () => {
+      for (let i = 0; i < list.length; i += 1) {
+        const item = list[(cursor + i) % list.length];
+        if ((usage.get(item.host) || 0) < limitPerIp) {
+          cursor = (cursor + i + 1) % list.length;
+          usage.set(item.host, (usage.get(item.host) || 0) + 1);
+          return item.url;
+        }
+      }
+      return null; // tất cả IP đã đạt giới hạn
+    },
+  };
 }
 
 // Run an async mapper over items with a bounded number of concurrent workers,
@@ -3025,31 +3910,37 @@ function sub2ApiResponseMessage(payload, text) {
 
 async function loadSub2ApiMonitorConfiguration() {
   try {
-    const saved = JSON.parse(await fs.readFile(SUB2API_MONITOR_PATH, "utf8"));
-    const config = normalizeSub2ApiConfig(saved.config);
-    sub2ApiMonitorConfig = { ...config, enabled: saved.enabled === true };
-    sub2ApiMonitorState.lastCheckAt = saved.state?.lastCheckAt || null;
-    sub2ApiMonitorState.lastError = saved.state?.lastError || null;
-    sub2ApiMonitorState.lastResult = saved.state?.lastResult && typeof saved.state.lastResult === "object"
-      ? saved.state.lastResult
-      : null;
+    const saved = sub2apiMonitorDao.get();
+    if (!saved) { sub2ApiMonitorConfig = null; return; }
+    const config = normalizeSub2ApiConfig({
+      baseUrl: saved.base_url,
+      adminApiKey: saved.admin_api_key,
+      groupIds: saved.group_ids ? JSON.parse(saved.group_ids) : [],
+      proxyId: saved.proxy_id,
+      concurrency: saved.concurrency,
+      loadFactor: saved.load_factor,
+      priority: saved.priority,
+      modelWhitelist: saved.model_whitelist ? JSON.parse(saved.model_whitelist) : [],
+      codexFingerprintMode: saved.codex_fingerprint_mode,
+    });
+    sub2ApiMonitorConfig = { ...config, enabled: Boolean(saved.enabled) };
+    sub2ApiMonitorState.lastCheckAt = saved.last_check_at || null;
+    sub2ApiMonitorState.lastError = saved.last_error || null;
+    sub2ApiMonitorState.lastResult = saved.last_result ? JSON.parse(saved.last_result) : null;
   } catch (error) {
-    if (error?.code !== "ENOENT") {
-      console.warn(`[warn] Sub2API 号池监控配置无法读取：${String(error?.message || error).slice(0, 180)}`);
-    }
+    console.warn(`[warn] Sub2API 号池监控配置无法读取：${String(error?.message || error).slice(0, 180)}`);
     sub2ApiMonitorConfig = null;
   }
 }
 
 async function persistSub2ApiMonitorConfiguration() {
   if (!sub2ApiMonitorConfig) {
-    await fs.rm(SUB2API_MONITOR_PATH, { force: true });
+    try { sub2apiMonitorDao.remove(); } catch {}
     return;
   }
-  const payload = {
-    version: 1,
-    enabled: Boolean(sub2ApiMonitorConfig.enabled),
-    config: {
+  try {
+    sub2apiMonitorDao.upsert({
+      enabled: sub2ApiMonitorConfig.enabled,
       baseUrl: sub2ApiMonitorConfig.baseUrl,
       adminApiKey: sub2ApiMonitorConfig.adminApiKey,
       groupIds: sub2ApiMonitorConfig.groupIds,
@@ -3059,17 +3950,13 @@ async function persistSub2ApiMonitorConfiguration() {
       priority: sub2ApiMonitorConfig.priority,
       modelWhitelist: sub2ApiMonitorConfig.modelWhitelist,
       codexFingerprintMode: sub2ApiMonitorConfig.codexFingerprintMode,
-    },
-    state: {
       lastCheckAt: sub2ApiMonitorState.lastCheckAt,
       lastError: sub2ApiMonitorState.lastError,
       lastResult: sub2ApiMonitorState.lastResult,
-    },
-    updatedAt: new Date().toISOString(),
-  };
-  const tempPath = `${SUB2API_MONITOR_PATH}.${process.pid}.${crypto.randomUUID()}.tmp`;
-  await fs.writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
-  await fs.rename(tempPath, SUB2API_MONITOR_PATH);
+    });
+  } catch (error) {
+    console.warn(`[warn] Sub2API monitor config save failed: ${error.message}`);
+  }
 }
 
 function publicSub2ApiMonitorState() {
@@ -3124,6 +4011,8 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
       missingTask: 0,
       ineligible: 0,
       blocked: 0,
+      disabled: 0,
+      removed: 0,
       busy: 0,
       cooldown: 0,
       outsideGroups: 0,
@@ -3160,6 +4049,16 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
           summary.matched += accounts.length;
           if (job.autoRepairBlocked) {
             summary.blocked += accounts.length;
+            // Console cannot recover this account (confirmed banned/deleted/deactivated) —
+            // stop Sub2API from scheduling a permanently broken account, then drop the
+            // task so only the mailbox remains (flagged deactivated). Remove only once
+            // scheduling is confirmed off (no failed calls); otherwise retry next pass.
+            const outcome = await disableSub2ApiScheduling(config, accounts, job, "账号已确认不可用");
+            summary.disabled += outcome.disabled;
+            markEmailDeactivated(email, job.autoRepairBlockedReason);
+            if (outcome.failed === 0 && await removeDeactivatedTask(email, job.autoRepairBlockedReason)) {
+              summary.removed += 1;
+            }
             return;
           }
           if (isActive(job.status) || job.autoRepairOperation) {
@@ -3174,6 +4073,10 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
           const eligibility = getAutoRepairEligibility(job);
           if (!eligibility.eligible) {
             summary.ineligible += accounts.length;
+            // Not auto-repairable (e.g. the last full login needed a manually entered
+            // password / email code / 2FA) — keep it out of the schedule instead of
+            // letting Sub2API keep dispatching an account the console can't fix.
+            summary.disabled += (await disableSub2ApiScheduling(config, accounts, job, eligibility.reason)).disabled;
             return;
           }
 
@@ -3183,6 +4086,35 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
           await saveJobMetadata(job);
           summary.started += accounts.length;
         });
+      }
+
+      // Confirmed-deactivated tasks that never surfaced as Sub2API error accounts
+      // this pass (e.g. an account banned during creation, or one outside the error
+      // pool): make sure any schedulable Sub2API account for them is turned off,
+      // then drop the task. The full-account listing is fetched at most once, and
+      // only when such a task actually exists — a quiet pass makes no extra calls.
+      const residualBlocked = listUniqueJobs().filter((job) => job.autoRepairBlocked);
+      if (residualBlocked.length) {
+        let backendAccounts = null;
+        for (const candidate of residualBlocked) {
+          if (shuttingDown) break;
+          await withEmailJobLock(candidate.email, async () => {
+            const job = findJobByEmail(candidate.email);
+            if (!job || !job.autoRepairBlocked) return;
+            const emailKey = job.email.toLowerCase();
+            if (backendAccounts === null) {
+              backendAccounts = await listAllSub2ApiAccounts(config).catch(() => []);
+            }
+            const matches = backendAccounts.filter((account) => sub2ApiAccountEmail(account) === emailKey);
+            const outcome = matches.length
+              ? await disableSub2ApiScheduling(config, matches, job, "账号已确认不可用")
+              : { disabled: 0, failed: 0 };
+            summary.disabled += outcome.disabled;
+            if (outcome.failed === 0 && await removeDeactivatedTask(job.email, job.autoRepairBlockedReason)) {
+              summary.removed += 1;
+            }
+          });
+        }
       }
 
       sub2ApiMonitorState.lastCheckAt = new Date().toISOString();
@@ -3215,6 +4147,61 @@ function createSub2ApiAutoRepairOperation(config, accounts) {
     config,
     startedAt: new Date().toISOString(),
   };
+}
+
+// Stop Sub2API from scheduling error accounts the console cannot auto-repair
+// (ineligible logins or permanently blocked accounts). Best-effort and
+// idempotent: accounts already marked schedulable=false are skipped, and a
+// single failed call must never abort the whole monitor pass.
+async function disableSub2ApiScheduling(config, accounts, job = null, reason = "") {
+  let disabled = 0;
+  let failed = 0;
+  for (const account of accounts) {
+    const accountId = Number(account?.id);
+    if (!Number.isSafeInteger(accountId) || accountId <= 0) continue;
+    if (account?.schedulable === false) continue; // already out of the schedule
+    try {
+      await requestSub2Api(config, `/api/v1/admin/accounts/${accountId}/schedulable`, {
+        method: "POST",
+        body: JSON.stringify({ schedulable: false }),
+      });
+      disabled += 1;
+    } catch {
+      failed += 1;
+    }
+  }
+  if (job && (disabled || failed)) {
+    const detail = reason ? `（${reason}）` : "";
+    appendJobLog(
+      job,
+      failed
+        ? `[monitor] 无法自动修复${detail}，已在 Sub2API 停止调度 ${disabled} 条，另有 ${failed} 条停调失败，下次巡检重试。\n`
+        : `[monitor] 无法自动修复${detail}，已在 Sub2API 停止调度（schedulable=false）${disabled} 条账号。\n`,
+    );
+  }
+  return { disabled, failed };
+}
+
+// A confirmed-deactivated account whose Sub2API scheduling is already off: drop
+// the local task + run files so it leaves the task list. The mailbox stays in the
+// deactivated registry (and thus in "Danh sách email") — it is never removed here.
+async function removeDeactivatedTask(email, reason) {
+  markEmailDeactivated(email, reason);
+  const key = String(email || "").trim().toLowerCase();
+  if (!key || !findJobByEmail(key)) return false;
+  await deleteJobsByEmail(key);
+  return true;
+}
+
+// Tag a confirmed-deactivated account, then drop its task right away when no
+// Sub2API backend is configured (there is nothing to unschedule). When a backend
+// IS configured, only tag here and leave removal to the monitor, so Sub2API
+// scheduling is turned off first (the user's chosen ordering). Tagging runs
+// synchronously before the first await, so the label appears immediately.
+async function maybeRemoveDeactivatedNow(email, reason) {
+  markEmailDeactivated(email, reason);
+  if (sub2ApiMonitorConfig?.baseUrl) return false;
+  return removeDeactivatedTask(email, reason);
 }
 
 async function retryPendingSub2ApiUploads(config, summary) {
@@ -3610,12 +4597,17 @@ function publicJob(job) {
     securityCheckRequired: Boolean(job.securityCheckRequired),
     canRetry: ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
     canResume: job.status === "resume_available",
+    canStart: job.status === "idle",
     canRegenerate: job.status === "completed" && job.resultSaved,
     canForceRelogin: canForceRelogin(job),
     canSetupTotp: canSetupTotp(job),
     canAddPassword: canAddPassword(job),
     restartRequired: job.restartRequired,
     proxyConfigured: Boolean(job.proxyUrl),
+    proxyConnectionError: Boolean(job.proxyConnectionError),
+    failedProxyLabel: job.failedProxyLabel || null,
+    canChangeProxy: job.status === "proxy_error",
+    canReconnectProxy: job.status === "proxy_error" && Boolean(job.proxyUrl),
     autoRepairEligible: autoRepair.eligible,
     autoRepairEligibilityReason: autoRepair.reason,
     autoRepairBlocked: Boolean(job.autoRepairBlocked),
@@ -3635,6 +4627,7 @@ function publicSelectionJob(job) {
     status: job.status,
     canDownload: Boolean(job.resultSaved),
     canRetry: ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
+    canStart: job.status === "idle",
     canRegenerate: job.status === "completed" && job.resultSaved,
     canForceRelogin: canForceRelogin(job),
     canSetupTotp: canSetupTotp(job),
@@ -3713,7 +4706,21 @@ function setStage(job, status, prompt) {
   job.status = status;
   job.prompt = prompt;
   job.lastError = null;
+  // Reaching the SMS/phone step means email OTP + account creation succeeded —
+  // i.e. the account was registered through its proxy IP.
+  if (["phone", "phone_otp", "finalizing"].includes(status)) markRegistrationSucceeded(job);
   touch(job);
+}
+
+// A job counts as a successful registration once it has passed email OTP and
+// reached the SMS step. Persisted so it survives later status changes, restarts
+// and completion, and drives the per-IP "remaining registrations" quota.
+function markRegistrationSucceeded(job) {
+  if (job.registrationSucceeded) return;
+  job.registrationSucceeded = true;
+  job.registeredAt = new Date().toISOString();
+  clearEmailDeactivated(job.email); // fresh account registered on this mailbox → no longer deactivated
+  void saveJobMetadata(job).catch(() => {});
 }
 
 function failJob(job, message) {
@@ -3791,6 +4798,10 @@ function markAutoRepairBlocked(job, reason) {
   job.autoRepairPendingBackend = null;
   job.autoRepairOperation = null;
   appendJobLog(job, "[monitor] 已确认账号被封禁、删除或永久停用，后续号池巡检将直接跳过。\n");
+  // Label the mailbox as deactivated right away — don't wait for a deactivation
+  // email. With no Sub2API backend the task is dropped now; with a backend the
+  // monitor drops it after turning off scheduling. (Tagging is synchronous.)
+  void maybeRemoveDeactivatedNow(job.email, job.autoRepairBlockedReason).catch(() => {});
 }
 
 function isPermanentAccountFailure(message) {
@@ -3824,7 +4835,8 @@ function isActive(status) {
 }
 
 function occupiesActiveSlot(job) {
-  return isActive(job.status) && job.status !== "queued";
+  // Staged ("idle") jobs are not running, so they never take a concurrency slot.
+  return isActive(job.status) && job.status !== "queued" && job.status !== "idle";
 }
 
 function getQueuePosition(job) {
@@ -3836,7 +4848,7 @@ function getQueuePosition(job) {
 }
 
 function isTerminalStatus(status) {
-  return ["completed", "failed", "canceled", "reauth_required", "resume_available"].includes(status);
+  return ["completed", "failed", "canceled", "reauth_required", "resume_available", "proxy_error"].includes(status);
 }
 
 function uniqueByJson(items) {
@@ -3903,6 +4915,7 @@ async function deleteJobsByEmail(email) {
     directories.add(path.dirname(job.outputPath));
     jobs.delete(job.id);
   });
+  try { jobDao.deleteByIds(matching.map((j) => j.id)); } catch {}
   await Promise.allSettled(matching.map((job) => job.metadataWritePromise).filter(Boolean));
   await Promise.all([
     ...[...directories].map((directory) => fs.rm(directory, { recursive: true, force: true })),
@@ -4003,6 +5016,7 @@ async function syncCompletedOutputs(force = false) {
           fallbackInProgress: false,
           ...restoredTotpSetupState(metadata, storedCredentials),
           ...restoredProxyRiskState(metadata),
+          ...restoredRegistrationState(metadata),
           ...restoredAutoRepairState(metadata),
           ...restoredSub2ApiUploadState(metadata),
           totpSetupError: restoredOperation.totpSetupError,
@@ -4098,6 +5112,7 @@ async function syncCompletedOutputs(force = false) {
           fallbackInProgress: false,
           ...restoredTotpSetupState(metadata, storedCredentials),
           ...restoredProxyRiskState(metadata),
+          ...restoredRegistrationState(metadata),
           ...restoredAutoRepairState(metadata),
           ...restoredSub2ApiUploadState(metadata),
           totpSetupError: totpRecovery.error || null,
@@ -4123,7 +5138,8 @@ async function syncCompletedOutputs(force = false) {
         const storedCredentialsMissing = missingStoredCredentials.length > 0;
         const savedStatus = String(metadata.status || "");
         const restartable = ["queued", "starting"].includes(savedStatus);
-        const interrupted = Boolean(savedStatus) && !isTerminalStatus(savedStatus) && !restartable;
+        // Staged ("idle") jobs never ran, so they are not "interrupted" — keep them idle.
+        const interrupted = Boolean(savedStatus) && !isTerminalStatus(savedStatus) && !restartable && savedStatus !== "idle";
         const restoredStatus = storedCredentialsMissing && restartable
           ? "reauth_required"
           : restartable
@@ -4195,6 +5211,7 @@ async function syncCompletedOutputs(force = false) {
           fallbackInProgress: false,
           ...restoredTotpSetupState(metadata, storedCredentials),
           ...restoredProxyRiskState(metadata),
+          ...restoredRegistrationState(metadata),
           ...restoredAutoRepairState(metadata),
           ...restoredSub2ApiUploadState(metadata),
           passwordAddError: metadata.password_add_error || null,
@@ -4455,6 +5472,20 @@ function restoredProxyRiskState(metadata = {}) {
     proxyRiskRestarting: false,
     proxySessionAttemptIds: new Set(),
     proxyAttemptParserTail: "",
+    proxyConnectionError: Boolean(metadata.proxy_connection_error),
+    failedProxyLabel: metadata.failed_proxy_label || null,
+  };
+}
+
+// Restore whether a job already counted as a registered account. Older metadata
+// (before this flag existed) is inferred from a status that is at/after the SMS
+// step, or from a saved result.
+function restoredRegistrationState(metadata = {}) {
+  const reachedSms = ["phone", "phone_otp", "finalizing", "completed"].includes(String(metadata.status || ""));
+  const succeeded = Boolean(metadata.registration_succeeded) || reachedSms || Boolean(metadata.result_saved);
+  return {
+    registrationSucceeded: succeeded,
+    registeredAt: metadata.registered_at || (succeeded ? (metadata.updated_at || metadata.created_at || null) : null),
   };
 }
 
@@ -4942,13 +5973,14 @@ async function updateJobCredentials(job, credentials, options = {}) {
   job.hasPasswordCredential = Boolean(normalized.password);
   job.hasTotpCredential = Boolean(normalized.totpSecret);
   job.proxyUrl = nextProxyUrl;
+  if (nextProxyUrl) recordProxyUsage(nextProxyUrl, job.email);
   job.mailSeenCandidateKeys.clear();
   job.mailCandidateCounts.clear();
   job.mailStatus = job.mailApiUrl ? "baseline" : "manual";
   job.mailApiError = null;
   recordJobOperation(job, "account_update");
   appendJobLog(job, "[account] 登录方式与验证资料已按邮箱唯一键更新，敏感字段未写入日志。\n");
-  if (isActive(job.status) && job.status !== "queued") {
+  if (isActive(job.status) && job.status !== "queued" && job.status !== "idle") {
     restartJobAfterConfigurationUpdate(job);
   } else {
     touch(job);
@@ -4959,15 +5991,229 @@ async function updateJobCredentials(job, credentials, options = {}) {
 async function updateJobProxy(job, proxyUrl) {
   if (job.proxyUrl === proxyUrl) return;
   job.proxyUrl = proxyUrl;
+  if (proxyUrl) recordProxyUsage(proxyUrl, job.email);
+  // A fresh proxy clears the previous connection-error marker.
+  job.proxyConnectionError = false;
+  job.failedProxyLabel = null;
   await saveStoredLoginCredentials(job.email, job);
   recordJobOperation(job, "proxy_update");
   appendJobLog(job, "[proxy] 账号代理配置已更新。\n");
-  if (isActive(job.status) && job.status !== "queued") {
+  if (isActive(job.status) && job.status !== "queued" && job.status !== "idle") {
     restartJobAfterConfigurationUpdate(job);
   } else {
     touch(job);
     await saveJobMetadata(job);
   }
+}
+
+// Operator-driven replacement of a dead proxy. Enforces: the replacement must be
+// in the loaded pool; it must differ from the failing proxy; and a connection
+// credential ("giao thức kết nối") that was ever used may only be reused when no
+// account currently uses it AND the operator explicitly confirms. Never switches
+// proxies on its own. Returns { status, payload } for the route to send.
+async function changeJobProxy(job, body = {}) {
+  if (job.status !== "proxy_error") {
+    throw httpError(409, "只有代理连接失败的任务才能更换代理");
+  }
+  // The client selects a pooled proxy by its key (credentials never leave the
+  // server); a raw proxyUrl is also accepted for flexibility/tests.
+  let proxyUrl;
+  if (body.poolKey) {
+    const entry = proxyPool.get(String(body.poolKey));
+    if (!entry) throw httpError(400, "所选代理不在系统代理池中，请刷新后重试");
+    proxyUrl = entry.url;
+  } else {
+    proxyUrl = normalizeProxyUrl(body.proxyUrl);
+  }
+  if (!proxyUrl) throw httpError(400, "必须提供有效的代理地址");
+  const identity = proxyConnectionIdentity(proxyUrl);
+  if (!identity) throw httpError(400, "无法解析代理连接信息");
+
+  // "đã được nạp vào hệ thống": only proxies loaded into the pool are selectable.
+  if (!proxyPool.has(identity.key)) {
+    throw httpError(400, "该代理尚未纳入系统代理池，请先在代理池中导入后再选择");
+  }
+
+  const currentIdentity = job.proxyUrl ? proxyConnectionIdentity(job.proxyUrl) : null;
+  if (currentIdentity && currentIdentity.key === identity.key) {
+    throw httpError(409, "新代理与当前失败的代理相同，请选择其它代理");
+  }
+
+  // never-used → allow; used-before → require confirmation and no current user.
+  if (isProxyEverUsed(identity.key)) {
+    if (proxyCurrentlyInUse(identity.key, job.id)) {
+      throw httpError(409, "该代理线路仍有其它账号在使用，不能重复使用");
+    }
+    if (body.confirmReuse !== true) {
+      return {
+        status: 409,
+        payload: {
+          needsReuseConfirm: true,
+          proxyLabel: identity.label,
+          message: "该代理线路曾被使用，但当前没有账号在用。确认要重复使用吗？",
+        },
+      };
+    }
+  }
+
+  // Verify the replacement actually connects before committing to it. A test
+  // seam skips the live network probe (smoke tests have no real proxy).
+  const check = process.env.PROXY_CHANGE_SKIP_LIVE_CHECK === "1"
+    ? { ok: true, ip: null }
+    : await checkProxyExitIp(proxyUrl);
+  if (!check.ok) {
+    throw httpError(502, `新代理仍然无法连接：${check.error || "未知错误"}`);
+  }
+
+  job.proxyUrl = proxyUrl;
+  job.proxyConnectionError = false;
+  job.failedProxyLabel = null;
+  await saveStoredLoginCredentials(job.email, job);
+  recordProxyUsage(proxyUrl, job.email);
+  recordJobOperation(job, "proxy_change");
+  appendJobLog(job, `[proxy] 已更换为新的代理线路（${identity.label}，出口 IP ${check.ip || "未知"}）。\n`);
+
+  // Auto-sync the new proxy to Sub2API when this account was uploaded there.
+  let sub2apiSync = { attempted: false };
+  if (job.sub2apiUploadedAt) {
+    sub2apiSync = await syncAccountProxyToSub2Api(job, proxyUrl, body.config).catch((error) => ({
+      attempted: true,
+      ok: false,
+      error: String(error?.message || error).slice(0, 300),
+    }));
+    if (sub2apiSync.ok) {
+      appendJobLog(job, `[proxy] 新代理已同步到 Sub2API（proxy_id ${sub2apiSync.proxyId}）。\n`);
+    } else if (sub2apiSync.attempted) {
+      appendJobLog(job, `[proxy] 同步新代理到 Sub2API 失败：${sub2apiSync.error || "未知错误"}。\n`);
+    }
+  }
+
+  restartJobForProxyChange(job);
+  return {
+    status: 200,
+    payload: { changed: true, proxyLabel: identity.label, exitIp: check.ip || null, sub2apiSync },
+  };
+}
+
+// Operator-driven retry of the SAME proxy that just failed. A proxy_error can be
+// transient (the pool health probe may still show the proxy up while a single
+// login attempt failed), so re-test the current proxy and, if it now connects,
+// resume the login flow on it without forcing a change. If it still fails, report
+// the error so the operator switches proxies instead. Never retries on its own.
+async function reconnectJobProxy(job) {
+  if (job.status !== "proxy_error") {
+    throw httpError(409, "只有代理连接失败的任务才能重新连接");
+  }
+  const proxyUrl = job.proxyUrl;
+  if (!proxyUrl) throw httpError(409, "当前任务没有可重连的代理，请改用更换代理");
+  const identity = proxyConnectionIdentity(proxyUrl);
+
+  // Verify the same proxy actually connects now before committing to a restart.
+  // A test seam skips the live network probe (smoke tests have no real proxy).
+  const check = process.env.PROXY_CHANGE_SKIP_LIVE_CHECK === "1"
+    ? { ok: true, ip: null }
+    : await checkProxyExitIp(proxyUrl);
+  if (!check.ok) {
+    throw httpError(502, `代理仍然无法连接：${check.error || "未知错误"}，请更换代理`);
+  }
+
+  job.proxyConnectionError = false;
+  job.failedProxyLabel = null;
+  recordProxyUsage(proxyUrl, job.email);
+  recordJobOperation(job, "proxy_reconnect");
+  appendJobLog(
+    job,
+    `[proxy] 原代理重新连接成功（${identity?.label || "未知"}，出口 IP ${check.ip || "未知"}），使用原代理重新登录。\n`,
+  );
+  restartJobForProxyChange(job, {
+    source: "proxy_reconnect",
+    logLine: `\n[proxy-reconnect] 使用原代理开始第 ${job.attempt + 1} 次授权登录。\n`,
+    enqueueMessage: "代理已重新连接，正在使用原代理重新登录",
+  });
+  return {
+    status: 200,
+    payload: { reconnected: true, proxyLabel: identity?.label || null, exitIp: check.ip || null },
+  };
+}
+
+// Restart the login flow after a proxy change or reconnect (a proxy_error job is
+// terminal, so updateJobProxy's active-only restart does not apply here). The
+// caller supplies the automation source, log line and queue prompt so the same
+// restart path serves both "更换代理" (new proxy) and "重新连接" (same proxy).
+function restartJobForProxyChange(job, options = {}) {
+  const source = options.source || "proxy_change";
+  const logLine = options.logLine || `\n[proxy-change] 使用新代理开始第 ${job.attempt + 1} 次授权登录。\n`;
+  const enqueueMessage = options.enqueueMessage || "已更换代理，正在使用新代理重新登录";
+  stopMailPolling(job);
+  releaseSmsNumber(job, "idle");
+  job.queueRunId = null;
+  job.runId = crypto.randomUUID();
+  job.child?.kill("SIGTERM");
+  job.child = null;
+  job.lastError = null;
+  job.parserTail = "";
+  job.completedAt = null;
+  job.currentPhone = null;
+  job.phoneError = null;
+  job.securityCheckRequired = false;
+  job.restartRequired = false;
+  job.attempt += 1;
+  job.proxyRiskRetryCount = 0;
+  job.proxyConnectionFailureCount = 0;
+  job.directTlsFallbackAttempted = false;
+  job.proxyRiskRestarting = false;
+  job.proxySessionAttemptIds.clear();
+  job.proxyAttemptParserTail = "";
+  job.mailCandidateCounts.clear();
+  beginAuthorizationAutomationAttempt(job, source);
+  recordJobOperation(job, "reauthorize");
+  appendJobLog(job, logLine);
+  enqueueJob(job, "full", enqueueMessage);
+}
+
+// Build a Sub2API-creatable proxy object (with a proxy_key) from a proxy URL.
+function proxyUrlToCreatableSub2ApiProxy(proxyUrl) {
+  const parsed = parseProxyUrlForSub2Api(proxyUrl);
+  if (!parsed) return null;
+  const rawKey = `${parsed.protocol}|${parsed.host}|${parsed.port}|${parsed.username}|${parsed.password}`;
+  const proxyKey = `p_${crypto.createHash("sha1").update(rawKey).digest("hex").slice(0, 16)}`;
+  return { ...parsed, proxy_key: proxyKey, status: "active" };
+}
+
+// Create the new proxy on Sub2API and point the account's proxy_id at it. Uses
+// the config from the request body, falling back to the stored monitor config.
+// Best-effort: never throws to the caller (caught upstream) — returns a status.
+async function syncAccountProxyToSub2Api(job, proxyUrl, rawConfig) {
+  let config = null;
+  try {
+    config = rawConfig ? normalizeSub2ApiConfig(rawConfig) : null;
+  } catch {
+    config = null;
+  }
+  if ((!config?.baseUrl || !config?.adminApiKey) && sub2ApiMonitorConfig?.baseUrl && sub2ApiMonitorConfig?.adminApiKey) {
+    config = sub2ApiMonitorConfig;
+  }
+  if (!config?.baseUrl || !config?.adminApiKey) {
+    return { attempted: false, reason: "no-config" };
+  }
+  const proxyObj = proxyUrlToCreatableSub2ApiProxy(proxyUrl);
+  if (!proxyObj) return { attempted: true, ok: false, error: "无法解析代理信息" };
+  const { idByKey } = await createSub2ApiProxyIds(config, [proxyObj]);
+  const proxyId = idByKey.get(proxyObj.proxy_key);
+  if (!proxyId) return { attempted: true, ok: false, error: "在 Sub2API 创建代理失败" };
+  const accounts = await listAllSub2ApiAccounts(config);
+  const email = String(job.email || "").toLowerCase();
+  const account = accounts.find((item) => sub2ApiAccountEmail(item) === email);
+  if (!account) return { attempted: true, ok: false, error: "在 Sub2API 未找到该账号" };
+  const accountId = Number(account.id);
+  if (!Number.isSafeInteger(accountId) || accountId <= 0) {
+    return { attempted: true, ok: false, error: "Sub2API 账号 ID 无效" };
+  }
+  await requestSub2Api(config, `/api/v1/admin/accounts/${accountId}`, {
+    method: "PUT",
+    body: JSON.stringify({ proxy_id: proxyId }),
+  });
+  return { attempted: true, ok: true, proxyId, accountId };
 }
 
 function restartJobAfterConfigurationUpdate(job) {
@@ -5024,6 +6270,10 @@ async function saveJobMetadata(job) {
         proxy_risk_retry_count: Number(job.proxyRiskRetryCount || 0),
         proxy_connection_failure_count: Number(job.proxyConnectionFailureCount || 0),
         proxy_configured: Boolean(job.proxyUrl),
+        proxy_connection_error: Boolean(job.proxyConnectionError),
+        failed_proxy_label: job.failedProxyLabel || null,
+        registration_succeeded: Boolean(job.registrationSucceeded),
+        registered_at: job.registeredAt || null,
         sms_provider_id: job.smsProviderId || null,
         sms_provider_name: job.smsProviderName || null,
         sms_service_label: job.smsServiceLabel || null,
@@ -5050,6 +6300,10 @@ async function saveJobMetadata(job) {
       const tempPath = `${metadataPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
       await fs.writeFile(tempPath, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
       await fs.rename(tempPath, metadataPath);
+      try {
+        if (jobDao.getById(job.id)) jobDao.update(job);
+        else jobDao.insert(job);
+      } catch {}
     });
   return job.metadataWritePromise;
 }
@@ -5314,7 +6568,8 @@ async function shutdown() {
       ...sub2ApiRequestPromises,
       ...sub2ApiAutoRepairPromises,
     ].filter(Boolean));
-    const activeJobs = [...jobs.values()].filter((job) => isActive(job.status));
+    // Don't cancel staged (idle) jobs on shutdown — they must survive restart as "待启动".
+    const activeJobs = [...jobs.values()].filter((job) => isActive(job.status) && job.status !== "idle");
     const childWaits = activeJobs
       .map((job) => job.child)
       .filter(Boolean)
@@ -5326,6 +6581,7 @@ async function shutdown() {
     ]);
     await vite.close();
     await closeHttpServer(server);
+    closeDb();
   })();
   return shutdownPromise;
 }
