@@ -10,7 +10,9 @@ const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "
 const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-console-cooldown-"));
 const port = await findAvailablePort();
 const baseUrl = `http://127.0.0.1:${port}`;
-const COOLDOWN_MS = 3_000;
+// A fixed IP may launch MAX_PER_WINDOW brand-new registrations per rolling WINDOW_MS; the next one waits.
+const WINDOW_MS = 4_000;
+const MAX_PER_WINDOW = 2;
 const PROXY_SETTING_KEY = "chatgpt-onboarding.proxy-link-config-v1";
 
 const child = spawn(process.execPath, [
@@ -26,7 +28,15 @@ const child = spawn(process.execPath, [
     ONBOARDING_OUTPUT_ROOT: outputRoot,
     TOSUB2_MAC_CREDENTIAL_ROOT: path.join(outputRoot, "test-mac-credentials"),
     ONBOARDING_PROTOCOL_SCRIPT: path.join(projectRoot, "test", "mock-protocol-login.mjs"),
-    PROXY_SIGNUP_COOLDOWN_MS: String(COOLDOWN_MS),
+    PROXY_SIGNUP_WINDOW_MS: String(WINDOW_MS),
+    PROXY_SIGNUP_MAX_PER_WINDOW: String(MAX_PER_WINDOW),
+    // The throttle keys by real exit IP; this seam maps each test proxy host to a
+    // deterministic exit IP so launches don't probe the (fake) proxies over the network.
+    PROXY_EXIT_IP_TEST_MAP: JSON.stringify({
+      "10.9.8.7": "77.77.77.7",
+      "10.9.8.8": "88.88.88.8",
+      "10.9.8.9": "99.99.99.9",
+    }),
     TOSUB2_TLS_PROFILE: "chrome142",
   },
   stdio: ["ignore", "pipe", "pipe"],
@@ -50,50 +60,45 @@ try {
   };
   const sharedIp = "socks5h://user:password@10.9.8.7:1080";
 
-  // The first account on an IP starts at once.
-  const firstStartedAt = Date.now();
-  const first = await createJob("cooldown-first@example.com", sharedIp);
-  await waitForJob(headers, first, (job) => job.status === "completed");
-
-  // A second account on the same IP waits in the queue and says until when.
-  const second = await createJob("cooldown-second@example.com", sharedIp);
-  const held = await waitForJob(headers, second, (job) => job.status === "queued");
+  // The first two accounts on an IP start at once — the per-minute window allows two.
+  const windowStartedAt = Date.now();
+  const first = await createJob("window-first@example.com", sharedIp);
+  const second = await createJob("window-second@example.com", sharedIp);
+  // A third account on the same IP waits in the queue and says until when.
+  const third = await createJob("window-third@example.com", sharedIp);
+  const held = await waitForJob(headers, third, (job) => job.status === "queued" && /同一代理 IP/.test(job.prompt));
   assert.match(held.prompt, /^同一代理 IP 刚注册过其他账号，等到 \d{2}:\d{2}:\d{2} 再开始$/);
+  await waitForJob(headers, first, (job) => job.status === "completed");
+  await waitForJob(headers, second, (job) => job.status === "completed");
 
   // The held job takes no slot: other IPs, and rotating proxies on the same host, are not delayed.
-  const otherIp = await createJob("cooldown-other-ip@example.com", "socks5h://user:password@10.9.8.8:1080");
-  const rotating = await createJob("cooldown-rotating@example.com", "socks5h://user-sid-abc-t-20:password@10.9.8.7:6000");
+  const otherIp = await createJob("window-other-ip@example.com", "socks5h://user:password@10.9.8.8:1080");
+  const rotating = await createJob("window-rotating@example.com", "socks5h://user-sid-abc-t-20:password@10.9.8.7:6000");
   await waitForJob(headers, otherIp, (job) => job.status === "completed", 2_000);
   await waitForJob(headers, rotating, (job) => job.status === "completed", 2_000);
-  assert.equal((await getJob(headers, second)).status, "queued", "still cooling down while other IPs run");
+  assert.equal((await getJob(headers, third)).status, "queued", "still waiting for the window while other IPs run");
 
-  // It starts by itself once the IP has been quiet for the configured time.
-  await waitForJob(headers, second, (job) => job.status === "completed");
-  const waited = Date.now() - firstStartedAt;
-  assert.ok(waited >= COOLDOWN_MS, `second registration started after ${waited} ms, before the ${COOLDOWN_MS} ms cool-down`);
+  // It starts by itself once an earlier start has aged out of the window.
+  await waitForJob(headers, third, (job) => job.status === "completed");
+  const waited = Date.now() - windowStartedAt;
+  assert.ok(waited >= WINDOW_MS, `third registration started after ${waited} ms, before the ${WINDOW_MS} ms window cleared`);
 
-  // Only another account holds a job back: retrying the same account on its own IP is immediate.
+  // The limit set in the proxy dialog replaces the default, and 0 removes the throttle so a waiting job runs.
   const ownIp = "socks5h://user:password@10.9.8.9:1080";
-  const retried = await createJob("wrong-email-otp-console@example.com", ownIp);
-  await waitForJob(headers, retried, (job) => job.status === "email_otp");
-  await fetch(`${baseUrl}/api/jobs/${retried}/cancel`, { method: "POST", headers, body: "{}" });
-  await waitForJob(headers, retried, (job) => job.status === "canceled");
-  const retryResponse = await fetch(`${baseUrl}/api/jobs/${retried}/retry`, { method: "POST", headers, body: "{}" });
-  assert.equal(retryResponse.status, 200, await retryResponse.clone().text());
-  await waitForJob(headers, retried, (job) => job.status === "email_otp", 2_000);
-
-  // The pause set in the proxy dialog replaces the default, and 0 releases what is waiting.
-  const waiting = await createJob("cooldown-setting@example.com", ownIp);
-  await waitForJob(headers, waiting, (job) => job.status === "queued" && /同一代理 IP/.test(job.prompt));
+  const fillA = await createJob("window-fill-a@example.com", ownIp);
+  const fillB = await createJob("window-fill-b@example.com", ownIp);
+  const blocked = await createJob("window-blocked@example.com", ownIp);
+  await waitForJob(headers, blocked, (job) => job.status === "queued" && /同一代理 IP/.test(job.prompt));
+  await waitForJob(headers, fillA, (job) => job.status === "completed");
+  await waitForJob(headers, fillB, (job) => job.status === "completed");
   const saved = await fetch(`${baseUrl}/api/settings`, {
     method: "PUT",
     headers,
-    body: JSON.stringify({ settings: { [PROXY_SETTING_KEY]: JSON.stringify({ mode: "batch", proxies: "", limitPerIp: 15, cooldownMinutes: "0" }) } }),
+    body: JSON.stringify({ settings: { [PROXY_SETTING_KEY]: JSON.stringify({ mode: "batch", proxies: "", limitPerIp: 15, maxPerMinute: "0" }) } }),
   });
   assert.equal(saved.status, 200, await saved.clone().text());
-  await waitForJob(headers, waiting, (job) => job.status === "completed", 2_000);
+  await waitForJob(headers, blocked, (job) => job.status === "completed", 2_000);
 
-  await fetch(`${baseUrl}/api/jobs/${retried}/cancel`, { method: "POST", headers, body: "{}" });
   console.log("console proxy cooldown tests passed");
 } catch (error) {
   error.message = `${error.message}\nConsole output:\n${consoleLogs}`;

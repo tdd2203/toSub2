@@ -134,7 +134,13 @@ const child = spawn(process.execPath, [
     TOSUB2_TLS_PROFILE: "chrome142",
     PROXY_CONNECTION_RETRY_BASE_MS: "1",
     PROXY_CHANGE_SKIP_LIVE_CHECK: "1",
-    PROXY_EXIT_IP_TEST_MAP: JSON.stringify({ "line.example.test": "10.9.8.7", "10.9.8.7": "10.9.8.7" }),
+    PROXY_EXIT_IP_TEST_MAP: JSON.stringify({
+      "line.example.test": "10.9.8.7",
+      "10.9.8.7": "10.9.8.7",
+      "10.0.0.1": "10.0.0.1",
+      "10.0.0.2": "10.0.0.2",
+      "10.0.0.9": "10.0.0.9",
+    }),
     SUB2API_AUTO_REPAIR_COOLDOWN_MS: "0",
     TOSUB2_MAC_CREDENTIAL_ROOT: path.join(outputRoot, "test-mac-credentials"),
   },
@@ -231,6 +237,51 @@ try {
     body: JSON.stringify({ ids: postMailBatch.jobs.map((job) => job.id) }),
   });
   assert.equal(deletePostMailJobsResponse.status, 200, await deletePostMailJobsResponse.text());
+
+  // --- Proxy riêng theo domain: email thuộc domain đã khai báo chỉ dùng proxy
+  // của domain đó; domain chưa khai báo thì mượn pool chung. ---
+  // 10.0.0.1 cố tình nằm CẢ ở pool chung LẪN nhóm d1.test → phải độc quyền cho
+  // d1.test, email domain khác (other.test) không được bốc trúng 10.0.0.1.
+  const domainProxyBatchResponse = await fetch(`${baseUrl}/api/jobs/batch`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      text: ["a@d1.test", "b@d1.test", "c@d2.test", "d@other.test", "e@other.test"].join("\n"),
+      proxyMode: "batch",
+      limitPerIp: 50,
+      proxies: ["socks5h://10.0.0.9:1080", "socks5h://10.0.0.1:1080"].join("\n"),
+      domainProxies: [
+        { domain: "d1.test", proxies: "socks5h://10.0.0.1:1080" },
+        { domain: "d2.test", proxies: "socks5h://10.0.0.2:1080" },
+      ],
+    }),
+  });
+  const domainProxyBatchText = await domainProxyBatchResponse.text();
+  assert.equal(domainProxyBatchResponse.status, 201, domainProxyBatchText);
+  const domainProxyBatch = JSON.parse(domainProxyBatchText);
+  assert.equal(domainProxyBatch.jobs.length, 5, domainProxyBatchText);
+  const domainStatusResponse = await fetch(`${baseUrl}/api/proxies/status`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      mode: "batch",
+      limitPerIp: 50,
+      proxies: ["socks5h://10.0.0.9:1080", "socks5h://10.0.0.1:1080", "socks5h://10.0.0.2:1080"].join("\n"),
+    }),
+  });
+  const domainStatusText = await domainStatusResponse.text();
+  assert.equal(domainStatusResponse.status, 200, domainStatusText);
+  const domainStatus = JSON.parse(domainStatusText);
+  const emailsByHost = new Map(domainStatus.proxies.map((p) => [p.host, (p.emails || []).slice().sort()]));
+  assert.deepEqual(emailsByHost.get("10.0.0.1"), ["a@d1.test", "b@d1.test"], "proxy riêng cho d1.test (độc quyền, không nhận email domain khác)");
+  assert.deepEqual(emailsByHost.get("10.0.0.2"), ["c@d2.test"], "proxy riêng cho d2.test");
+  assert.deepEqual(emailsByHost.get("10.0.0.9"), ["d@other.test", "e@other.test"], "pool chung (đã loại 10.0.0.1) cho domain chưa khai báo");
+  const deleteDomainProxyJobs = await fetch(`${baseUrl}/api/jobs/delete-batch`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ids: domainProxyBatch.jobs.map((job) => job.id) }),
+  });
+  assert.equal(deleteDomainProxyJobs.status, 200, await deleteDomainProxyJobs.text());
 
   const forbiddenMailHeaderResponse = await fetch(`${baseUrl}/api/mail-request-config`, {
     method: "POST",
@@ -399,6 +450,47 @@ try {
   });
   assert.equal(mfaInputResponse.status, 200, await mfaInputResponse.text());
   await waitForJob(headers, mfaPromptJobId, (value) => value.status === "completed");
+
+  // 2FA step on an account OpenAI has deleted/deactivated: the code wasn't wrong,
+  // so the run must be recognised as a permanent closure and the task dropped —
+  // never retried with another code nor offered as a resumable checkpoint.
+  const mfaClosedResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ email: "mfa-account-closed@example.com" }),
+  });
+  assert.equal(mfaClosedResponse.status, 201);
+  const mfaClosedJobId = (await mfaClosedResponse.json()).job.id;
+  await waitForJob(headers, mfaClosedJobId, (value) => value.status === "mfa_otp");
+  const mfaClosedInput = await fetch(`${baseUrl}/api/jobs/${mfaClosedJobId}/input`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ action: "mfa_otp", value: "123456" }),
+  });
+  assert.equal(mfaClosedInput.status, 200, await mfaClosedInput.text());
+  // No Sub2API backend is bound here, so a confirmed-deactivated account's task
+  // is dropped from the list right away (same as a deactivation found elsewhere).
+  let mfaClosedListed = true;
+  for (let deadline = Date.now() + 10_000; mfaClosedListed && Date.now() < deadline;) {
+    let found = false;
+    for (let pageNumber = 1, totalPages = 1; pageNumber <= totalPages; pageNumber += 1) {
+      const page = await fetch(`${baseUrl}/api/jobs?page=${pageNumber}`, { headers }).then((r) => r.json());
+      totalPages = page.pagination?.totalPages || 1;
+      if (page.jobs.some((item) => item.id === mfaClosedJobId)) found = true;
+    }
+    mfaClosedListed = found;
+    if (mfaClosedListed) await delay(50);
+  }
+  assert.equal(mfaClosedListed, false, "a 2FA-step deactivation must end the task, not offer another code or a resume");
+  // The mailbox is tagged deactivated in the registry so the operator can clean it up.
+  const mfaClosedMailboxes = await fetch(`${baseUrl}/api/mail/mailboxes`, { headers }).then((r) => r.json());
+  const mfaClosedMailbox = (mfaClosedMailboxes.mailboxes || []).find(
+    (item) => String(item.email).toLowerCase() === "mfa-account-closed@example.com",
+  );
+  if (mfaClosedMailbox) {
+    assert.equal(mfaClosedMailbox.deactivated, true, "the deactivated mailbox must be flagged in the registry");
+    assert.match(String(mfaClosedMailbox.deactivatedReason || ""), /deactivated/i);
+  }
 
   const wrongEmailOtpResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",

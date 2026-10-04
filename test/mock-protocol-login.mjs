@@ -262,6 +262,18 @@ try {
     return;
   }
 
+  if (args.email === "mfa-account-closed@example.com") {
+    // Reach the 2FA challenge, take the operator's code, then the server reports
+    // the account was deleted/deactivated. The real script throws, printing an
+    // [error] line and exiting non-zero — the console must end the run as a
+    // confirmed deactivation, never offer another code or a resume.
+    process.stdout.write("[mfa] TOTP 2FA challenge reached.\n2FA OTP (6 digits, q=quit): ");
+    await rl.question("");
+    console.error('[error] POST https://auth.openai.com/api/accounts/mfa/verify failed with HTTP 403: { "error": { "message": "You do not have an account because it has been deleted or deactivated. If you believe this was an error, please contact us through our help center at help.openai.com.", "type": "invalid_request_error", "param": null, "code": "account_deactivated" } }');
+    process.exitCode = 1;
+    return;
+  }
+
   if (args.email === "monitor-banned@example.com" && (await fileExists(args.sub2apiOut))) {
     console.error('[error] HTTP 403: { "error": { "message": "Your account has been deactivated.", "code": "account_deactivated" } }');
     process.exitCode = 1;

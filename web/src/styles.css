@@ -875,7 +875,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .proxy-thead,
 .proxy-row-main {
   display: grid;
-  grid-template-columns: 92px minmax(0, 1fr) 150px 116px 116px 40px;
+  grid-template-columns: 92px minmax(0, 1fr) 150px 116px 92px 110px 40px;
   align-items: center;
   gap: 12px;
   padding: 12px 16px;
@@ -895,6 +895,32 @@ tbody tr:last-child td { border-bottom: 0; }
   padding: 1px 7px; border-radius: 999px; background: #eef1f0; color: var(--muted);
   vertical-align: middle;
 }
+.proxy-domain-tag {
+  display: inline-block; margin-left: 8px; font-size: 10.5px; font-weight: 600;
+  max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  padding: 1px 8px; border-radius: 999px; background: rgba(18, 113, 91, .12); color: var(--green);
+  vertical-align: middle;
+}
+
+/* Cấu hình proxy: khu "Gán proxy riêng theo domain" trong hộp thoại cấu hình */
+.domain-proxy-section { display: flex; flex-direction: column; gap: 10px; }
+.domain-proxy-title { color: #53605b; font-size: 12px; font-weight: 700; }
+.domain-proxy-title small { display: block; margin-top: 3px; font-weight: 400; color: var(--muted); font-size: 11.5px; line-height: 1.5; }
+.domain-proxy-groups { display: flex; flex-direction: column; gap: 10px; }
+.domain-proxy-group { border: 1px solid var(--line); border-radius: 10px; padding: 10px; background: #fbfdfc; }
+.domain-proxy-group-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.domain-proxy-domain {
+  flex: 1 1 auto; min-width: 0; font-size: 13px;
+  border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; background: #fff;
+}
+.domain-proxy-domain:focus { outline: none; border-color: var(--green); box-shadow: 0 0 0 3px rgba(18, 113, 91, .1); }
+.domain-proxy-count { flex: 0 0 auto; font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.domain-proxy-list {
+  width: 100%; min-height: 72px; resize: vertical;
+  font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; line-height: 1.55;
+  border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; background: #fff;
+}
+.domain-proxy-list:focus { outline: none; border-color: var(--green); box-shadow: 0 0 0 3px rgba(18, 113, 91, .1); }
 .proxy-del {
   display: inline-flex; align-items: center; justify-content: center;
   width: 30px; height: 30px; border-radius: 8px; border: 1px solid transparent;
@@ -934,6 +960,34 @@ tbody tr:last-child td { border-bottom: 0; }
 .proxy-ipcell .exit { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
 .proxy-remain { font-size: 13px; font-variant-numeric: tabular-nums; color: var(--ink); }
 .proxy-remain small { color: var(--muted); font-weight: 400; }
+/* Số tài khoản bị vô hiệu hoá (ban) trên IP đó: 0 = xám · 1–4 = vàng · >=ngưỡng = đỏ */
+.proxy-disabled {
+  display: inline-flex; align-items: center; justify-content: center; gap: 4px;
+  justify-self: center; min-width: 34px; padding: 2px 9px; border-radius: 999px;
+  font-size: 12.5px; font-weight: 700; font-variant-numeric: tabular-nums;
+  background: #eef1f0; color: var(--muted);
+}
+.proxy-disabled small { font-weight: 400; }
+.proxy-disabled.warn { background: var(--amber-soft); color: var(--amber); }
+.proxy-disabled.burn { background: var(--danger-soft); color: var(--danger); }
+/* Nhãn "cần đổi IP" ngay cạnh địa chỉ IP đã cháy */
+/* Chip "checking" cạnh địa chỉ IP: trạng thái của IP RA THỰC đang ra */
+.proxy-check {
+  display: inline-flex; align-items: center; gap: 3px; margin-left: 8px;
+  font-size: 10.5px; font-weight: 700; padding: 1px 7px; border-radius: 999px;
+  vertical-align: middle; font-family: var(--font, inherit); letter-spacing: .01em;
+  white-space: nowrap;
+}
+.proxy-check.burn { background: var(--danger-soft); color: var(--danger); }
+.proxy-check.warn { background: var(--amber-soft); color: var(--amber); }
+.proxy-check.ok { background: var(--green-soft); color: var(--green); }
+.proxy-check.muted { background: #eef1f0; color: var(--muted); }
+.proxy-del.forget:hover { background: #eef1f0; color: var(--ink); border-color: var(--line); }
+.proxy-row.burned { background: color-mix(in srgb, var(--danger) 6%, transparent); }
+.proxy-row.burned:hover { background: color-mix(in srgb, var(--danger) 9%, transparent); }
+.proxy-chip.burn { border-color: #f2c9c9; color: var(--danger); }
+.proxy-chip.burn:hover { border-color: var(--danger); }
+.proxy-chip.burn.active { border-color: var(--danger); background: var(--danger); color: #fff; }
 .proxy-emailbtn {
   display: inline-flex; align-items: center; gap: 6px;
   font-size: 12.5px; color: var(--green); font-weight: 600;

@@ -13,6 +13,7 @@ import {
   Copy,
   Download,
   ExternalLink,
+  EyeOff,
   FileText,
   Filter,
   Globe2,
@@ -52,7 +53,10 @@ const SUB2API_UPLOAD_SETTINGS_KEY = "chatgpt-onboarding.sub2api-upload-settings-
 const ACCOUNT_PROXY_STORAGE_KEY = "chatgpt-onboarding.account-proxy-v1";
 const USE_MACHINE_IP_STORAGE_KEY = "chatgpt-onboarding.use-machine-ip-v1";
 const PROXY_LINK_CONFIG_KEY = "chatgpt-onboarding.proxy-link-config-v1";
-const DEFAULT_PROXY_LINK_CONFIG = { mode: "single", proxies: "", limitPerIp: 15, cooldownMinutes: 10 };
+// `proxies` = pool proxy dùng chung (mọi domain). `domainProxies` = các nhóm
+// proxy gán riêng cho 1 domain: [{ domain, proxies }]. Khi đăng ký, email thuộc
+// domain nào sẽ dùng proxy riêng của domain đó trước, hết chỗ mới mượn pool chung.
+const DEFAULT_PROXY_LINK_CONFIG = { mode: "single", proxies: "", domainProxies: [], limitPerIp: 15, maxPerMinute: 2 };
 const SMS_PROVIDER_EXTERNAL_LINKS = {
   luban: {
     href: "https://lubansms.com/",
@@ -196,6 +200,22 @@ function App() {
   useEffect(() => writeLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY, accountProxyUrl.trim()), [accountProxyUrl]);
   useEffect(() => writeLocalTextSetting(USE_MACHINE_IP_STORAGE_KEY, useMachineIp ? "1" : ""), [useMachineIp]);
   useEffect(() => writeLocalJson(PROXY_LINK_CONFIG_KEY, proxyLinkConfig), [proxyLinkConfig]);
+  // Gộp pool chung + mọi nhóm proxy riêng theo domain thành 1 khối text để hiển
+  // thị/thống kê trong "Danh sách proxy IP" (đếm, kiểm tra kết nối, round-robin).
+  const combinedProxiesText = useMemo(() => {
+    const parts = [normalizeProxyText(proxyLinkConfig.proxies || "")];
+    for (const g of proxyLinkConfig.domainProxies || []) if (g?.proxies) parts.push(normalizeProxyText(g.proxies));
+    return parts.filter((p) => p.trim()).join("\n");
+  }, [proxyLinkConfig.proxies, proxyLinkConfig.domainProxies]);
+  // Map host -> domain (để gắn nhãn domain cho từng dòng proxy trong bảng).
+  const proxyDomainByHost = useMemo(() => {
+    const map = new Map();
+    for (const g of proxyLinkConfig.domainProxies || []) {
+      if (!g?.domain || !g?.proxies) continue;
+      for (const e of parseProxyPasteList(g.proxies)) map.set(e.host, g.domain);
+    }
+    return map;
+  }, [proxyLinkConfig.domainProxies]);
 
   async function loadMachineIp() {
     if (!token) return;
@@ -250,7 +270,7 @@ function App() {
         method: "POST",
         body: JSON.stringify({
           mode: "batch",
-          proxies: proxyLinkConfig.proxies,
+          proxies: combinedProxiesText,
           limitPerIp: Number(proxyLinkConfig.limitPerIp) || 15,
           refresh: Boolean(refresh),
         }),
@@ -279,6 +299,20 @@ function App() {
       });
       return { ...c, proxies: kept.join("\n") };
     });
+  }
+  // "Quên IP này": ẩn 1 IP cũ (configured:false) khỏi danh sách. Không xoá job/account,
+  // chỉ ẩn dòng (lưu server). Thêm lại IP vào cấu hình sẽ hiện lại.
+  async function forgetProxy(host) {
+    if (!token || !host) return;
+    try {
+      await apiFetch(token, "/api/proxies/forget", {
+        method: "POST",
+        body: JSON.stringify({ host, forget: true }),
+      });
+      await fetchProxyStatus({ silent: true });
+    } catch (requestError) {
+      setProxyListError(requestError.message);
+    }
   }
   async function copyProxyEmails(emails) {
     const text = (emails || []).join("\n");
@@ -320,13 +354,28 @@ function App() {
     });
     if (added) setProxyBulkText(""); // effect theo dõi proxyLinkConfig.proxies sẽ tự làm mới bảng
   }
+  // ---- Proxy riêng theo domain: thêm/sửa/xoá các nhóm { domain, proxies } ----
+  function addDomainProxyGroup() {
+    setProxyLinkConfig((c) => ({ ...c, domainProxies: [...(c.domainProxies || []), { domain: "", proxies: "" }] }));
+  }
+  function updateDomainProxyGroup(index, field, value) {
+    setProxyLinkConfig((c) => {
+      const groups = [...(c.domainProxies || [])];
+      if (!groups[index]) return c;
+      groups[index] = { ...groups[index], [field]: value };
+      return { ...c, domainProxies: groups };
+    });
+  }
+  function removeDomainProxyGroup(index) {
+    setProxyLinkConfig((c) => ({ ...c, domainProxies: (c.domainProxies || []).filter((_, i) => i !== index) }));
+  }
   // Khi popup "Danh sách proxy IP" đang mở: tự lấy trạng thái theo danh sách hiện tại
   // (mọi chế độ), và làm mới mỗi khi danh sách / giới hạn đổi.
   useEffect(() => {
     if (!proxyListOpen || !token) return undefined;
     const timer = setTimeout(() => { void fetchProxyStatus({ silent: Boolean(proxyStatus) }); }, 250);
     return () => clearTimeout(timer);
-  }, [proxyListOpen, proxyLinkConfig.proxies, proxyLinkConfig.limitPerIp, token]);
+  }, [proxyListOpen, combinedProxiesText, proxyLinkConfig.limitPerIp, token]);
   // Real-time refresh of the registration counts while the popup is open: poll
   // every 3s (silent). The server caches the exit-IP probe, so this mainly
   // recomputes "còn N lần đăng ký" as accounts reach the SMS step.
@@ -334,7 +383,7 @@ function App() {
     if (!proxyListOpen || !token) return undefined;
     const interval = setInterval(() => { void fetchProxyStatus({ silent: true }); }, 3_000);
     return () => clearInterval(interval);
-  }, [proxyListOpen, proxyLinkConfig.proxies, proxyLinkConfig.limitPerIp, token]);
+  }, [proxyListOpen, combinedProxiesText, proxyLinkConfig.limitPerIp, token]);
   // Nếu 2 proxy có cùng IP xuất (một bản nhập bằng IP, một bản nhập bằng domain),
   // tự thay thế: giữ bản domain, bỏ bản nhập bằng IP thô.
   useEffect(() => {
@@ -364,10 +413,10 @@ function App() {
   // Ở chế độ "nhiều IP": tự động (debounce) lấy trạng thái để ô tóm tắt trên thanh công cụ hiển thị số IP hoạt động.
   useEffect(() => {
     if (!token || proxyLinkConfig.mode !== "batch") return undefined;
-    if (!parseProxyPasteList(proxyLinkConfig.proxies).length) { setProxyStatus(null); return undefined; }
+    if (!parseProxyPasteList(combinedProxiesText).length) { setProxyStatus(null); return undefined; }
     const timer = setTimeout(() => { void fetchProxyStatus({ silent: true }); }, 1000);
     return () => clearTimeout(timer);
-  }, [proxyLinkConfig.mode, proxyLinkConfig.proxies, proxyLinkConfig.limitPerIp, token]);
+  }, [proxyLinkConfig.mode, combinedProxiesText, proxyLinkConfig.limitPerIp, token]);
 
   useEffect(() => {
     let stopped = false;
@@ -894,7 +943,14 @@ function App() {
   const proxyBatchMode = proxyLinkConfig.mode === "batch";
   function newJobProxyPayload() {
     return proxyBatchMode
-      ? { proxyMode: "batch", proxies: proxyLinkConfig.proxies, limitPerIp: Number(proxyLinkConfig.limitPerIp) || 15 }
+      ? {
+          proxyMode: "batch",
+          proxies: normalizeProxyText(proxyLinkConfig.proxies),
+          domainProxies: (proxyLinkConfig.domainProxies || [])
+            .map((g) => ({ domain: String(g?.domain || "").trim(), proxies: normalizeProxyText(g?.proxies || "") }))
+            .filter((g) => g.domain && g.proxies.trim()),
+          limitPerIp: Number(proxyLinkConfig.limitPerIp) || 15,
+        }
       : { proxyUrl: accountProxyUrl.trim() };
   }
   // Với thao tác trên tài khoản đã có (cấp lại/đăng nhập lại…): ở chế độ nhiều IP giữ nguyên proxy đã gán.
@@ -903,7 +959,7 @@ function App() {
   }
   function ensureProxyReady(setErr) {
     if (proxyBatchMode) {
-      if (!parseProxyPasteList(proxyLinkConfig.proxies).length) { setErr(t("请先在“代理 IP 列表”中添加代理 IP")); return false; }
+      if (!parseProxyPasteList(combinedProxiesText).length) { setErr(t("请先在“代理 IP 列表”中添加代理 IP")); return false; }
       return true;
     }
     if (!accountProxyUrl.trim() && !useMachineIp) { setErr(t("必须先配置代理 IP，或在“格式”里选择“本机 IP”")); return false; }
@@ -1532,10 +1588,10 @@ function App() {
                 <span className={`provider-ready ${proxyStatus && proxyStatus.activeCount ? "" : "incomplete"}`} style={{ flex: "1 1 auto", minWidth: 0 }}>
                   {proxyStatus
                     ? (proxyStatus.activeCount ? <Check size={14} /> : <CircleAlert size={14} />)
-                    : (proxyLinkConfig.proxies.trim() ? <LoaderCircle className="spin" size={14} /> : <CircleAlert size={14} />)}
+                    : (combinedProxiesText.trim() ? <LoaderCircle className="spin" size={14} /> : <CircleAlert size={14} />)}
                   {proxyStatus
                     ? tf("{0} 个 IP 活跃 · 剩余约 {1} 次注册", proxyStatus.activeCount, proxyStatus.remaining)
-                    : (proxyLinkConfig.proxies.trim() ? t("批量模式 · 正在统计代理") : t("批量模式 · 请添加代理"))}
+                    : (combinedProxiesText.trim() ? t("批量模式 · 正在统计代理") : t("批量模式 · 请添加代理"))}
                 </span>
               ) : (
                 <span className={`provider-ready ${(useMachineIp || accountProxyUrl.trim()) && proxyCheck.state !== "fail" ? "" : "incomplete"}`}>
@@ -2290,9 +2346,45 @@ function App() {
                   </div>
                 </label>
                 <div className="settings-field wide-settings-field" style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 10, fontSize: 13, opacity: 0.85 }}>
-                  <span>{tf("已配置 {0} 个代理 IP。代理请在“代理 IP 列表”中添加与管理。", parseProxyPasteList(proxyLinkConfig.proxies).length)}</span>
+                  <span>{tf("通用代理池：已配置 {0} 个代理 IP（用于所有域名）。", parseProxyPasteList(proxyLinkConfig.proxies).filter((e) => !proxyDomainByHost.has(e.host)).length)}</span>
                   <button type="button" className="secondary-button" onClick={() => { setProxyLinkOpen(false); openProxyList(); }}>
                     <List size={16} />{t("代理 IP 列表")}
+                  </button>
+                </div>
+                <div className="wide-settings-field domain-proxy-section">
+                  <span className="domain-proxy-title">{t("按域名分配专用代理")} <small>{t("指定域名的邮箱只用该域名的专用代理；用完后再借用通用代理池")}</small></span>
+                  <div className="domain-proxy-groups">
+                    {(proxyLinkConfig.domainProxies || []).map((group, index) => {
+                      const ipCount = parseProxyPasteList(group?.proxies || "").length;
+                      return (
+                        <div key={index} className="domain-proxy-group">
+                          <div className="domain-proxy-group-head">
+                            <input
+                              type="text"
+                              className="domain-proxy-domain"
+                              placeholder={t("域名，例如 example.com")}
+                              value={group?.domain || ""}
+                              spellCheck="false"
+                              onChange={(event) => updateDomainProxyGroup(index, "domain", event.target.value)}
+                            />
+                            <span className="domain-proxy-count">{tf("{0} 个 IP", ipCount)}</span>
+                            <button type="button" className="icon-button" title={t("删除")} onClick={() => removeDomainProxyGroup(index)}>
+                              <X size={16} />
+                            </button>
+                          </div>
+                          <textarea
+                            className="domain-proxy-list"
+                            placeholder={"socks5h://user:pass@host:port\nhost:port:user:pass"}
+                            value={group?.proxies || ""}
+                            spellCheck="false"
+                            onChange={(event) => updateDomainProxyGroup(index, "proxies", event.target.value)}
+                          />
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <button type="button" className="secondary-button" onClick={addDomainProxyGroup}>
+                    <Plus size={15} />{t("添加域名代理")}
                   </button>
                 </div>
               </div>
@@ -2303,20 +2395,20 @@ function App() {
             )}
             <div className="provider-config-grid mail-request-config-grid">
               <label className="settings-field wide-settings-field">
-                <span>{t("同一 IP 两次注册的最短间隔（分钟）")} <small>{tf("默认 {0}，0 = 不等待", 10)}</small></span>
+                <span>{t("每个 IP 每分钟最多注册账号数")} <small>{tf("默认 {0}，0 = 不限制", 2)}</small></span>
                 <div>
                   <input
                     type="number"
                     min="0"
-                    max="240"
-                    value={proxyLinkConfig.cooldownMinutes}
-                    onChange={(event) => setProxyLinkConfig((c) => ({ ...c, cooldownMinutes: event.target.value }))}
+                    max="100"
+                    value={proxyLinkConfig.maxPerMinute}
+                    onChange={(event) => setProxyLinkConfig((c) => ({ ...c, maxPerMinute: event.target.value }))}
                   />
                 </div>
               </label>
             </div>
             <div style={{ fontSize: 13, opacity: 0.78, margin: "10px 2px 0" }}>
-              {t("同一 IP 连续注册时，服务端可能不发送验证邮件；间隔内的注册任务会留在队列中等待。")}
+              {t("同一 IP 短时间内连续注册时，服务端可能不发送验证邮件；超出上限的注册任务会留在队列中等待。")}
             </div>
             <div className="dialog-footer">
               <button type="button" className="primary-button" onClick={() => setProxyLinkOpen(false)}>
@@ -2415,11 +2507,12 @@ function App() {
                   ["inuse", t("使用中"), proxyStatus.usageCounts?.inuse ?? 0],
                   ["unused", t("未使用"), proxyStatus.usageCounts?.unused ?? 0],
                   ["used", t("已用完"), proxyStatus.usageCounts?.used ?? 0],
-                ].map(([value, label, count]) => (
+                  ["burned", t("需换 IP"), proxyStatus.burnedCount ?? 0, "burn"],
+                ].map(([value, label, count, tone]) => (
                   <button
                     key={value === null ? "__all__" : value}
                     type="button"
-                    className={`proxy-chip ${proxyFilter === value ? "active" : ""}`}
+                    className={`proxy-chip ${tone === "burn" ? "burn" : ""} ${proxyFilter === value ? "active" : ""}`}
                     onClick={() => setProxyFilter(value)}
                   >
                     {label}<span className="cnt">{count}</span>
@@ -2434,6 +2527,7 @@ function App() {
                 <span>{t("代理 IP")}</span>
                 <span>{t("状态")}</span>
                 <span>{t("已注册邮箱")}</span>
+                <span style={{ textAlign: "center" }}>{t("被封号")}</span>
                 <span style={{ textAlign: "right" }}>{t("剩余额度")}</span>
                 <span />
               </div>
@@ -2443,13 +2537,13 @@ function App() {
                 ) : !proxyStatus || !proxyStatus.proxies.length ? (
                   <div className="proxy-empty">{t("暂无代理，请在“配置”中选择“批量连接”并填入代理，或使用上方批量添加")}</div>
                 ) : (() => {
-                  const rows = proxyStatus.proxies.filter((p) => proxyFilter === null || p.usage === proxyFilter);
+                  const rows = proxyStatus.proxies.filter((p) => proxyFilter === null || (proxyFilter === "burned" ? p.burned : p.usage === proxyFilter));
                   if (!rows.length) return <div className="proxy-empty">{t("没有符合筛选条件的代理")}</div>;
                   return rows.map((p) => {
                     const expanded = proxyExpanded.has(p.label);
                     const isSocks = /socks/i.test(p.protocol);
                     return (
-                      <div key={p.label} className="proxy-row">
+                      <div key={p.label} className={`proxy-row ${p.burned ? "burned" : ""}`}>
                         <div className="proxy-row-main">
                           <span className={`proxy-pill ${isSocks ? "socks" : "http"}`}>
                             <Network size={12} />{isSocks ? "SOCKS5" : (p.protocol || "?").toUpperCase()}
@@ -2458,6 +2552,22 @@ function App() {
                             <div className="addr" title={p.label}>
                               {p.label}
                               {!p.configured ? <span className="proxy-old">{t("IP 旧")}</span> : null}
+                              {proxyDomainByHost.get(p.host) ? <span className="proxy-domain-tag" title={proxyDomainByHost.get(p.host)}>{proxyDomainByHost.get(p.host)}</span> : null}
+                              {(() => {
+                                // "Checking" — IP RA THỰC đang ra đã sạch hay vẫn cháy
+                                switch (p.curExitStatus) {
+                                  case "burned":
+                                    return <span className="proxy-check burn" title={tf("当前出口 IP 已有 {0} 个账号被封，需更换", p.curExitDisabled)}><Ban size={11} />{t("需换 IP")}</span>;
+                                  case "burning":
+                                    return <span className="proxy-check warn" title={tf("当前出口 IP 已有 {0} 个账号被封", p.curExitDisabled)}><CircleAlert size={11} />{tf("当前 IP {0} 封", p.curExitDisabled)}</span>;
+                                  case "clean":
+                                    return <span className="proxy-check ok" title={t("当前出口 IP 尚无账号被封，已更换成功")}><Check size={11} />{t("已换 IP")}</span>;
+                                  case "nodata":
+                                    return <span className="proxy-check muted" title={t("当前出口 IP 还没有新账号数据")}>{t("当前 IP 暂无数据")}</span>;
+                                  default:
+                                    return null; // unknown: proxy chết, pill "连接失败" đã báo
+                                }
+                              })()}
                             </div>
                             {p.connected && p.ip ? <div className="exit">{tf("出口 {0}", p.ip)}</div> : (!p.connected && p.error ? <div className="exit" title={p.error}>{ts(p.error)}</div> : null)}
                           </div>
@@ -2469,18 +2579,34 @@ function App() {
                             <Mail size={14} />{tf("{0} 个邮箱", p.emailCount)}
                             {p.emailCount ? (expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />) : null}
                           </button>
+                          <span
+                            className={`proxy-disabled ${p.disabledCount >= (proxyStatus.burnThreshold || 5) ? "burn" : (p.disabledCount ? "warn" : "")}`}
+                            title={p.disabledCount ? tf("历史封号 {0}/{1}（该代理全部记录，不随换 IP 清零）", p.disabledCount, p.disabledTotal) : t("该代理暂无封号记录")}
+                          >
+                            {p.disabledCount ? <><Ban size={12} />{p.disabledCount}</> : <small>0</small>}
+                          </span>
                           <span className="proxy-remain" style={{ textAlign: "right" }}>
                             {p.remaining}<small>{tf(" / {0}", proxyStatus.limitPerIp)}</small>
                           </span>
-                          <button
-                            type="button"
-                            className="proxy-del"
-                            onClick={() => removeProxy(p.host)}
-                            disabled={!p.configured}
-                            title={p.configured ? t("从列表中删除该代理") : t("旧 IP（不在配置列表中）")}
-                          >
-                            <Trash2 size={15} />
-                          </button>
+                          {p.configured ? (
+                            <button
+                              type="button"
+                              className="proxy-del"
+                              onClick={() => removeProxy(p.host)}
+                              title={t("从列表中删除该代理")}
+                            >
+                              <Trash2 size={15} />
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              className="proxy-del forget"
+                              onClick={() => forgetProxy(p.host)}
+                              title={t("忘记此 IP（从列表隐藏，不删账号）")}
+                            >
+                              <EyeOff size={15} />
+                            </button>
+                          )}
                         </div>
                         {expanded && p.emails.length ? (
                           <div className="proxy-emails">
@@ -3979,6 +4105,12 @@ function parseProxyPasteList(text) {
     lineInBlock += 1;
   }
   return entries;
+}
+
+// Chuẩn hoá 1 khối proxy (nhiều dòng, nhận cả host:port:user:pass lẫn scheme://…)
+// về dạng URL đầy đủ mỗi dòng, để backend (chỉ hiểu scheme://…) parse được.
+function normalizeProxyText(text) {
+  return parseProxyPasteList(text).map((e) => e.url).join("\n");
 }
 
 function toProxyUrl(value, scheme) {

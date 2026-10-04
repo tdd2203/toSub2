@@ -149,7 +149,9 @@ const server = http.createServer(async (req, res) => {
     ) {
       return sendJson(res, 400, { error: { message: "missing sentinel token" } });
     }
-    if (!/^[A-Za-z]+ [A-Za-z]+$/.test(payload.name || "")) {
+    // generateVietnameseName() yields 2 or 3 space-separated parts (surname +
+    // optional middle + given), each a run of Unicode letters with diacritics.
+    if (!/^\p{L}+( \p{L}+){1,2}$/u.test(payload.name || "")) {
       return sendJson(res, 400, { error: { message: "invalid generated name" } });
     }
     if (!isAgeBetween(payload.birthdate, 20, 50)) {

@@ -230,6 +230,14 @@ CREATE TABLE IF NOT EXISTS settings (
     name: "002_job_tls_profile",
     sql: `ALTER TABLE jobs ADD COLUMN tls_profile TEXT;`,
   },
+  {
+    // Real exit IP each account registered through, recorded per account. A proxy
+    // domain can rotate/reset through many exit IPs over time, so burn/throttle keyed
+    // by this (not the proxy host) lets a changed IP count as a fresh one. Old rows
+    // stay NULL — there is no historical exit IP to backfill.
+    name: "003_used_proxy_emails_exit_ip",
+    sql: `ALTER TABLE used_proxy_emails ADD COLUMN exit_ip TEXT;`,
+  },
 ];
 
 // ============================================================
@@ -499,15 +507,22 @@ export const usedProxyDao = {
     });
   },
 
-  addEmail(identityKey, email) {
-    getDb().prepare("INSERT OR IGNORE INTO used_proxy_emails (identity_key, email) VALUES (?, ?)").run(identityKey, email);
+  // exitIp is set once known (at registration); a null value never overwrites an
+  // exit IP already recorded for this (identity_key, email).
+  addEmail(identityKey, email, exitIp = null) {
+    getDb().prepare(`
+      INSERT INTO used_proxy_emails (identity_key, email, exit_ip)
+      VALUES (?, ?, ?)
+      ON CONFLICT(identity_key, email) DO UPDATE SET
+        exit_ip = COALESCE(excluded.exit_ip, exit_ip)
+    `).run(identityKey, email, exitIp || null);
   },
 
-  recordUsage(identityKey, entry, email) {
+  recordUsage(identityKey, entry, email, exitIp = null) {
     const db = getDb();
     db.transaction(() => {
       usedProxyDao.upsert(identityKey, entry);
-      if (email) usedProxyDao.addEmail(identityKey, email);
+      if (email) usedProxyDao.addEmail(identityKey, email, exitIp);
     })();
   },
 
@@ -528,6 +543,52 @@ export const usedProxyDao = {
   getEmails(identityKey) {
     return getDb().prepare("SELECT email FROM used_proxy_emails WHERE identity_key = ?")
       .all(identityKey).map((r) => r.email);
+  },
+
+  // Lifetime per-host account history, joined with the deactivated registry.
+  // The proxy ledger is never pruned (even when a job is deleted), so this
+  // surfaces IPs that have already burned accounts — the signal the live job
+  // list loses the moment a deactivated task is removed. Returns a Map keyed by
+  // host: { total, deactivated }.
+  deactivationHistoryByHost() {
+    const rows = getDb().prepare(`
+      SELECT p.host AS host,
+             COUNT(DISTINCT e.email) AS total,
+             COUNT(DISTINCT CASE WHEN d.email IS NOT NULL THEN e.email END) AS deactivated
+      FROM used_proxies p
+      JOIN used_proxy_emails e ON e.identity_key = p.identity_key
+      LEFT JOIN deactivated_emails d ON lower(e.email) = d.email
+      WHERE p.host <> ''
+      GROUP BY p.host
+    `).all();
+    const map = new Map();
+    for (const r of rows) {
+      map.set(r.host, { total: Number(r.total) || 0, deactivated: Number(r.deactivated) || 0 });
+    }
+    return map;
+  },
+
+  // Lifetime per-EXIT-IP account history. exit_ip is recorded per account on
+  // used_proxy_emails at registration time (the real IP OpenAI saw), so this keys
+  // the burn signal by the actual IP rather than the proxy line's host/domain —
+  // after the operator resets a domain's exit IP, the new IP starts clean. Records
+  // from before exit_ip existed are NULL and excluded (no history to attribute).
+  // Returns a Map keyed by exit_ip: { total, deactivated }.
+  deactivationHistoryByExitIp() {
+    const rows = getDb().prepare(`
+      SELECT e.exit_ip AS exitIp,
+             COUNT(DISTINCT e.email) AS total,
+             COUNT(DISTINCT CASE WHEN d.email IS NOT NULL THEN e.email END) AS deactivated
+      FROM used_proxy_emails e
+      LEFT JOIN deactivated_emails d ON lower(e.email) = d.email
+      WHERE e.exit_ip IS NOT NULL AND e.exit_ip <> ''
+      GROUP BY e.exit_ip
+    `).all();
+    const map = new Map();
+    for (const r of rows) {
+      map.set(r.exitIp, { total: Number(r.total) || 0, deactivated: Number(r.deactivated) || 0 });
+    }
+    return map;
   },
 
   remove(identityKey) {

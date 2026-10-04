@@ -41,6 +41,10 @@ const NEW_ACCOUNT_TLS_PROFILE = normalizeTlsProfile(
 const MAX_BATCH_JOBS = 500;
 const MAX_PROXY_RISK_RETRIES = 10;
 const MAX_PROXY_CONNECTION_FAILURES = 20;
+// Cảnh báo "đổi IP": khi một IP (host) đã có >= ngưỡng này tài khoản bị vô hiệu hoá
+// (account bị OpenAI ban/xoá/đình chỉ → autoRepairBlocked), IP đó coi như đã "cháy"
+// và nên đổi sang IP mới trên proxy. Số nhỏ hơn vẫn hiện cảnh báo (vàng) trên danh sách.
+const PROXY_BURN_THRESHOLD = Math.max(1, Math.trunc(Number(process.env.PROXY_BURN_THRESHOLD)) || 5);
 const PROXY_CONNECTION_RETRY_BASE_MS = Math.max(1, Number(process.env.PROXY_CONNECTION_RETRY_BASE_MS || 1_000));
 const PROXY_CONNECTION_RETRY_MAX_MS = 15_000;
 const PAGE_SIZE = 20;
@@ -62,12 +66,18 @@ const MAIL_POLL_TIMEOUT_MS = 10 * 60_000;
 // seconds before it was requested), so ask for a new one when none shows up.
 const MAIL_AUTO_RESEND_AFTER_MS = Number(process.env.MAIL_AUTO_RESEND_AFTER_MS) || 45_000;
 const MAIL_AUTO_RESEND_MAX = 2;
-// When an IP signs up a second account a few minutes after the first, the service accepts the
-// request but never sends the verification email. A queued registration therefore waits until
-// other accounts have left its proxy IP quiet for this long (overridden by the proxy dialog).
-const PROXY_SIGNUP_COOLDOWN_MS = readDurationEnv("PROXY_SIGNUP_COOLDOWN_MS", 10 * 60_000, 0);
-const MAX_PROXY_SIGNUP_COOLDOWN_MINUTES = 240;
+// OpenAI only emails the verification code for the first couple of signups an IP makes in quick
+// succession; a further one within the same short window is accepted but never emailed. So a fixed
+// proxy IP may launch at most PROXY_SIGNUP_MAX_PER_WINDOW brand-new registrations per rolling window,
+// and extra ones wait in the queue until an earlier start ages out (both overridden by the proxy dialog).
+const PROXY_SIGNUP_WINDOW_MS = readDurationEnv("PROXY_SIGNUP_WINDOW_MS", 60_000, 1_000);
+const PROXY_SIGNUP_MAX_PER_WINDOW = Math.max(1, Math.trunc(Number(process.env.PROXY_SIGNUP_MAX_PER_WINDOW)) || 2);
+const MAX_PROXY_SIGNUP_MAX_PER_WINDOW = 100;
 const PROXY_LINK_SETTING_DB_KEY = "ui:chatgpt-onboarding.proxy-link-config-v1";
+// Danh sách host (IP cũ) chủ máy đã "Quên" — ẩn khỏi "Danh sách proxy IP". Chỉ ẩn IP cũ
+// (configured:false), vì row IP cũ do LIVE JOBS (account đã đăng ký) tạo ra nên không xoá
+// được bằng cách sửa cấu hình; thêm lại IP vào cấu hình sẽ hiện lại (configured:true).
+const PROXY_FORGOTTEN_HOSTS_KEY = "proxy:forgotten-hosts-v1";
 const MAX_MAIL_REQUEST_BODY_BYTES = 64 * 1024;
 const MAX_MAIL_REQUEST_HEADERS = 64;
 const FORBIDDEN_MAIL_REQUEST_HEADERS = new Set([
@@ -568,6 +578,16 @@ async function handleApi(req, res, requestUrl) {
     // even an IP that is no longer in the configured list can still be health-checked.
     const jobsByHost = new Map(); // host -> { url, emails: [{email,status,registered}] }
     const consumedByHost = proxyConsumedByHost(); // registered-or-running, minus deactivated
+    // host -> { total, deactivated } lấy từ SỔ CÁI lifetime (used_proxy_emails JOIN
+    // deactivated_emails). Dùng sổ cái vì job của tài khoản bị vô hiệu hoá bị XOÁ hẳn
+    // (removeDeactivatedTask → deleteJobsByEmail), nên đếm từ job đang sống sẽ luôn = 0.
+    // HYBRID: giữ 2 góc nhìn về cháy, không wipe lịch sử.
+    // - deactivationByHost: lịch sử cháy TRỌN ĐỜI theo proxy line (host) — giữ nguyên
+    //   dữ liệu cũ (kể cả account NULL exit_ip), không bao giờ reset.
+    // - deactivationByExitIp: cháy theo IP RA THỰC đang ra (chỉ account mới có exit_ip)
+    //   — dùng để "checking" xem IP đang dùng đã sạch hay vẫn cháy.
+    const deactivationByHost = usedProxyDao.deactivationHistoryByHost();
+    const deactivationByExitIp = usedProxyDao.deactivationHistoryByExitIp();
     for (const job of listUniqueJobs()) {
       if (job.deleted || !job.proxyUrl) continue;
       const parsed = parseProxyUrlForSub2Api(job.proxyUrl);
@@ -588,8 +608,11 @@ async function handleApi(req, res, requestUrl) {
       seen.add(parsed.host);
       targets.push({ host: parsed.host, url, configured: true });
     }
+    // IP cũ (không trong cấu hình) mà chủ đã "Quên" thì ẩn khỏi danh sách. IP đang
+    // cấu hình (ở vòng trên) không bao giờ bị ẩn — thêm lại vào cấu hình là hiện lại.
+    const forgottenHosts = getForgottenProxyHosts();
     for (const [host, info] of jobsByHost) {
-      if (seen.has(host)) continue;
+      if (seen.has(host) || forgottenHosts.has(host)) continue;
       seen.add(host);
       targets.push({ host, url: info.url, configured: false });
     }
@@ -608,6 +631,27 @@ async function handleApi(req, res, requestUrl) {
       const registeredCount = emails.filter((e) => e.registered).length;
       const consumedCount = consumedByHost.get(target.host) || 0;
       const remaining = Math.max(0, limitPerIp - consumedCount);
+      // (1) LỊCH SỬ CHÁY theo host (trọn đời proxy line, không wipe): disabledCount =
+      // số account bị vô hiệu hoá, disabledTotal = tổng account từng chạy qua.
+      const history = deactivationByHost.get(target.host) || { total: 0, deactivated: 0 };
+      const disabledCount = history.deactivated;
+      const disabledTotal = history.total;
+      // (2) CHECKING — IP RA THỰC đang ra (check.ip) đã sạch chưa:
+      //   unknown = proxy chết, không probe được IP hiện tại.
+      //   nodata  = probe được IP nhưng CHƯA có account mới nào trên IP này (toàn
+      //             account cũ NULL) → KHÔNG kết luận sạch, chỉ là chưa có dữ liệu.
+      //   clean   = có account mới trên IP này và chưa cháy → "Đã đổi IP ✓".
+      //   burning = IP hiện tại đã có account cháy nhưng dưới ngưỡng.
+      //   burned  = IP hiện tại cháy >= ngưỡng → đỏ "Cần đổi IP".
+      const curBucket = (check.ok && check.ip) ? deactivationByExitIp.get(check.ip) : undefined;
+      const curExitDisabled = curBucket ? curBucket.deactivated : 0;
+      const curExitTotal = curBucket ? curBucket.total : 0;
+      let curExitStatus;
+      if (!check.ok || !check.ip) curExitStatus = "unknown";
+      else if (!curBucket) curExitStatus = "nodata";
+      else if (curExitDisabled >= PROXY_BURN_THRESHOLD) curExitStatus = "burned";
+      else if (curExitDisabled > 0) curExitStatus = "burning";
+      else curExitStatus = "clean";
       return {
         host: parsed?.host || target.host,
         port: parsed?.port || 0,
@@ -623,6 +667,14 @@ async function handleApi(req, res, requestUrl) {
         registeredCount,
         consumedCount,
         remaining,
+        disabledCount,
+        disabledTotal,
+        curExitDisabled,
+        curExitTotal,
+        curExitStatus,
+        // burned = IP ĐANG DÙNG cháy >= ngưỡng → đỏ "Cần đổi IP" (dựa trên IP hiện tại,
+        // không dựa lịch sử host để chủ đổi IP là cờ tắt).
+        burned: curExitStatus === "burned",
         // usage: "unused" = chưa chiếm chỗ · "inuse" = còn lượt · "used" = hết lượt
         usage: consumedCount === 0 ? "unused" : (remaining > 0 ? "inuse" : "used"),
       };
@@ -634,7 +686,22 @@ async function handleApi(req, res, requestUrl) {
       inuse: proxies.filter((p) => p.usage === "inuse").length,
       used: proxies.filter((p) => p.usage === "used").length,
     };
-    sendJson(res, 200, { limitPerIp, mode, totalCount: proxies.length, activeCount, remaining, usageCounts, proxies });
+    const burnedCount = proxies.filter((p) => p.burned).length;
+    sendJson(res, 200, { limitPerIp, mode, totalCount: proxies.length, activeCount, remaining, usageCounts, burnedCount, burnThreshold: PROXY_BURN_THRESHOLD, proxies });
+    return;
+  }
+
+  // "Quên IP này": ẩn 1 IP cũ (không còn trong cấu hình) khỏi danh sách. Không xoá job
+  // (giữ record tài khoản), chỉ ẩn dòng. forget=false để hiện lại.
+  if (req.method === "POST" && requestUrl.pathname === "/api/proxies/forget") {
+    const body = await readJson(req);
+    const host = String(body.host || "").trim();
+    if (!host) {
+      sendJson(res, 400, { error: "Thiếu host" });
+      return;
+    }
+    const forgotten = setProxyHostForgotten(host, body.forget !== false);
+    sendJson(res, 200, { ok: true, host, forgotten });
     return;
   }
 
@@ -838,7 +905,7 @@ async function handleApi(req, res, requestUrl) {
       }
       let assignedProxy = proxyUrl;
       if (batchMode) {
-        assignedProxy = makeProxyAllocator(body.proxies, body.limitPerIp).next();
+        assignedProxy = makeProxyAllocator(readProxyAllocConfig(body), body.limitPerIp).next(email);
         if (!assignedProxy) return { poolFull: true };
       }
       return { job: await startJob(email, credentials, assignedProxy), created: true, updated: false };
@@ -855,7 +922,7 @@ async function handleApi(req, res, requestUrl) {
     const body = await readJson(req);
     const entries = parseBatchEntries(body.text, mailRequestConfig);
     const batchMode = body.proxyMode === "batch";
-    const allocator = batchMode ? makeProxyAllocator(body.proxies, body.limitPerIp) : null;
+    const allocator = batchMode ? makeProxyAllocator(readProxyAllocConfig(body), body.limitPerIp) : null;
     const proxyUrl = normalizeProxyUrl(body.proxyUrl);
     // Ở chế độ nhiều IP: chạy đủ số chỗ còn lại của các IP; tài khoản dư (không
     // còn chỗ) được tạo rồi huỷ tác vụ ngay, không từ chối cả lô.
@@ -869,7 +936,7 @@ async function handleApi(req, res, requestUrl) {
         return { job: existing, updated: true };
       }
       if (allocator) {
-        const assignedProxy = allocator.next();
+        const assignedProxy = allocator.next(entry.email);
         if (!assignedProxy) {
           // IP đã đủ giới hạn đăng ký → tạo tác vụ rồi huỷ ngay.
           const job = await startJob(entry.email, entry, null, { staged: true });
@@ -900,20 +967,36 @@ async function handleApi(req, res, requestUrl) {
     // Staged jobs are idle and do NOT consume a slot, so stage everything and
     // just distribute them round-robin across the configured IPs. The per-IP
     // registration limit is enforced later, when the jobs are actually started.
-    let hostUrls = [];
-    if (batchMode) {
-      const seenHosts = new Set();
-      hostUrls = parseProxyList(body.proxies)
-        .filter((p) => (seenHosts.has(p.host) ? false : (seenHosts.add(p.host), true)))
-        .map(proxyObjToUrl);
-    }
-    let cursor = 0;
+    // Khớp proxy theo domain của email (có proxy riêng thì dùng, hết thì mượn
+    // pool chung); round-robin thuần, không xét giới hạn/usage ở bước staging.
+    const stageConfig = batchMode ? readProxyAllocConfig(body) : { general: "", groups: [] };
+    const stageDomains = stageConfig.groups.map((g) => ({ domain: g.domain, list: dedupeProxyUrls(g.proxies) }));
+    const stageDomainHosts = new Set(stageDomains.flatMap((d) => d.list.map((it) => it.host)));
+    const stageDomainLists = stageDomains.map((d) => ({ domain: d.domain, urls: d.list.map((it) => it.url) }));
+    // Proxy đã gán domain là độc quyền → loại khỏi pool chung ở bước staging luôn.
+    const stageGeneral = batchMode
+      ? dedupeProxyUrls(stageConfig.general).filter((it) => !stageDomainHosts.has(it.host)).map((it) => it.url)
+      : [];
+    const stageCursors = new Map();
+    const pickStage = (urls, key) => {
+      if (!urls.length) return null;
+      const i = (stageCursors.get(key) || 0) % urls.length;
+      stageCursors.set(key, i + 1);
+      return urls[i];
+    };
+    const nextStageProxy = (email) => {
+      const domain = emailDomainPart(email);
+      const group = domain ? stageDomainLists.find((g) => domain === g.domain || domain.endsWith(`.${g.domain}`)) : null;
+      if (group) {
+        const url = pickStage(group.urls, `domain:${group.domain}`);
+        if (url) return url;
+      }
+      return pickStage(stageGeneral, "__general__");
+    };
     const results = await Promise.all(entries.map((entry) => withEmailJobLock(entry.email, async () => {
       const existing = findJobByEmail(entry.email);
       if (existing) return { job: existing, created: false };
-      const assignedProxy = batchMode
-        ? (hostUrls.length ? hostUrls[cursor++ % hostUrls.length] : null)
-        : proxyUrl;
+      const assignedProxy = batchMode ? nextStageProxy(entry.email) : proxyUrl;
       return { job: await startJob(entry.email, entry, assignedProxy, { staged: true }), created: true };
     })));
     sendJson(res, 201, {
@@ -1316,7 +1399,7 @@ async function handleApi(req, res, requestUrl) {
     if (req.method === "PUT") {
       const body = await readJson(req);
       writeUiSettings(body.settings);
-      // A shorter proxy cool-down may release registrations that are waiting in the queue.
+      // A looser proxy per-IP limit may release registrations that are waiting in the queue.
       scheduleQueuedJobs();
       sendJson(res, 200, { ok: true });
       return;
@@ -1626,23 +1709,34 @@ function scheduleQueuedJobs() {
   const queuedJobs = [...jobs.values()]
     .filter((job) => job.status === "queued")
     .sort((a, b) => String(a.queuedAt || a.createdAt).localeCompare(String(b.queuedAt || b.createdAt)));
-  const cooldownMs = proxySignupCooldownMs();
-  const signupActivity = cooldownMs > 0 ? proxySignupActivityByHost() : null;
+  const { windowMs, maxPerWindow } = proxySignupLimit();
+  const throttleOn = windowMs > 0 && maxPerWindow > 0;
+  // Keep one entry more than the limit so a job is never held back by its own earlier start.
+  const keepPerKey = maxPerWindow + 1;
+  const signupActivity = throttleOn ? proxySignupActivityByKey(keepPerKey) : null;
   let nextCooldownEndsAt = Infinity;
   for (const job of queuedJobs) {
     const mode = job.queuedMode || "full";
-    const cooldownHost = signupActivity ? signupCooldownHost(job, mode) : null;
-    if (cooldownHost) {
-      const recent = signupActivity.get(cooldownHost) || [];
-      const readyAt = (recent.find((entry) => entry.id !== job.id)?.at || 0) + cooldownMs;
-      if (readyAt > Date.now()) {
-        // Stays queued without taking a slot, so jobs on other IPs behind it still start.
-        job.proxyCooldownUntil = readyAt;
-        nextCooldownEndsAt = Math.min(nextCooldownEndsAt, readyAt);
-        continue;
+    const cooldownKey = signupActivity ? signupCooldownHost(job, mode) : null;
+    if (cooldownKey) {
+      const now = Date.now();
+      // Other accounts' recent signups through this exit IP, newest first, still inside the window.
+      const within = (signupActivity.get(cooldownKey) || [])
+        .filter((entry) => entry.id !== job.id && now - entry.at < windowMs)
+        .sort((a, b) => b.at - a.at);
+      if (within.length >= maxPerWindow) {
+        // The window is full; wait until the oldest start that still blocks us leaves it.
+        const readyAt = within[maxPerWindow - 1].at + windowMs;
+        if (readyAt > now) {
+          // Stays queued without taking a slot, so jobs on other IPs behind it still start.
+          job.proxyCooldownUntil = readyAt;
+          nextCooldownEndsAt = Math.min(nextCooldownEndsAt, readyAt);
+          continue;
+        }
       }
-      job.signupLaunchedAt = Date.now();
-      signupActivity.set(cooldownHost, [{ id: job.id, at: job.signupLaunchedAt }, ...recent].slice(0, 2));
+      job.signupLaunchedAt = now;
+      const others = (signupActivity.get(cooldownKey) || []).filter((entry) => entry.id !== job.id);
+      signupActivity.set(cooldownKey, [{ id: job.id, at: now }, ...others].slice(0, keepPerKey));
     }
     job.proxyCooldownUntil = null;
     const queueRunId = crypto.randomUUID();
@@ -1671,21 +1765,24 @@ function scheduleQueuedJobs() {
   if (nextCooldownEndsAt !== Infinity) scheduleProxyCooldownWake(nextCooldownEndsAt);
 }
 
-function proxySignupCooldownMs() {
+// How many brand-new registrations a fixed IP may launch per rolling window. The proxy dialog's
+// maxPerMinute overrides the default; 0 (or blank) removes the throttle entirely.
+function proxySignupLimit() {
+  let maxPerWindow = PROXY_SIGNUP_MAX_PER_WINDOW;
   try {
-    const minutes = JSON.parse(settingsDao.get(PROXY_LINK_SETTING_DB_KEY) || "null")?.cooldownMinutes;
-    if (minutes !== undefined && minutes !== null && minutes !== "") {
-      const value = Number(minutes);
-      if (Number.isFinite(value) && value >= 0) return Math.min(value, MAX_PROXY_SIGNUP_COOLDOWN_MINUTES) * 60_000;
+    const raw = JSON.parse(settingsDao.get(PROXY_LINK_SETTING_DB_KEY) || "null")?.maxPerMinute;
+    if (raw !== undefined && raw !== null && raw !== "") {
+      const value = Number(raw);
+      if (Number.isFinite(value) && value >= 0) maxPerWindow = Math.min(Math.trunc(value), MAX_PROXY_SIGNUP_MAX_PER_WINDOW);
     }
   } catch {}
-  return PROXY_SIGNUP_COOLDOWN_MS;
+  return { windowMs: PROXY_SIGNUP_WINDOW_MS, maxPerWindow };
 }
 
 // The cool-down only concerns a brand-new registration; a rotating proxy exits through another IP each time.
 function signupCooldownHost(job, mode) {
   if (mode !== "full" || job.registrationSucceeded) return null;
-  return fixedProxyHost(job.proxyUrl);
+  return signupExitKey(job);
 }
 
 function fixedProxyHost(proxyUrl) {
@@ -1693,18 +1790,45 @@ function fixedProxyHost(proxyUrl) {
   return parseProxyUrlForSub2Api(proxyUrl)?.host || null;
 }
 
-// Per proxy host: the two jobs that most recently sent signup traffic through it, newest first.
-// Two are kept so that a job retrying on its own IP is only held back by another account.
-function proxySignupActivityByHost() {
-  const byHost = new Map();
+// Throttle identity for a signup: the proxy's real exit IP once known, so a changed or reset IP
+// starts its own window (and a domain that rotates every request spreads across IPs and never
+// trips the limit). Falls back to the configured host until the exit IP is probed; null = exempt
+// (rotating sid/kookeey proxy, or no proxy).
+function signupExitKey(job) {
+  const host = fixedProxyHost(job.proxyUrl);
+  if (!host) return null;
+  if (job.exitIp) return job.exitIp;
+  const cached = proxyExitIpCache.get(host);
+  if (cached?.result?.ok && cached.result.ip && Date.now() - cached.at < PROXY_EXIT_IP_TTL_MS) return cached.result.ip;
+  return host;
+}
+
+// Non-blocking: probe the proxy's current exit IP and stamp it on the job, warming the shared
+// cache so later queued-job throttle decisions on the same host key off the real IP too.
+function probeSignupExitIp(job) {
+  const host = fixedProxyHost(job.proxyUrl);
+  if (!host) return; // rotating sid/kookeey proxy or no proxy: not keyed by a fixed exit IP
+  void checkProxyExitIp(job.proxyUrl).then((res) => {
+    if (res?.ok && res.ip) {
+      job.exitIp = res.ip;
+      proxyExitIpCache.set(host, { at: Date.now(), result: res });
+    }
+  }).catch(() => {});
+}
+
+// Per exit-IP key: the jobs that most recently sent signup traffic through it, newest first.
+// One more than the per-window limit is kept so a job retrying on its own IP is only ever held
+// back by other accounts, never by its own earlier start.
+function proxySignupActivityByKey(keepPerKey) {
+  const byKey = new Map();
   for (const job of jobs.values()) {
     const at = Math.max(job.signupLaunchedAt || 0, job.mailOtpRequestedAt || 0, Date.parse(job.registeredAt || "") || 0);
-    const host = at ? fixedProxyHost(job.proxyUrl) : null;
-    if (!host) continue;
-    const recent = [...(byHost.get(host) || []), { id: job.id, at }].sort((a, b) => b.at - a.at);
-    byHost.set(host, recent.slice(0, 2));
+    const key = at ? signupExitKey(job) : null;
+    if (!key) continue;
+    const recent = [...(byKey.get(key) || []), { id: job.id, at }].sort((a, b) => b.at - a.at);
+    byKey.set(key, recent.slice(0, keepPerKey));
   }
-  return byHost;
+  return byKey;
 }
 
 function scheduleProxyCooldownWake(at) {
@@ -1750,6 +1874,10 @@ function launchJob(job, options = {}) {
   if (mode === "full" && !job.authAutomationAttempt) {
     beginAuthorizationAutomationAttempt(job, "login");
   }
+  // Learn this signup's real exit IP in the background so the per-IP throttle (and the
+  // registration ledger) key off the IP OpenAI actually sees, not the proxy host. A domain
+  // that rotates every request yields a different IP each launch and so never trips the limit.
+  if (mode === "full") probeSignupExitIp(job);
   const runId = crypto.randomUUID();
   job.runId = runId;
   job.runMode = mode;
@@ -1872,7 +2000,13 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
     return;
   }
   if (job.status !== "failed") {
-    if (await fileExists(job.checkpointPath)) {
+    // Safety net: if the fatal "[error]" line slipped past the streaming
+    // detector (e.g. split across the parser tail), a permanent account closure
+    // must still fail the job rather than be offered as a resumable checkpoint.
+    const fatalError = extractFatalLoginError(job.logs);
+    if (fatalError && isPermanentAccountFailure(fatalError)) {
+      failAccountClosedDuringLogin(job, fatalError);
+    } else if (await fileExists(job.checkpointPath)) {
       markResumeAvailable(job, signal ? `登录进程被 ${signal} 终止` : "登录流程中断");
     } else {
       failJob(job, signal ? `登录进程被 ${signal} 终止` : `登录进程退出，代码 ${code ?? "未知"}`);
@@ -2386,6 +2520,18 @@ function consumeOutput(job, rawText) {
   const scan = `${job.parserTail}${text}`;
   job.parserTail = scan.slice(-2_000);
 
+  // Fatal account closure (deleted / deactivated / banned) surfaces as a thrown
+  // "[error] ..." line — commonly at the 2FA step. The OTP wasn't wrong and a
+  // resume won't help, so stop immediately and mark the mailbox deactivated
+  // instead of letting the child exit into a generic "resume available" state.
+  if (!isTerminalStatus(job.status) && job.runMode !== "totp_setup" && job.runMode !== "password_add") {
+    const fatalError = extractFatalLoginError(scan);
+    if (fatalError && isPermanentAccountFailure(fatalError)) {
+      failAccountClosedDuringLogin(job, fatalError);
+      return;
+    }
+  }
+
   if (scan.includes("[3/5] Password login page reached.")) {
     markAuthorizationRequirement(job, "password");
     if (job.password) markAuthorizationAutomatic(job, "password");
@@ -2829,6 +2975,30 @@ function failAccountClosedAtPhoneOtp(job, validationMessage) {
   job.child?.kill("SIGTERM");
   job.child = null;
   scheduleQueuedJobs();
+}
+
+// Account confirmed deleted/deactivated/banned partway through login — most
+// often at the 2FA step, where OpenAI answers "You do not have an account
+// because it has been deleted or deactivated." The 2FA code was not wrong, so
+// retrying the OTP or resuming the saved checkpoint cannot recover it: fail now
+// with the real reason so failJob() tags the mailbox as deactivated and the
+// pool scan skips it, instead of offering a pointless resume.
+function failAccountClosedDuringLogin(job, rawMessage) {
+  if (isTerminalStatus(job.status)) return;
+  failJob(job, `账号已被 OpenAI 删除或停用：${extractResponseMessage(rawMessage)}`);
+  job.child?.kill("SIGTERM");
+  job.child = null;
+  scheduleQueuedJobs();
+}
+
+// Pull the fatal "[error] ..." line the login child prints right before it
+// exits, so a permanent account closure can be recognised from streamed output.
+function extractFatalLoginError(scan) {
+  let found = null;
+  for (const match of String(scan || "").matchAll(/\[error\]\s*([^\r\n]+)/g)) {
+    found = match[1].trim();
+  }
+  return found;
 }
 
 function markResumeAvailable(job, reason = "登录流程中断") {
@@ -3746,9 +3916,27 @@ function phoneLedgerStats() {
   return { maxUses: phoneMaxUses, totalNumbers: usedPhoneLedger.size, blocked, totalUses };
 }
 
+// Các host (IP cũ) chủ máy đã "Quên" — đọc từ settings, trả về Set.
+function getForgottenProxyHosts() {
+  try {
+    const arr = JSON.parse(settingsDao.get(PROXY_FORGOTTEN_HOSTS_KEY) || "[]");
+    return new Set(Array.isArray(arr) ? arr.filter((h) => typeof h === "string" && h) : []);
+  } catch {
+    return new Set();
+  }
+}
+
+// Thêm/bỏ 1 host khỏi danh sách "đã quên". Trả về mảng host hiện tại.
+function setProxyHostForgotten(host, forget) {
+  const set = getForgottenProxyHosts();
+  if (forget) set.add(host); else set.delete(host);
+  settingsDao.set(PROXY_FORGOTTEN_HOSTS_KEY, JSON.stringify([...set]));
+  return [...set];
+}
+
 // Record that a proxy credential has been assigned to an account. Never removed
 // on account deletion, so the ledger keeps the full history ("kể cả tài khoản đã xóa").
-function recordProxyUsage(proxyUrl, email) {
+function recordProxyUsage(proxyUrl, email, exitIp = null) {
   const identity = proxyConnectionIdentity(proxyUrl);
   if (!identity) return;
   const now = new Date().toISOString();
@@ -3776,7 +3964,7 @@ function recordProxyUsage(proxyUrl, email) {
       label: identity.label, protocol: identity.protocol,
       host: identity.host, port: identity.port,
       firstUsedAt: now, lastUsedAt: now,
-    }, email);
+    }, email, exitIp);
   } catch (error) {
     console.warn(`[warn] 代理使用记录写入失败：${String(error?.message || error).slice(0, 180)}`);
   }
@@ -3964,34 +4152,93 @@ function proxyConsumedByHost() {
   return usage;
 }
 
-function makeProxyAllocator(proxiesText, limitPerIpRaw) {
-  const limitPerIp = Math.min(999, Math.max(1, Math.trunc(Number(limitPerIpRaw)) || 15));
-  const list = [];
+// Phần sau @ của email, dạng chữ thường. Dùng để khớp proxy theo domain.
+function emailDomainPart(email) {
+  const at = String(email || "").lastIndexOf("@");
+  return at >= 0 ? String(email).slice(at + 1).trim().toLowerCase() : "";
+}
+
+// Đọc cấu hình phân bổ proxy từ body: pool chung (`proxies`) + các nhóm proxy
+// gán riêng theo domain (`domainProxies: [{ domain, proxies }]`). Nhóm thiếu
+// domain hoặc rỗng bị bỏ qua.
+function readProxyAllocConfig(body) {
+  const general = typeof body?.proxies === "string" ? body.proxies : "";
+  const groups = Array.isArray(body?.domainProxies)
+    ? body.domainProxies
+        .map((g) => ({
+          domain: String(g?.domain || "").trim().toLowerCase().replace(/^@+/, ""),
+          proxies: typeof g?.proxies === "string" ? g.proxies : "",
+        }))
+        .filter((g) => g.domain && g.proxies.trim())
+    : [];
+  return { general, groups };
+}
+
+// Danh sách URL proxy đã khử trùng host (mỗi IP chỉ 1 lần) từ 1 khối text.
+function dedupeProxyUrls(text) {
   const seen = new Set();
-  for (const p of parseProxyList(proxiesText)) {
+  const list = [];
+  for (const p of parseProxyList(text)) {
     if (seen.has(p.host)) continue;
     seen.add(p.host);
     list.push({ host: p.host, url: proxyObjToUrl(p) });
   }
+  return list;
+}
+
+// Auto-assign proxies when registering accounts in batch mode. Nhận hoặc 1 khối
+// text (pool chung, tương thích cũ) hoặc cấu hình { general, groups } có proxy
+// gán riêng theo domain. `.next(email)` ưu tiên proxy của domain email đó; hết
+// chỗ (mọi IP riêng đã đạt giới hạn) thì mượn pool chung. Giới hạn limitPerIp
+// đếm theo host và DÙNG CHUNG cho cả proxy riêng lẫn pool chung, nên một IP
+// không bao giờ vượt giới hạn dù nằm ở nhóm nào.
+function makeProxyAllocator(proxyConfig, limitPerIpRaw) {
+  const limitPerIp = Math.min(999, Math.max(1, Math.trunc(Number(limitPerIpRaw)) || 15));
+  const { general, groups } = typeof proxyConfig === "string"
+    ? { general: proxyConfig, groups: [] }
+    : (proxyConfig || { general: "", groups: [] });
+  const domainLists = groups.map((g) => ({ domain: g.domain, list: dedupeProxyUrls(g.proxies) }));
+  // Proxy đã gán cho 1 domain là ĐỘC QUYỀN của domain đó: loại khỏi pool chung dù
+  // người dùng vẫn để nó trong danh sách chung, nên domain khác không bốc trúng.
+  const domainHosts = new Set(domainLists.flatMap((d) => d.list.map((it) => it.host)));
+  const generalList = dedupeProxyUrls(general).filter((it) => !domainHosts.has(it.host));
   // Only registered-or-running (non-deactivated) jobs occupy a slot; queued/idle
   // and pre-SMS failures do not — so freshly staged accounts don't pre-reserve.
+  // Một usage map DUY NHẤT theo host cho mọi nhóm: cùng IP không bị tính 2 lần.
   const usage = proxyConsumedByHost();
-  for (const item of list) if (!usage.has(item.host)) usage.set(item.host, 0);
-  let cursor = 0;
+  const allItems = [...generalList, ...domainLists.flatMap((d) => d.list)];
+  for (const item of allItems) if (!usage.has(item.host)) usage.set(item.host, 0);
+  const cursors = new Map(); // key nhóm -> vị trí round-robin
+  const pickFrom = (list, key) => {
+    if (!list.length) return null;
+    const start = cursors.get(key) || 0;
+    for (let i = 0; i < list.length; i += 1) {
+      const item = list[(start + i) % list.length];
+      if ((usage.get(item.host) || 0) < limitPerIp) {
+        cursors.set(key, (start + i + 1) % list.length);
+        usage.set(item.host, (usage.get(item.host) || 0) + 1);
+        return item.url;
+      }
+    }
+    return null;
+  };
+  const groupFor = (email) => {
+    const domain = emailDomainPart(email);
+    if (!domain) return null;
+    return domainLists.find((g) => domain === g.domain || domain.endsWith(`.${g.domain}`)) || null;
+  };
   return {
     limitPerIp,
-    count: list.length,
-    remainingCapacity: () => list.reduce((sum, it) => sum + Math.max(0, limitPerIp - (usage.get(it.host) || 0)), 0),
-    next: () => {
-      for (let i = 0; i < list.length; i += 1) {
-        const item = list[(cursor + i) % list.length];
-        if ((usage.get(item.host) || 0) < limitPerIp) {
-          cursor = (cursor + i + 1) % list.length;
-          usage.set(item.host, (usage.get(item.host) || 0) + 1);
-          return item.url;
-        }
+    count: allItems.length,
+    remainingCapacity: () => allItems.reduce((sum, it) => sum + Math.max(0, limitPerIp - (usage.get(it.host) || 0)), 0),
+    next: (email) => {
+      const group = groupFor(email);
+      // Proxy riêng của domain trước; hết chỗ thì mượn pool chung (fallback).
+      if (group) {
+        const url = pickFrom(group.list, `domain:${group.domain}`);
+        if (url) return url;
       }
-      return null; // tất cả IP đã đạt giới hạn
+      return pickFrom(generalList, "__general__");
     },
   };
 }
@@ -4974,7 +5221,22 @@ function markRegistrationSucceeded(job) {
   job.registrationSucceeded = true;
   job.registeredAt = new Date().toISOString();
   clearEmailDeactivated(job.email); // fresh account registered on this mailbox → no longer deactivated
+  void recordRegistrationExitIp(job).catch(() => {});
   void saveJobMetadata(job).catch(() => {});
+}
+
+// Persist, per account, the real exit IP this registration went through, so burn/history can be
+// counted by IP (not proxy host). Reuses the launch probe; probes once (cached) if it is missing.
+// A rotating/no-proxy job has no fixed exit IP and is skipped.
+async function recordRegistrationExitIp(job) {
+  const host = fixedProxyHost(job.proxyUrl);
+  if (!host) return;
+  let ip = job.exitIp || null;
+  if (!ip) {
+    const res = await checkProxyExitIpCached(job.proxyUrl, host).catch(() => null);
+    if (res?.ok && res.ip) { ip = res.ip; job.exitIp = ip; }
+  }
+  if (ip) recordProxyUsage(job.proxyUrl, job.email, ip);
 }
 
 function failJob(job, message) {
