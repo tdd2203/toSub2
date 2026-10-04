@@ -2399,7 +2399,7 @@ function App() {
                   </button>
                 </div>
                 <div className="wide-settings-field domain-proxy-section">
-                  <span className="domain-proxy-title">{t("按域名分配专用代理")} <small>{t("指定域名的邮箱只用该域名的专用代理；用完后再借用通用代理池")}</small></span>
+                  <span className="domain-proxy-title">{t("按域名分配专用代理")} <small>{t("每个域名可填多行代理（每行一个）；该域名的账号会在这些专用代理间按每 IP 上限轮流分配，用完后再借用通用代理池")}</small></span>
                   <div className="domain-proxy-groups">
                     {(proxyLinkConfig.domainProxies || []).map((group, index) => {
                       const ipCount = parseProxyPasteList(group?.proxies || "").length;

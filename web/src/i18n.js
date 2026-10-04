@@ -344,6 +344,7 @@ const VI = {
   "通用代理池：已配置 {0} 个代理 IP（用于所有域名）。": "Pool chung: đã cấu hình {0} proxy IP (dùng cho mọi domain).",
   "按域名分配专用代理": "Gán proxy riêng theo domain",
   "指定域名的邮箱只用该域名的专用代理；用完后再借用通用代理池": "Email thuộc domain đã chỉ định chỉ dùng proxy riêng của domain đó; hết chỗ mới mượn pool chung",
+  "每个域名可填多行代理（每行一个）；该域名的账号会在这些专用代理间按每 IP 上限轮流分配，用完后再借用通用代理池": "Mỗi domain nhập được nhiều proxy (mỗi dòng 1 cái); tài khoản của domain được phân bổ đều (round-robin) qua các proxy riêng đó theo giới hạn mỗi IP, hết chỗ mới mượn pool chung",
   "域名，例如 example.com": "Domain, ví dụ example.com",
   "{0} 个 IP": "{0} IP",
   "添加域名代理": "Thêm proxy domain",

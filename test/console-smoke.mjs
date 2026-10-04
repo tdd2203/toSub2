@@ -139,6 +139,8 @@ const child = spawn(process.execPath, [
       "10.9.8.7": "10.9.8.7",
       "10.0.0.1": "10.0.0.1",
       "10.0.0.2": "10.0.0.2",
+      "10.0.0.3": "10.0.0.3",
+      "10.0.0.4": "10.0.0.4",
       "10.0.0.9": "10.0.0.9",
     }),
     SUB2API_AUTO_REPAIR_COOLDOWN_MS: "0",
@@ -321,6 +323,30 @@ try {
   assert.deepEqual(by2.get("10.0.0.1"), ["y@d1.test", "z@d1.test"], "d1.test gom hết về proxy riêng 10.0.0.1");
   assert.deepEqual(by2.get("10.0.0.9"), ["x@other.test"], "other.test rời proxy độc quyền sang pool chung");
   await fetch(`${baseUrl}/api/jobs/delete-batch`, { method: "POST", headers, body: JSON.stringify({ ids: [...staged1.jobs, ...staged2.jobs].map((j) => j.id) }) });
+
+  // --- Một domain có NHIỀU proxy riêng: tài khoản của domain được phân bổ đều
+  // (round-robin) qua các proxy đó, tôn trọng giới hạn mỗi IP (ở đây 2/IP). ---
+  const multiResp = await fetch(`${baseUrl}/api/jobs/batch`, {
+    method: "POST", headers,
+    body: JSON.stringify({
+      text: ["m1@d3.test", "m2@d3.test", "m3@d3.test", "m4@d3.test"].join("\n"),
+      proxyMode: "batch", limitPerIp: 2,
+      proxies: "socks5h://10.0.0.9:1080",
+      domainProxies: [{ domain: "d3.test", proxies: ["socks5h://10.0.0.3:1080", "socks5h://10.0.0.4:1080"].join("\n") }],
+    }),
+  });
+  const multiText = await multiResp.text();
+  assert.equal(multiResp.status, 201, multiText);
+  const multi = JSON.parse(multiText);
+  const st3 = JSON.parse(await (await fetch(`${baseUrl}/api/proxies/status`, {
+    method: "POST", headers,
+    body: JSON.stringify({ mode: "batch", limitPerIp: 2, proxies: ["socks5h://10.0.0.9:1080", "socks5h://10.0.0.3:1080", "socks5h://10.0.0.4:1080"].join("\n") }),
+  })).text());
+  const by3 = new Map(st3.proxies.map((p) => [p.host, (p.emails || []).length]));
+  assert.equal(by3.get("10.0.0.3"), 2, `d3.test phân bổ đều: 10.0.0.3 nhận 2 (${multiText})`);
+  assert.equal(by3.get("10.0.0.4"), 2, "d3.test phân bổ đều: 10.0.0.4 nhận 2");
+  assert.ok(!by3.get("10.0.0.9"), "chưa chạm pool chung vì proxy riêng còn chỗ");
+  await fetch(`${baseUrl}/api/jobs/delete-batch`, { method: "POST", headers, body: JSON.stringify({ ids: multi.jobs.map((j) => j.id) }) });
 
   const forbiddenMailHeaderResponse = await fetch(`${baseUrl}/api/mail-request-config`, {
     method: "POST",
