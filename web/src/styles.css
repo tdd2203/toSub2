@@ -914,6 +914,11 @@ tbody tr:last-child td { border-bottom: 0; }
   border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; background: #fff;
 }
 .domain-proxy-domain:focus { outline: none; border-color: var(--green); box-shadow: 0 0 0 3px rgba(18, 113, 91, .1); }
+.domain-proxy-proto {
+  flex: 0 0 auto; font-size: 12px; font-weight: 600; color: var(--ink);
+  border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; background: #fff; cursor: pointer;
+}
+.domain-proxy-proto:focus { outline: none; border-color: var(--green); box-shadow: 0 0 0 3px rgba(18, 113, 91, .1); }
 .domain-proxy-count { flex: 0 0 auto; font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .domain-proxy-list {
   width: 100%; min-height: 72px; resize: vertical;
@@ -921,6 +926,12 @@ tbody tr:last-child td { border-bottom: 0; }
   border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; background: #fff;
 }
 .domain-proxy-list:focus { outline: none; border-color: var(--green); box-shadow: 0 0 0 3px rgba(18, 113, 91, .1); }
+.domain-proxy-status { display: flex; align-items: center; gap: 6px; margin-top: 7px; font-size: 11.5px; font-weight: 600; }
+.domain-proxy-status.ok { color: var(--green); }
+.domain-proxy-status.warn { color: #a3791f; }
+.domain-proxy-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.domain-proxy-notice { margin-top: 2px; font-size: 12px; font-weight: 600; color: var(--green); }
+.domain-proxy-hint { font-size: 11.5px; color: var(--muted); line-height: 1.5; }
 .proxy-del {
   display: inline-flex; align-items: center; justify-content: center;
   width: 30px; height: 30px; border-radius: 8px; border: 1px solid transparent;

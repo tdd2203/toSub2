@@ -283,6 +283,37 @@ try {
   });
   assert.equal(deleteDomainProxyJobs.status, 200, await deleteDomainProxyJobs.text());
 
+  // --- apply-domains: đổi proxy cho tài khoản cũ đang dùng proxy nay thành độc
+  // quyền của domain khác. Stage 2 job (idle) trên 10.0.0.1, rồi gán 10.0.0.1 cho
+  // d1.test → x@other.test phải chuyển sang pool chung (10.0.0.9), y@d1.test giữ. ---
+  const stageResp = await fetch(`${baseUrl}/api/jobs/stage`, {
+    method: "POST", headers,
+    body: JSON.stringify({ text: ["x@other.test", "y@d1.test"].join("\n"), proxyMode: "batch", proxies: "socks5h://10.0.0.1:1080" }),
+  });
+  const stageText = await stageResp.text();
+  assert.equal(stageResp.status, 201, stageText);
+  const staged = JSON.parse(stageText);
+  const applyResp = await fetch(`${baseUrl}/api/proxies/apply-domains`, {
+    method: "POST", headers,
+    body: JSON.stringify({
+      limitPerIp: 50,
+      proxies: ["socks5h://10.0.0.9:1080", "socks5h://10.0.0.1:1080"].join("\n"),
+      domainProxies: [{ domain: "d1.test", proxies: "socks5h://10.0.0.1:1080" }],
+    }),
+  });
+  const applyText = await applyResp.text();
+  assert.equal(applyResp.status, 200, applyText);
+  const apply = JSON.parse(applyText);
+  assert.equal(apply.reassigned, 1, `chỉ x@other.test bị đổi: ${applyText}`);
+  const st2 = JSON.parse(await (await fetch(`${baseUrl}/api/proxies/status`, {
+    method: "POST", headers,
+    body: JSON.stringify({ mode: "batch", limitPerIp: 50, proxies: ["socks5h://10.0.0.9:1080", "socks5h://10.0.0.1:1080"].join("\n") }),
+  })).text());
+  const by2 = new Map(st2.proxies.map((p) => [p.host, (p.emails || []).slice().sort()]));
+  assert.deepEqual(by2.get("10.0.0.1"), ["y@d1.test"], "d1.test giữ 10.0.0.1 (đúng domain)");
+  assert.deepEqual(by2.get("10.0.0.9"), ["x@other.test"], "other.test đã chuyển khỏi proxy độc quyền sang pool chung");
+  await fetch(`${baseUrl}/api/jobs/delete-batch`, { method: "POST", headers, body: JSON.stringify({ ids: staged.jobs.map((j) => j.id) }) });
+
   const forbiddenMailHeaderResponse = await fetch(`${baseUrl}/api/mail-request-config`, {
     method: "POST",
     headers,

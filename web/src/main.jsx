@@ -184,6 +184,8 @@ function App() {
   const [proxyExpanded, setProxyExpanded] = useState(() => new Set()); // proxy labels whose email list is expanded
   const [proxyBulkText, setProxyBulkText] = useState(""); // dán nhanh danh sách proxy để nhận diện HTTP/SOCKS5
   const [proxyFilter, setProxyFilter] = useState(null); // null=tất cả · "unused" · "inuse" · "used"
+  const [domainApplyBusy, setDomainApplyBusy] = useState(false);
+  const [domainApplyNotice, setDomainApplyNotice] = useState(""); // kết quả đổi proxy cho tài khoản cũ
   const [lang, setLang] = useState(readInitialLang);
   setActiveLang(lang);
 
@@ -204,7 +206,7 @@ function App() {
   // thị/thống kê trong "Danh sách proxy IP" (đếm, kiểm tra kết nối, round-robin).
   const combinedProxiesText = useMemo(() => {
     const parts = [normalizeProxyText(proxyLinkConfig.proxies || "")];
-    for (const g of proxyLinkConfig.domainProxies || []) if (g?.proxies) parts.push(normalizeProxyText(g.proxies));
+    for (const g of proxyLinkConfig.domainProxies || []) if (g?.proxies) parts.push(normalizeProxyText(g.proxies, g.protocol || "socks5h"));
     return parts.filter((p) => p.trim()).join("\n");
   }, [proxyLinkConfig.proxies, proxyLinkConfig.domainProxies]);
   // Map host -> domain (để gắn nhãn domain cho từng dòng proxy trong bảng).
@@ -215,6 +217,25 @@ function App() {
       for (const e of parseProxyPasteList(g.proxies)) map.set(e.host, g.domain);
     }
     return map;
+  }, [proxyLinkConfig.domainProxies]);
+  // Proxy đã gán riêng cho domain là ĐỘC QUYỀN → tự gỡ host đó khỏi pool chung
+  // để không còn dùng chung ("không dùng IP cũ nữa"). Guard tránh vòng lặp set.
+  useEffect(() => {
+    const domainHosts = new Set();
+    for (const g of proxyLinkConfig.domainProxies || []) {
+      if (!g?.proxies) continue;
+      for (const e of parseProxyPasteList(g.proxies)) domainHosts.add(e.host);
+    }
+    if (!domainHosts.size) return;
+    setProxyLinkConfig((c) => {
+      const lines = String(c.proxies || "").split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+      const kept = lines.filter((line) => {
+        const e = parseProxyPasteList(line)[0];
+        return !e || !domainHosts.has(e.host);
+      });
+      if (kept.length === lines.length) return c;
+      return { ...c, proxies: kept.join("\n") };
+    });
   }, [proxyLinkConfig.domainProxies]);
 
   async function loadMachineIp() {
@@ -356,7 +377,7 @@ function App() {
   }
   // ---- Proxy riêng theo domain: thêm/sửa/xoá các nhóm { domain, proxies } ----
   function addDomainProxyGroup() {
-    setProxyLinkConfig((c) => ({ ...c, domainProxies: [...(c.domainProxies || []), { domain: "", proxies: "" }] }));
+    setProxyLinkConfig((c) => ({ ...c, domainProxies: [...(c.domainProxies || []), { domain: "", protocol: "socks5h", proxies: "" }] }));
   }
   function updateDomainProxyGroup(index, field, value) {
     setProxyLinkConfig((c) => {
@@ -368,6 +389,32 @@ function App() {
   }
   function removeDomainProxyGroup(index) {
     setProxyLinkConfig((c) => ({ ...c, domainProxies: (c.domainProxies || []).filter((_, i) => i !== index) }));
+  }
+  // Áp dụng gán domain cho các tài khoản đã có: đổi proxy cho tài khoản đang dùng
+  // proxy nay đã thành độc quyền của domain khác. Chỉ đổi tài khoản không đang chạy.
+  async function applyDomainProxies() {
+    if (!token || domainApplyBusy) return;
+    setDomainApplyBusy(true);
+    setDomainApplyNotice("");
+    try {
+      const domainProxies = (proxyLinkConfig.domainProxies || [])
+        .map((g) => ({ domain: String(g?.domain || "").trim(), proxies: normalizeProxyText(g?.proxies || "", g?.protocol || "socks5h") }))
+        .filter((g) => g.domain && g.proxies.trim());
+      const data = await apiFetch(token, "/api/proxies/apply-domains", {
+        method: "POST",
+        body: JSON.stringify({
+          proxies: normalizeProxyText(proxyLinkConfig.proxies || ""),
+          domainProxies,
+          limitPerIp: Number(proxyLinkConfig.limitPerIp) || 15,
+        }),
+      });
+      setDomainApplyNotice(tf("已为 {0} 个账号更换代理（跳过运行中 {1} · 无可用代理 {2}）", data.reassigned || 0, data.skippedRunning || 0, data.noProxy || 0));
+      void fetchProxyStatus({ silent: true });
+    } catch (requestError) {
+      setDomainApplyNotice(requestError.message);
+    } finally {
+      setDomainApplyBusy(false);
+    }
   }
   // Khi popup "Danh sách proxy IP" đang mở: tự lấy trạng thái theo danh sách hiện tại
   // (mọi chế độ), và làm mới mỗi khi danh sách / giới hạn đổi.
@@ -947,7 +994,7 @@ function App() {
           proxyMode: "batch",
           proxies: normalizeProxyText(proxyLinkConfig.proxies),
           domainProxies: (proxyLinkConfig.domainProxies || [])
-            .map((g) => ({ domain: String(g?.domain || "").trim(), proxies: normalizeProxyText(g?.proxies || "") }))
+            .map((g) => ({ domain: String(g?.domain || "").trim(), proxies: normalizeProxyText(g?.proxies || "", g?.protocol || "socks5h") }))
             .filter((g) => g.domain && g.proxies.trim()),
           limitPerIp: Number(proxyLinkConfig.limitPerIp) || 15,
         }
@@ -2356,6 +2403,8 @@ function App() {
                   <div className="domain-proxy-groups">
                     {(proxyLinkConfig.domainProxies || []).map((group, index) => {
                       const ipCount = parseProxyPasteList(group?.proxies || "").length;
+                      const hasDomain = Boolean(String(group?.domain || "").trim());
+                      const assignedOk = hasDomain && ipCount > 0;
                       return (
                         <div key={index} className="domain-proxy-group">
                           <div className="domain-proxy-group-head">
@@ -2367,7 +2416,15 @@ function App() {
                               spellCheck="false"
                               onChange={(event) => updateDomainProxyGroup(index, "domain", event.target.value)}
                             />
-                            <span className="domain-proxy-count">{tf("{0} 个 IP", ipCount)}</span>
+                            <select
+                              className="domain-proxy-proto"
+                              value={group?.protocol || "socks5h"}
+                              title={t("协议")}
+                              onChange={(event) => updateDomainProxyGroup(index, "protocol", event.target.value)}
+                            >
+                              <option value="socks5h">SOCKS5</option>
+                              <option value="http">HTTP</option>
+                            </select>
                             <button type="button" className="icon-button" title={t("删除")} onClick={() => removeDomainProxyGroup(index)}>
                               <X size={16} />
                             </button>
@@ -2379,13 +2436,27 @@ function App() {
                             spellCheck="false"
                             onChange={(event) => updateDomainProxyGroup(index, "proxies", event.target.value)}
                           />
+                          <div className={`domain-proxy-status ${assignedOk ? "ok" : "warn"}`}>
+                            {assignedOk ? <Check size={14} /> : <CircleAlert size={14} />}
+                            {assignedOk
+                              ? tf("已绑定 {0} 个专用 IP 给 {1}（已从通用池移除）", ipCount, String(group.domain).trim())
+                              : (!hasDomain ? t("请填写域名") : t("请填写该域名的代理"))}
+                          </div>
                         </div>
                       );
                     })}
                   </div>
-                  <button type="button" className="secondary-button" onClick={addDomainProxyGroup}>
-                    <Plus size={15} />{t("添加域名代理")}
-                  </button>
+                  <div className="domain-proxy-actions">
+                    <button type="button" className="secondary-button" onClick={addDomainProxyGroup}>
+                      <Plus size={15} />{t("添加域名代理")}
+                    </button>
+                    <button type="button" className="secondary-button" onClick={applyDomainProxies} disabled={domainApplyBusy}>
+                      {domainApplyBusy ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}
+                      {t("为现有账号更换代理")}
+                    </button>
+                  </div>
+                  {domainApplyNotice ? <div className="domain-proxy-notice">{ts(domainApplyNotice)}</div> : null}
+                  <div className="domain-proxy-hint">{t("把某代理分配给域名后，它会自动从通用池移除；点“为现有账号更换代理”可把正用着该代理的其它域名账号改到合适代理（运行中的账号会跳过）。")}</div>
                 </div>
               </div>
             ) : (
@@ -4109,8 +4180,14 @@ function parseProxyPasteList(text) {
 
 // Chuẩn hoá 1 khối proxy (nhiều dòng, nhận cả host:port:user:pass lẫn scheme://…)
 // về dạng URL đầy đủ mỗi dòng, để backend (chỉ hiểu scheme://…) parse được.
-function normalizeProxyText(text) {
-  return parseProxyPasteList(text).map((e) => e.url).join("\n");
+// Dòng không ghi rõ giao thức (host:port:user:pass) dùng `defaultProtocol`
+// (mặc định socks5h); dòng đã có scheme thì giữ nguyên giao thức của nó.
+function normalizeProxyText(text, defaultProtocol) {
+  return parseProxyPasteList(text).map((e) => {
+    const protocol = defaultProtocol && e.ambiguous ? defaultProtocol : e.protocol;
+    const auth = e.user ? `${e.user}:${e.pass}@` : "";
+    return `${protocol}://${auth}${e.host}:${e.port}`;
+  }).join("\n");
 }
 
 function toProxyUrl(value, scheme) {

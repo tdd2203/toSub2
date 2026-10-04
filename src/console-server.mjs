@@ -691,6 +691,47 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
+  // Áp dụng việc gán proxy theo domain cho các TÀI KHOẢN ĐÃ CÓ: tài khoản nào
+  // đang dùng proxy nay đã thành độc quyền của MỘT domain khác (email không khớp
+  // domain đó) sẽ được đổi sang proxy phù hợp (proxy riêng của domain nó nếu có,
+  // không thì pool chung đã loại các host độc quyền). Chỉ đổi tài khoản KHÔNG
+  // đang chạy để không làm gián đoạn phiên đăng ký; tài khoản đang chạy được bỏ
+  // qua và báo lại số lượng.
+  if (req.method === "POST" && requestUrl.pathname === "/api/proxies/apply-domains") {
+    const body = await readJson(req);
+    const config = readProxyAllocConfig(body);
+    const limitPerIp = Math.min(999, Math.max(1, Math.trunc(Number(body.limitPerIp)) || 15));
+    // host -> domain mà nó được gán riêng.
+    const domainOfHost = new Map();
+    for (const group of config.groups) {
+      for (const item of dedupeProxyUrls(group.proxies)) domainOfHost.set(item.host, group.domain);
+    }
+    const allocator = makeProxyAllocator(config, limitPerIp);
+    let reassigned = 0;
+    let skippedRunning = 0;
+    let noProxy = 0;
+    const mismatched = [];
+    for (const job of listUniqueJobs()) {
+      if (job.deleted || !job.proxyUrl) continue;
+      const parsed = parseProxyUrlForSub2Api(job.proxyUrl);
+      if (!parsed) continue;
+      const boundDomain = domainOfHost.get(parsed.host);
+      if (!boundDomain) continue; // proxy hiện tại không bị gán độc quyền → giữ nguyên
+      const emailDomain = emailDomainPart(job.email);
+      if (emailDomain === boundDomain || emailDomain.endsWith(`.${boundDomain}`)) continue; // đúng domain
+      mismatched.push(job); // đang dùng proxy độc quyền của domain khác → cần đổi
+    }
+    for (const job of mismatched) {
+      if (occupiesActiveSlot(job)) { skippedRunning += 1; continue; }
+      const newProxy = allocator.next(job.email);
+      if (!newProxy) { noProxy += 1; continue; }
+      await withEmailJobLock(job.email, () => updateJobProxy(job, newProxy));
+      reassigned += 1;
+    }
+    sendJson(res, 200, { mismatched: mismatched.length, reassigned, skippedRunning, noProxy });
+    return;
+  }
+
   // "Quên IP này": ẩn 1 IP cũ (không còn trong cấu hình) khỏi danh sách. Không xoá job
   // (giữ record tài khoản), chỉ ẩn dòng. forget=false để hiện lại.
   if (req.method === "POST" && requestUrl.pathname === "/api/proxies/forget") {
