@@ -54,7 +54,7 @@ def request_headers(
     target_origin = f"{target.scheme}://{target.netloc}"
     headers = {str(k): str(v) for k, v in (supplied or {}).items()}
     headers.setdefault("user-agent", user_agent)
-    headers.setdefault("accept-language", str(identity.get("acceptLanguage") or "zh-CN,zh;q=0.9,en;q=0.8"))
+    headers.setdefault("accept-language", str(identity.get("acceptLanguage") or "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"))
     if identity.get("secChUa"):
         headers.setdefault("sec-ch-ua", str(identity["secChUa"]))
     if identity.get("secChUaMobile"):
@@ -188,8 +188,8 @@ def start_runtime(
         "html": "<!doctype html><html><head></head><body></body></html>",
         "userAgent": user_agent,
         "platform": identity.get("platform") or "MacIntel",
-        "language": identity.get("locale") or "zh-CN",
-        "languages": identity.get("languages") or ["zh-CN", "zh"],
+        "language": identity.get("locale") or "vi-VN",
+        "languages": identity.get("languages") or ["vi-VN", "vi", "en"],
         "cookies": cookies or {},
         "debug": debug,
         "screenWidth": screen_width,

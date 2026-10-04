@@ -31,6 +31,12 @@ body {
 
 button, input { font: inherit; }
 button { letter-spacing: 0; }
+/* Click & hover feedback — every button eases its state change and visibly
+   "presses" on click (sinks + darkens + inset shadow) so a tap is obviously
+   registered. Per-component rules below still override colors as needed. */
+button { transition: background .15s ease, color .15s ease, border-color .15s ease, box-shadow .12s ease, filter .1s ease, transform .07s ease; }
+button:not(:disabled):active { transform: translateY(1px) scale(.98); filter: brightness(.92); box-shadow: inset 0 2px 5px rgba(0, 0, 0, .14); }
+button:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
 
 .app-shell { min-height: 100vh; }
 
@@ -88,6 +94,7 @@ button { letter-spacing: 0; }
 .lang-switch button:hover { color: var(--ink); }
 .lang-switch button.active { background: var(--green); color: #fff; }
 .status-dot { width: 7px; height: 7px; border-radius: 50%; background: #a5adaa; }
+.status-dot.idle { background: #8b8f9c; box-shadow: 0 0 0 3px #ececf1; }
 .status-dot.active { background: #d4942e; box-shadow: 0 0 0 3px #fff0d4; }
 .status-dot.queued { background: #5e8fbe; box-shadow: 0 0 0 3px #e4eef8; }
 .status-dot.complete { background: #23906f; box-shadow: 0 0 0 3px #dcf4eb; }
@@ -411,8 +418,8 @@ th {
   letter-spacing: 0;
 }
 th:nth-child(1) { width: 4%; }
-th:nth-child(2) { width: 17%; }
-th:nth-child(3) { width: 9%; }
+th:nth-child(2) { width: 14%; } /* account: narrower now that badges moved to the status column */
+th:nth-child(3) { width: 12%; } /* status: wide enough for long localized badges (e.g. VI) without overflow */
 th:nth-child(4) { width: 23%; }
 th:nth-child(5) { width: 8%; }
 th:nth-child(6) { width: 11%; }
@@ -443,10 +450,9 @@ tbody tr:last-child td { border-bottom: 0; }
 .account-cell .account-badges {
   margin-left: auto;
   display: flex;
-  flex-wrap: wrap;
+  flex-direction: column;
   gap: 4px;
-  justify-content: flex-end;
-  align-items: center;
+  align-items: flex-end;
   flex: 0 1 auto;
   min-width: 0;
 }
@@ -488,6 +494,7 @@ tbody tr:last-child td { border-bottom: 0; }
   white-space: nowrap;
 }
 .status-badge.email_otp, .status-badge.password, .status-badge.mfa_otp, .status-badge.totp_setup_otp, .status-badge.phone, .status-badge.phone_otp { color: var(--amber); background: var(--amber-soft); }
+.status-badge.idle { color: #5b606c; background: #eceef2; }
 .status-badge.queued { color: var(--blue); background: var(--blue-soft); }
 .status-badge.completed { color: var(--green-strong); background: var(--green-soft); }
 .status-badge.failed { color: var(--danger); background: var(--danger-soft); }
@@ -498,9 +505,38 @@ tbody tr:last-child td { border-bottom: 0; }
 .status-badge.totp_starting { color: var(--blue); background: var(--blue-soft); }
 .status-badge.password_add_starting { color: var(--blue); background: var(--blue-soft); }
 
+/* Status column: status badge on top, then login-method + "uploaded to Sub2API",
+   stacked vertically so each label is clearly readable. */
+.status-cell { display: inline-flex; flex-direction: column; align-items: flex-start; gap: 5px; }
+.status-cell .mail-mode {
+  min-height: 22px;
+  padding: 3px 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--green-strong);
+  background: var(--green-soft);
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.status-cell .mail-mode.error { color: var(--danger); background: var(--danger-soft); }
+.status-cell .mail-mode.password-mode { color: var(--blue); background: var(--blue-soft); }
+.status-cell .mail-mode.unknown-mode { color: var(--amber); background: var(--amber-soft); }
+.status-cell .mail-mode.sub2api-uploaded { color: var(--indigo); background: var(--indigo-soft); }
+
 .step-cell { padding-top: 10px; padding-bottom: 10px; }
 .prompt-line { color: #44504c; font-size: 12px; }
 .row-error { margin-top: 5px; color: var(--danger); font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; }
+.proxy-error-banner { margin-top: 6px; display: flex; align-items: center; gap: 6px; padding: 6px 8px; border-radius: 8px; background: color-mix(in srgb, var(--danger) 12%, transparent); color: var(--danger); font-size: 11.5px; font-weight: 600; line-height: 1.4; overflow-wrap: anywhere; }
+.proxy-error-banner svg { flex: 0 0 auto; }
+.proxy-pool-list { margin-top: 12px; display: flex; flex-direction: column; gap: 6px; max-height: 320px; overflow-y: auto; }
+.proxy-pool-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; }
+.proxy-pool-meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.proxy-pool-meta strong { font-size: 13px; overflow-wrap: anywhere; }
+.proxy-pool-meta span { font-size: 11px; color: var(--muted); text-transform: uppercase; }
+.proxy-pool-empty { margin-top: 12px; padding: 16px; text-align: center; color: var(--muted); font-size: 12px; border: 1px dashed var(--line); border-radius: 8px; }
 .mail-error { margin-top: 5px; color: var(--amber); font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; }
 .phone-target { margin-top: 6px; display: flex; align-items: center; gap: 4px; color: #4f5e58; font-size: 11px; }
 .phone-target strong { color: var(--ink); font-variant-numeric: tabular-nums; }
@@ -538,6 +574,11 @@ tbody tr:last-child td { border-bottom: 0; }
   font-variant-numeric: tabular-nums;
 }
 .inline-entry { margin-top: 8px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+/* Hàng SMS: khoá trên một dòng, ô nhập co lại để nút gửi lại/đổi số không bao giờ bị đẩy xuống dưới. */
+.otp-inline { flex-wrap: nowrap; }
+.otp-inline .text-action { flex: 0 0 auto; padding: 0 4px; white-space: nowrap; }
+.otp-inline .icon-button.submit { flex: 0 0 auto; }
+.resend-counter { flex: 0 0 auto; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .compact-input {
   width: 178px;
   height: 32px;
@@ -625,6 +666,23 @@ tbody tr:last-child td { border-bottom: 0; }
   cursor: pointer;
 }
 .retry-button:hover { background: #923630; border-color: #923630; }
+.start-button {
+  height: 32px;
+  padding: 0 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #fff;
+  background: var(--green);
+  border: 1px solid var(--green);
+  border-radius: 5px;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.start-button:hover:not(:disabled) { background: var(--green-strong); border-color: var(--green-strong); }
+.start-button:disabled { opacity: 0.5; cursor: not-allowed; }
 .regenerate-button {
   height: 32px;
   padding: 0 9px;
@@ -764,6 +822,161 @@ tbody tr:last-child td { border-bottom: 0; }
 .sms-settings-dialog { width: min(620px, 100%); }
 .mail-request-settings-dialog { width: min(620px, 100%); }
 .sub2api-settings-dialog { width: min(620px, 100%); }
+
+/* ---- Proxy IP list dialog ---- */
+.proxy-list-dialog { width: min(960px, 100%); }
+.proxy-stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin-top: 16px;
+}
+.proxy-stat {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 13px 16px;
+  background: linear-gradient(180deg, #fafcfb, #f3f7f5);
+}
+.proxy-stat .num { font-size: 26px; font-weight: 700; line-height: 1.1; color: var(--ink); font-variant-numeric: tabular-nums; }
+.proxy-stat .num.ok { color: var(--green); }
+.proxy-stat .num.warn { color: var(--danger); }
+.proxy-stat .lbl { margin-top: 4px; font-size: 12px; color: var(--muted); }
+
+.proxy-bulk {
+  margin-top: 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 14px;
+  background: #fbfdfc;
+}
+.proxy-bulk-head { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; margin-bottom: 10px; color: var(--ink); }
+.proxy-bulk textarea {
+  width: 100%;
+  min-height: 92px;
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 12.5px;
+  line-height: 1.55;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 10px 12px;
+  resize: vertical;
+  background: #fff;
+}
+.proxy-bulk textarea:focus { outline: none; border-color: var(--green); box-shadow: 0 0 0 3px rgba(18, 113, 91, .1); }
+.proxy-bulk-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
+.proxy-bulk-hint { font-size: 12px; color: var(--muted); margin-right: auto; }
+
+.proxy-table {
+  margin-top: 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.proxy-thead,
+.proxy-row-main {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr) 150px 116px 116px 40px;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+}
+.proxy-filters { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.proxy-chip {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 5px 13px; border-radius: 999px; font-size: 12.5px; cursor: pointer;
+  border: 1px solid var(--line); background: transparent; color: var(--ink);
+}
+.proxy-chip:hover { border-color: #c2ccc8; }
+.proxy-chip.active { border-color: var(--green); background: var(--green); color: #fff; }
+.proxy-chip .cnt { font-variant-numeric: tabular-nums; opacity: .7; }
+.proxy-chip.active .cnt { opacity: .85; }
+.proxy-old {
+  display: inline-block; margin-left: 8px; font-size: 10.5px; font-weight: 600;
+  padding: 1px 7px; border-radius: 999px; background: #eef1f0; color: var(--muted);
+  vertical-align: middle;
+}
+.proxy-del {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px; border-radius: 8px; border: 1px solid transparent;
+  background: none; color: var(--muted); cursor: pointer;
+}
+.proxy-del:hover { background: var(--danger-soft); color: var(--danger); border-color: #f2c9c9; }
+.proxy-del:disabled { opacity: .3; cursor: default; background: none; border-color: transparent; color: var(--muted); }
+.proxy-thead {
+  background: #f4f7f6;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.proxy-scroll { max-height: 50vh; overflow-y: auto; }
+.proxy-row { border-top: 1px solid #eef2f0; }
+.proxy-row:hover { background: #f8faf9; }
+.proxy-row-main { font-size: 13.5px; }
+.proxy-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 999px;
+  white-space: nowrap;
+  width: max-content;
+}
+.proxy-pill.socks { background: rgba(124, 58, 237, .12); color: #7c3aed; }
+.proxy-pill.http { background: var(--blue-soft); color: var(--blue); }
+.proxy-pill.ok { background: var(--green-soft); color: var(--green); }
+.proxy-pill.down { background: var(--danger-soft); color: var(--danger); }
+.proxy-ipcell { min-width: 0; }
+.proxy-ipcell .addr { font-family: ui-monospace, Menlo, monospace; font-size: 13px; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.proxy-ipcell .exit { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+.proxy-remain { font-size: 13px; font-variant-numeric: tabular-nums; color: var(--ink); }
+.proxy-remain small { color: var(--muted); font-weight: 400; }
+.proxy-emailbtn {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12.5px; color: var(--green); font-weight: 600;
+  background: none; border: none; cursor: pointer; padding: 4px 0; width: max-content;
+}
+.proxy-emailbtn:disabled { color: var(--muted); cursor: default; opacity: .8; }
+.proxy-emails {
+  padding: 4px 16px 16px;
+  background: #f7faf9;
+  border-top: 1px dashed #e1e8e5;
+}
+.proxy-emails-head {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--muted); padding: 11px 2px 9px;
+}
+.proxy-emails-copy {
+  margin-left: auto; display: inline-flex; align-items: center; gap: 5px;
+  font-size: 11.5px; font-weight: 600; text-transform: none; letter-spacing: 0;
+  color: var(--green); background: none; border: none; cursor: pointer; padding: 2px 4px;
+}
+.proxy-emails-copy:hover { text-decoration: underline; }
+.proxy-emails-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(236px, 1fr));
+  gap: 6px;
+}
+.proxy-emails-grid .item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 10px; border-radius: 8px;
+  background: #fff; border: 1px solid var(--line);
+  font-size: 12.5px; font-family: ui-monospace, Menlo, monospace; color: var(--ink);
+  min-width: 0;
+}
+.proxy-emails-grid .item .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); flex: 0 0 auto; }
+.proxy-emails-grid .item span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.proxy-empty { padding: 44px 20px; text-align: center; color: var(--muted); font-size: 13px; }
+@media (max-width: 720px) {
+  .proxy-stats { grid-template-columns: 1fr; }
+  .proxy-thead { display: none; }
+  .proxy-row-main { grid-template-columns: 1fr 1fr; gap: 8px; }
+}
+
 .sub2api-config-grid { margin-top: 18px; }
 .mail-request-config-grid { margin-top: 18px; }
 .provider-tabs {
@@ -1057,6 +1270,83 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .price-refresh-button:hover:not(:disabled) { background: #e9f2ee; }
 .price-refresh-button:disabled { cursor: not-allowed; opacity: .55; }
+
+/* SMSCode pickers stack several controls, so their wrapper drops the single-input box of .settings-field > div. */
+.settings-field > .smscode-field {
+  height: auto;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+  align-items: stretch;
+  background: transparent;
+  border: 0;
+}
+.settings-field > .smscode-field:focus-within { box-shadow: none; }
+.smscode-query-row { min-width: 0; display: flex; align-items: center; gap: 10px; }
+.smscode-query-info {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.price-select-box select:disabled { color: #7f8a85; }
+.search-picker { position: relative; min-width: 0; }
+.search-picker-toggle { width: 100%; font: inherit; text-align: left; cursor: pointer; }
+.search-picker-toggle:disabled { cursor: not-allowed; }
+.search-picker-toggle > svg { flex: 0 0 auto; }
+.search-picker-value {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.search-picker-value.placeholder { color: #7f8a85; }
+/* Floats over the fields below: an in-flow panel would resize the centered dialog and move whatever is clicked next. */
+.search-picker-panel {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 5;
+  overflow: hidden;
+  background: #fff;
+  border: 1px solid #cdd5d1;
+  border-radius: 7px;
+  box-shadow: 0 10px 28px rgba(19, 30, 26, .16);
+}
+.search-picker-search {
+  padding: 8px 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #7c8682;
+  border-bottom: 1px solid #eef1ef;
+}
+.search-picker-list { max-height: 192px; overflow-y: auto; overscroll-behavior: contain; }
+.search-picker-list button {
+  width: 100%;
+  padding: 8px 12px;
+  display: block;
+  color: var(--ink);
+  background: transparent;
+  border: 0;
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 400;
+  text-align: left;
+  cursor: pointer;
+}
+.search-picker-list button:hover { background: #f3f7f5; }
+.search-picker-list button.active { color: var(--green-strong); background: var(--green-soft); font-weight: 700; }
+.search-picker-note { padding: 10px 12px; color: var(--muted); font-size: 12px; font-weight: 400; }
 .dialog-error { margin-top: 10px; display: flex; align-items: flex-start; gap: 6px; color: var(--danger); font-size: 12px; line-height: 1.45; }
 .dialog-error svg { flex: 0 0 auto; margin-top: 1px; }
 .dialog-footer {
@@ -1103,6 +1393,8 @@ tbody tr:last-child td { border-bottom: 0; }
   .wide-settings-field { grid-column: auto; }
   .settings-field > .price-select-row { flex-direction: column; }
   .price-refresh-button { width: 100%; }
+  .smscode-query-row { flex-direction: column; align-items: stretch; gap: 6px; }
+  .smscode-query-info { white-space: normal; }
   .provider-tabs { overflow-x: auto; }
   .empty-state { width: calc(100vw - 34px); }
 }

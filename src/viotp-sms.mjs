@@ -56,14 +56,14 @@ export function createViOtpClient(options = {}) {
 
   return {
     async getBalance() {
-      const data = await request("/api/balance");
+      const data = await request("/users/balance");
       return typeof data === "number" ? data : Number(data?.balance ?? data ?? 0);
     },
 
     async listServices(country) {
       const params = {};
       if (country) params.country = country;
-      const data = await request("/api/service/getv2", params);
+      const data = await request("/service/getv2", params);
       if (!Array.isArray(data)) return [];
       return data.map((s) => ({
         id: s.id,
@@ -73,17 +73,17 @@ export function createViOtpClient(options = {}) {
     },
 
     async listNetworks() {
-      const data = await request("/api/network/getv2");
+      const data = await request("/networks/get");
       if (!Array.isArray(data)) return [];
       return data.map((n) => ({ id: n.id, name: String(n.name || "") }));
     },
 
     async getNumber(serviceId, opts = {}) {
-      const params = { service_id: serviceId };
+      const params = { serviceId };
       if (opts.network) params.network = opts.network;
       if (opts.country) params.country = opts.country;
       if (opts.number) params.number = opts.number;
-      const data = await request("/api/request/getv2", params);
+      const data = await request("/request/getv2", params);
       if (!data?.phone_number || !data?.request_id) {
         throw new ViOtpError("获取手机号失败：ViOTP 未返回号码", { terminal: false });
       }
@@ -97,7 +97,7 @@ export function createViOtpClient(options = {}) {
     },
 
     async getSms(requestId) {
-      const data = await request("/api/session/getv2", { id: requestId });
+      const data = await request("/session/getv2", { requestId });
       const status = Number(data?.Status ?? data?.status ?? 0);
       if (status === 1) {
         const code = extractViOtpCode(data);
@@ -134,7 +134,7 @@ function extractViOtpCode(data) {
   const code = String(data?.Code || data?.code || "").trim();
   if (/^\d{4,8}$/.test(code)) return code;
   const content = String(data?.SmsContent || data?.sms_content || "");
-  const match = /(?:^|\D)(\d{6})(?!\d)/.exec(content);
+  const match = /(?:^|\D)(\d{4,8})(?!\d)/.exec(content);
   return match?.[1] || code || null;
 }
 

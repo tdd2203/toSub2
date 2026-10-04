@@ -203,8 +203,8 @@ try {
       assert.match(Buffer.from(message.challengeBody, "base64").toString("utf8"), /_cf_chl_opt/);
       assert.match(message.userAgent, /Chrome\/146/);
       assert.equal(message.browserIdentity.platform, "MacIntel");
-      assert.equal(message.browserIdentity.locale, "zh-CN");
-      assert.equal(message.browserIdentity.languages[0], "zh-CN");
+      assert.equal(message.browserIdentity.locale, "vi-VN");
+      assert.equal(message.browserIdentity.languages[0], "vi-VN");
       return { ok: true, status: 200, clearance: true };
     }
     solvedChallengeRequests += 1;
@@ -556,7 +556,8 @@ bounded = module.Worker().probe_profiles(
 assert bounded == {"profile": "chrome142", "attempts": 4}, bounded
 assert FakeRequests.attempts == ["chrome146", "chrome142", "chrome141", "chrome140"]
 profiles = worker._supported_chrome_profiles()
-assert profiles[0] == "chrome146", profiles
+assert profiles[0] == "chrome150", profiles
+assert "chrome146" in profiles
 assert "chrome142" in profiles
 assert "chrome131_android" not in profiles
 assert "chrome" not in profiles
@@ -659,7 +660,7 @@ async function testDynamicSentinelTransportMessage() {
     assert.equal(message.pageUrl, "https://auth.openai.com/about-you");
     assert.match(message.userAgent, /Chrome\/145\.0\.0\.0/);
     assert.equal(message.browserIdentity.platform, "MacIntel");
-    assert.equal(message.browserIdentity.languages[0], "zh-CN");
+    assert.equal(message.browserIdentity.languages[0], "vi-VN");
     return { token: '{"c":"dynamic-token"}', soToken: '{"so":true}' };
   };
   const tokens = await sentinelTransport.generateSentinelTokens({

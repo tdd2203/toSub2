@@ -2,6 +2,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import http from "node:http";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { spawn, execFileSync } from "node:child_process";
@@ -28,6 +29,15 @@ const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 4399;
 const MAX_ACTIVE_JOBS = 20;
 const DEFAULT_TLS_PROFILE = "chrome146";
+// Per-account curl_cffi profile: existing ("old") accounts keep chrome146, while
+// newly created accounts are stamped with the new-account profile — chrome150 by
+// default, still overridable through the env knobs the chrome150 trial used. The
+// profile is resolved once at creation and persisted per job (see resolveJobTlsProfile),
+// so a job never changes fingerprint across reruns or server restarts.
+const NEW_ACCOUNT_TLS_PROFILE = normalizeTlsProfile(
+  process.env.TOSUB2_NEW_ACCOUNT_TLS_PROFILE || process.env.TOSUB2_TLS_PROFILE,
+  "chrome150",
+);
 const MAX_BATCH_JOBS = 500;
 const MAX_PROXY_RISK_RETRIES = 10;
 const MAX_PROXY_CONNECTION_FAILURES = 20;
@@ -48,6 +58,16 @@ const SUB2API_MONITOR_INTERVAL_MS = readDurationEnv("SUB2API_MONITOR_INTERVAL_MS
 const SUB2API_AUTO_REPAIR_COOLDOWN_MS = readDurationEnv("SUB2API_AUTO_REPAIR_COOLDOWN_MS", 5 * 60_000, 0);
 const MAIL_POLL_INTERVAL_MS = 2_500;
 const MAIL_POLL_TIMEOUT_MS = 10 * 60_000;
+// The first email code is sometimes never delivered (e.g. the mailbox was created
+// seconds before it was requested), so ask for a new one when none shows up.
+const MAIL_AUTO_RESEND_AFTER_MS = Number(process.env.MAIL_AUTO_RESEND_AFTER_MS) || 45_000;
+const MAIL_AUTO_RESEND_MAX = 2;
+// When an IP signs up a second account a few minutes after the first, the service accepts the
+// request but never sends the verification email. A queued registration therefore waits until
+// other accounts have left its proxy IP quiet for this long (overridden by the proxy dialog).
+const PROXY_SIGNUP_COOLDOWN_MS = readDurationEnv("PROXY_SIGNUP_COOLDOWN_MS", 10 * 60_000, 0);
+const MAX_PROXY_SIGNUP_COOLDOWN_MINUTES = 240;
+const PROXY_LINK_SETTING_DB_KEY = "ui:chatgpt-onboarding.proxy-link-config-v1";
 const MAX_MAIL_REQUEST_BODY_BYTES = 64 * 1024;
 const MAX_MAIL_REQUEST_HEADERS = 64;
 const FORBIDDEN_MAIL_REQUEST_HEADERS = new Set([
@@ -87,6 +107,7 @@ let outputSyncPromise = null;
 let lastOutputSyncAt = 0;
 let shuttingDown = false;
 let queueSchedulingPaused = false;
+let proxyCooldownWakeTimer = null;
 let shutdownPromise = null;
 let sub2ApiMonitorConfig = null;
 let sub2ApiMonitorTimer = null;
@@ -185,6 +206,11 @@ async function fetchMachinePublicIp() {
 async function checkProxyExitIp(proxyUrl) {
   const url = String(proxyUrl || "").trim();
   if (!url) return { ok: false, error: "缺少代理地址" };
+  // Test seam: a host -> exit IP map replaces the live probe (smoke tests have no real proxy).
+  if (process.env.PROXY_EXIT_IP_TEST_MAP) {
+    const ip = JSON.parse(process.env.PROXY_EXIT_IP_TEST_MAP)[parseProxyUrlForSub2Api(url)?.host];
+    return ip ? { ok: true, ip } : { ok: false, error: "no test exit IP" };
+  }
   let transport = null;
   try {
     transport = new TlsFingerprintTransport({ cloudflareSolver: false });
@@ -245,6 +271,26 @@ const directTlsProfileProbe = new DirectTlsProfileProbe({
   explicitProfile: process.env.TOSUB2_TLS_PROFILE,
   validationUrl: `${String(process.env.CHATGPT_BASE || "https://chatgpt.com").replace(/\/$/, "")}/`,
 });
+
+// Accept only a real curl_cffi profile name (chromeNNN / chromeNNNx) or "auto";
+// anything else (unset, blank, typo) falls back so a job never launches with a
+// bogus fingerprint.
+function normalizeTlsProfile(value, fallback = DEFAULT_TLS_PROFILE) {
+  const normalized = String(value || "").trim();
+  return /^chrome\d+[a-z]?$/i.test(normalized) || normalized === "auto" ? normalized : fallback;
+}
+
+// The fingerprint a job actually launches with. A stamped job (new account) uses
+// its stored profile; an unstamped job (old account restored without one) stays on
+// chrome146. This — not the global TOSUB2_TLS_PROFILE env — is authoritative at launch.
+function resolveJobTlsProfile(job) {
+  return normalizeTlsProfile(job?.tlsProfile, DEFAULT_TLS_PROFILE);
+}
+
+// Restore a job's profile from its job-meta.json. Missing field = old account = chrome146.
+function restoredTlsProfile(metadata = {}) {
+  return normalizeTlsProfile(metadata.tls_profile, DEFAULT_TLS_PROFILE);
+}
 const sub2ApiMonitorState = {
   running: false,
   lastCheckAt: null,
@@ -422,7 +468,8 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/query") {
     const body = await readJson(req);
     const requestedPage = Math.max(1, Number.parseInt(body.page || "1", 10) || 1);
-    const search = typeof body.search === "string" ? body.search.slice(0, 200) : "";
+    // Large enough for a bulk paste (a whole copied account table) — sendJobsPage extracts the emails.
+    const search = typeof body.search === "string" ? body.search.slice(0, 200_000) : "";
     // emails is the (optional) bulk list filter; search is the optional quick substring.
     const emails = Array.isArray(body.emails) && body.emails.length ? normalizeEmailFilter(body.emails) : null;
     await sendJobsPage(res, requestedPage, emails, search);
@@ -513,6 +560,10 @@ async function handleApi(req, res, requestUrl) {
       const one = normalizeProxyUrl(body.proxies);
       if (one) urls = [one];
     }
+    // A domain proxy whose exit IP equals a raw-IP proxy already stored on jobs is
+    // the same line: overwrite those records with the domain before counting usage.
+    const forceCheck = body.refresh === true;
+    const probedHosts = await overwriteRawIpProxiesWithDomains(urls, { force: forceCheck });
     // Group existing jobs by their proxy's IP (host). Keep a representative URL so
     // even an IP that is no longer in the configured list can still be health-checked.
     const jobsByHost = new Map(); // host -> { url, emails: [{email,status,registered}] }
@@ -545,11 +596,11 @@ async function handleApi(req, res, requestUrl) {
     // A live exit-IP probe is slow, so cache it per host — this lets the client
     // poll frequently for real-time registration counts without re-checking the
     // network every time. The manual refresh button forces a fresh probe.
-    const forceCheck = body.refresh === true;
     const proxies = await mapWithConcurrency(targets, 6, async (target) => {
       const parsed = parseProxyUrlForSub2Api(target.url);
       const emails = jobsByHost.get(target.host)?.emails || [];
-      const check = await checkProxyExitIpCached(target.url, target.host, { force: forceCheck });
+      // Domain hosts were just probed by the overwrite step above — reuse that result.
+      const check = await checkProxyExitIpCached(target.url, target.host, { force: forceCheck && !probedHosts.has(target.host) });
       const emailCount = emails.length;
       // "đăng ký thành công" = đã qua email OTP và tới bước SMS. Một slot bị chiếm
       // bởi tài khoản đã đăng ký (chưa vô hiệu hoá) HOẶC đang chạy; job chờ khởi
@@ -1255,6 +1306,23 @@ async function handleApi(req, res, requestUrl) {
     }
   }
 
+  // Console UI settings (proxy list, SMS / mail / Sub2API config, language) — kept
+  // in the database so they follow the server instead of one browser's localStorage.
+  if (requestUrl.pathname === "/api/settings") {
+    if (req.method === "GET") {
+      sendJson(res, 200, { settings: readUiSettings() });
+      return;
+    }
+    if (req.method === "PUT") {
+      const body = await readJson(req);
+      writeUiSettings(body.settings);
+      // A shorter proxy cool-down may release registrations that are waiting in the queue.
+      scheduleQueuedJobs();
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+  }
+
   if (req.method === "GET" && requestUrl.pathname === "/api/sms-providers/smsbower/catalog") {
     const serviceId = /^\d{1,6}$/.test(requestUrl.searchParams.get("serviceId") || "")
       ? requestUrl.searchParams.get("serviceId")
@@ -1274,6 +1342,7 @@ async function handleApi(req, res, requestUrl) {
         lubanApiBase: process.env.LUBAN_SMS_API_BASE,
         smsBowerApiBase: process.env.SMSBOWER_API_BASE,
         viOtpApiBase: process.env.VIOTP_API_BASE,
+        smsCodeApiBase: process.env.SMSCODE_API_BASE,
       });
       if (!smsClient.listNumberOptions) throw httpError(400, "该接码平台不支持价格查询");
       const options = await smsClient.listNumberOptions();
@@ -1382,17 +1451,37 @@ async function sendJobsPage(res, requestedPage, emailFilter = null, search = "")
   let visibleJobs = emailSet
     ? allJobs.filter((job) => emailSet.has(job.email.toLowerCase()))
     : allJobs;
-  // Quick email search (substring, across every page), combinable with the list filter.
-  if (term) visibleJobs = visibleJobs.filter((job) => job.email.toLowerCase().includes(term));
+  // Bulk search: text holding several emails (e.g. a pasted account table) matches exactly those
+  // emails and is returned on one page so the whole pasted list is visible at once.
+  const searchEmails = extractSearchEmails(term);
+  const bulkSearch = searchEmails.length > 1;
+  let missing = [];
+  if (bulkSearch) {
+    const wanted = new Set(searchEmails);
+    visibleJobs = visibleJobs.filter((job) => wanted.has(job.email.toLowerCase()));
+    const found = new Set(visibleJobs.map((job) => job.email.toLowerCase()));
+    missing = searchEmails.filter((email) => !found.has(email));
+  } else if (term) {
+    // Quick email search (substring, across every page), combinable with the list filter.
+    visibleJobs = visibleJobs.filter((job) => job.email.toLowerCase().includes(term));
+  }
   const total = visibleJobs.length;
-  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const pageSize = bulkSearch ? Math.max(PAGE_SIZE, total) : PAGE_SIZE;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const page = Math.min(requestedPage, totalPages);
-  const start = (page - 1) * PAGE_SIZE;
+  const start = (page - 1) * pageSize;
   sendJson(res, 200, {
-    jobs: visibleJobs.slice(start, start + PAGE_SIZE).map(publicJob),
+    jobs: visibleJobs.slice(start, start + pageSize).map(publicJob),
     selection: visibleJobs.map(publicSelectionJob),
-    pagination: { page, pageSize: PAGE_SIZE, total, totalPages, totalAll: allJobs.length },
-    filter: { active: Boolean(emailSet) || Boolean(term), requested: emailFilter?.length || 0, matched: total, search: term || null },
+    pagination: { page, pageSize, total, totalPages, totalAll: allJobs.length },
+    filter: {
+      active: Boolean(emailSet) || Boolean(term),
+      requested: emailFilter?.length || 0,
+      matched: total,
+      search: bulkSearch ? null : term || null,
+      searchEmails: bulkSearch ? searchEmails.length : 0,
+      missing,
+    },
     stats: {
       active: allJobs.filter(occupiesActiveSlot).length,
       queued: allJobs.filter((job) => job.status === "queued").length,
@@ -1400,6 +1489,12 @@ async function sendJobsPage(res, requestedPage, emailFilter = null, search = "")
       idle: allJobs.filter((job) => job.status === "idle").length,
     },
   });
+}
+
+// Pulls every distinct email out of free-form search text (lower-cased, capped at MAX_BATCH_JOBS).
+function extractSearchEmails(text) {
+  const matches = String(text || "").toLowerCase().match(/[a-z0-9._%+-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+/g) || [];
+  return [...new Set(matches)].slice(0, MAX_BATCH_JOBS);
 }
 
 function normalizeEmailFilter(value) {
@@ -1472,6 +1567,7 @@ async function startJob(email, credentials = {}, proxyUrl = null, options = {}) 
     queuedMode: "full",
     queuedAt: new Date().toISOString(),
     queuedStartPrompt: "正在建立登录会话",
+    tlsProfile: NEW_ACCOUNT_TLS_PROFILE,
     directTlsFallbackAttempted: false,
     fallbackInProgress: false,
     totpSetupSecret: null,
@@ -1530,8 +1626,25 @@ function scheduleQueuedJobs() {
   const queuedJobs = [...jobs.values()]
     .filter((job) => job.status === "queued")
     .sort((a, b) => String(a.queuedAt || a.createdAt).localeCompare(String(b.queuedAt || b.createdAt)));
-  for (const job of queuedJobs.slice(0, availableSlots)) {
+  const cooldownMs = proxySignupCooldownMs();
+  const signupActivity = cooldownMs > 0 ? proxySignupActivityByHost() : null;
+  let nextCooldownEndsAt = Infinity;
+  for (const job of queuedJobs) {
     const mode = job.queuedMode || "full";
+    const cooldownHost = signupActivity ? signupCooldownHost(job, mode) : null;
+    if (cooldownHost) {
+      const recent = signupActivity.get(cooldownHost) || [];
+      const readyAt = (recent.find((entry) => entry.id !== job.id)?.at || 0) + cooldownMs;
+      if (readyAt > Date.now()) {
+        // Stays queued without taking a slot, so jobs on other IPs behind it still start.
+        job.proxyCooldownUntil = readyAt;
+        nextCooldownEndsAt = Math.min(nextCooldownEndsAt, readyAt);
+        continue;
+      }
+      job.signupLaunchedAt = Date.now();
+      signupActivity.set(cooldownHost, [{ id: job.id, at: job.signupLaunchedAt }, ...recent].slice(0, 2));
+    }
+    job.proxyCooldownUntil = null;
     const queueRunId = crypto.randomUUID();
     job.queueRunId = queueRunId;
     job.status = mode === "refresh"
@@ -1555,6 +1668,52 @@ function scheduleQueuedJobs() {
     availableSlots -= 1;
     if (availableSlots <= 0) break;
   }
+  if (nextCooldownEndsAt !== Infinity) scheduleProxyCooldownWake(nextCooldownEndsAt);
+}
+
+function proxySignupCooldownMs() {
+  try {
+    const minutes = JSON.parse(settingsDao.get(PROXY_LINK_SETTING_DB_KEY) || "null")?.cooldownMinutes;
+    if (minutes !== undefined && minutes !== null && minutes !== "") {
+      const value = Number(minutes);
+      if (Number.isFinite(value) && value >= 0) return Math.min(value, MAX_PROXY_SIGNUP_COOLDOWN_MINUTES) * 60_000;
+    }
+  } catch {}
+  return PROXY_SIGNUP_COOLDOWN_MS;
+}
+
+// The cool-down only concerns a brand-new registration; a rotating proxy exits through another IP each time.
+function signupCooldownHost(job, mode) {
+  if (mode !== "full" || job.registrationSucceeded) return null;
+  return fixedProxyHost(job.proxyUrl);
+}
+
+function fixedProxyHost(proxyUrl) {
+  if (!proxyUrl || proxySupportsSessionRotation(proxyUrl)) return null;
+  return parseProxyUrlForSub2Api(proxyUrl)?.host || null;
+}
+
+// Per proxy host: the two jobs that most recently sent signup traffic through it, newest first.
+// Two are kept so that a job retrying on its own IP is only held back by another account.
+function proxySignupActivityByHost() {
+  const byHost = new Map();
+  for (const job of jobs.values()) {
+    const at = Math.max(job.signupLaunchedAt || 0, job.mailOtpRequestedAt || 0, Date.parse(job.registeredAt || "") || 0);
+    const host = at ? fixedProxyHost(job.proxyUrl) : null;
+    if (!host) continue;
+    const recent = [...(byHost.get(host) || []), { id: job.id, at }].sort((a, b) => b.at - a.at);
+    byHost.set(host, recent.slice(0, 2));
+  }
+  return byHost;
+}
+
+function scheduleProxyCooldownWake(at) {
+  if (proxyCooldownWakeTimer) clearTimeout(proxyCooldownWakeTimer);
+  proxyCooldownWakeTimer = setTimeout(() => {
+    proxyCooldownWakeTimer = null;
+    scheduleQueuedJobs();
+  }, Math.max(0, at - Date.now()) + 25);
+  proxyCooldownWakeTimer.unref?.();
 }
 
 async function prepareAndLaunchJob(job, mode, queueRunId) {
@@ -1649,9 +1808,10 @@ function launchJob(job, options = {}) {
       CHATGPT_NEW_PASSWORD: mode === "password_add" ? job.pendingNewPassword || "" : "",
       CHATGPT_PROXY_URL: job.proxyUrl || "",
       CHATGPT_PROXY_MAX_ATTEMPTS: String(Math.max(0, MAX_PROXY_RISK_RETRIES - (job.proxyRiskRetryCount || 0))),
-      TOSUB2_TLS_PROFILE:
-        String(process.env.TOSUB2_TLS_PROFILE || "").trim()
-        || (!job.proxyUrl ? String(options.tlsProfile || DEFAULT_TLS_PROFILE) : ""),
+      // Per-account fingerprint: old accounts resolve to chrome146, new accounts to
+      // their stamped chrome150 (see resolveJobTlsProfile). Always concrete so it
+      // overrides any inherited global TOSUB2_TLS_PROFILE from the environment.
+      TOSUB2_TLS_PROFILE: String(options.tlsProfile || resolveJobTlsProfile(job)),
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -2404,6 +2564,10 @@ function consumeOutput(job, rawText) {
   const validationFailures = [...scan.matchAll(/\[warn\] Phone OTP validation failed:\s*([^\r\n]+)/g)];
   if (validationFailures.length) {
     const validationMessage = validationFailures.at(-1)[1];
+    if (isPermanentAccountFailure(validationMessage)) {
+      failAccountClosedAtPhoneOtp(job, validationMessage);
+      return;
+    }
     job.phoneError = friendlyPhoneOtpError(validationMessage);
     stopSmsPolling(job);
     if (job.smsStatus === "submitted") {
@@ -2654,6 +2818,19 @@ function failAccountProfileRequired(job) {
   void saveJobMetadata(job).catch(() => {});
 }
 
+// The code was delivered and checked, but the service answered that the account no longer exists.
+// The code was not wrong, and neither a resend nor another (paid) number can bring the account back.
+function failAccountClosedAtPhoneOtp(job, validationMessage) {
+  if (isTerminalStatus(job.status)) return;
+  completeSmsNumber(job, "短信验证码已送达并提交");
+  job.currentPhone = null;
+  job.phoneError = null;
+  failJob(job, `提交手机验证码时账号已被 OpenAI 删除或停用：${extractResponseMessage(validationMessage)}`);
+  job.child?.kill("SIGTERM");
+  job.child = null;
+  scheduleQueuedJobs();
+}
+
 function markResumeAvailable(job, reason = "登录流程中断") {
   stopMailPolling(job);
   stopSmsPolling(job);
@@ -2735,6 +2912,7 @@ async function acquireSmsNumber(job, providerId, config) {
       lubanApiBase: process.env.LUBAN_SMS_API_BASE,
       smsBowerApiBase: process.env.SMSBOWER_API_BASE,
       viOtpApiBase: process.env.VIOTP_API_BASE,
+      smsCodeApiBase: process.env.SMSCODE_API_BASE,
       acquireCustomSmsEntry,
     });
   } catch (error) {
@@ -2784,7 +2962,8 @@ async function acquireSmsNumber(job, providerId, config) {
     recordPhoneUsage(order.number, job.email);
     // Cost ledger: a number was taken → money is held until the code verifies
     // (success = charged) or the number is released (cancel = refunded).
-    const smsPrice = Number(config?.maxPrice);
+    // Prefer the amount the provider actually charged; a configured max price is only an upper bound.
+    const smsPrice = Number(order.price ?? config?.maxPrice);
     if (!Array.isArray(job.smsCostEvents)) job.smsCostEvents = [];
     job.smsCostEvents.push({
       id: crypto.randomUUID(),
@@ -2933,7 +3112,7 @@ function releaseSmsNumber(job, nextStatus = "idle", errorMessage = null) {
   if (job.outputPath) void saveJobMetadata(job).catch(() => {});
 }
 
-function completeSmsNumber(job) {
+function completeSmsNumber(job, outcome = "手机验证码已通过") {
   const requestId = job.smsOrderId;
   const smsClient = job.smsClient;
   if (!requestId || !smsClient) return;
@@ -2943,8 +3122,8 @@ function completeSmsNumber(job) {
   job.smsLastSubmittedCode = null;
   job.smsStatus = "completed";
   job.smsError = null;
-  settleSmsCost(job, "charged"); // code verified → this number is charged (counts)
-  appendJobLog(job, `[sms] 手机验证码已通过，正在完成 ${smsClient.name} 订单。\n`);
+  settleSmsCost(job, "charged"); // the SMS was delivered and used → this number is charged (counts)
+  appendJobLog(job, `[sms] ${outcome}，正在完成 ${smsClient.name} 订单。\n`);
   if (smsClient.complete) {
     void smsClient.complete(requestId).catch((error) => {
       appendJobLog(job, `[sms] ${smsClient.name} 完成订单失败：${safeSmsProviderError(error)}\n`);
@@ -3528,6 +3707,35 @@ function setPhoneMaxUses(value) {
   return phoneMaxUses;
 }
 
+// Console UI settings live in the `settings` table under a "ui:" prefix, as the
+// same key -> string pairs the browser used to keep in localStorage.
+const UI_SETTING_PREFIX = "ui:";
+const UI_SETTING_KEY_PATTERN = /^chatgpt-onboarding\.[a-z0-9.-]{1,80}$/;
+
+function readUiSettings() {
+  const out = {};
+  for (const row of settingsDao.getAll()) {
+    if (row.key.startsWith(UI_SETTING_PREFIX)) out[row.key.slice(UI_SETTING_PREFIX.length)] = row.value ?? "";
+  }
+  return out;
+}
+
+// A null value deletes the key; anything else is stored as a string.
+function writeUiSettings(settings) {
+  if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
+    throw httpError(400, "settings must be an object");
+  }
+  const entries = Object.entries(settings);
+  for (const [key, value] of entries) {
+    if (!UI_SETTING_KEY_PATTERN.test(key)) throw httpError(400, `Invalid setting key: ${key}`);
+    if (value !== null && typeof value !== "string") throw httpError(400, `Setting ${key} must be a string or null`);
+  }
+  for (const [key, value] of entries) {
+    if (value === null) settingsDao.remove(UI_SETTING_PREFIX + key);
+    else settingsDao.set(UI_SETTING_PREFIX + key, value);
+  }
+}
+
 function phoneLedgerStats() {
   let blocked = 0;
   let totalUses = 0;
@@ -3572,6 +3780,50 @@ function recordProxyUsage(proxyUrl, email) {
   } catch (error) {
     console.warn(`[warn] 代理使用记录写入失败：${String(error?.message || error).slice(0, 180)}`);
   }
+}
+
+// Rule: when a configured domain proxy exits through the same IP as a proxy that
+// was stored by raw IP, they are one line — the domain overwrites the raw IP on
+// every job and in the used-proxy ledger, so usage is counted under one host.
+// Returns the set of domain hosts probed here.
+async function overwriteRawIpProxiesWithDomains(urls, { force = false } = {}) {
+  const domains = [];
+  for (const url of urls) {
+    const parsed = parseProxyUrlForSub2Api(url);
+    if (parsed && net.isIP(parsed.host) === 0) domains.push({ host: parsed.host, url });
+  }
+  const probed = new Set(domains.map((d) => d.host));
+  const hasRawIpRecord = [...jobs.values()].some((job) => net.isIP(parseProxyUrlForSub2Api(job.proxyUrl)?.host || "") !== 0)
+    || [...usedProxyLedger.values()].some((entry) => net.isIP(entry.host || "") !== 0);
+  if (!domains.length || !hasRawIpRecord) return new Set();
+  const checks = await mapWithConcurrency(domains, 6, (d) => checkProxyExitIpCached(d.url, d.host, { force }));
+  const domainByExitIp = new Map();
+  checks.forEach((check, index) => {
+    if (check.ok && check.ip && !domainByExitIp.has(check.ip)) domainByExitIp.set(check.ip, domains[index]);
+  });
+  if (!domainByExitIp.size) return probed;
+
+  for (const job of jobs.values()) {
+    const parsed = parseProxyUrlForSub2Api(job.proxyUrl);
+    const domain = parsed && net.isIP(parsed.host) !== 0 ? domainByExitIp.get(parsed.host) : null;
+    if (!domain) continue;
+    // Same line, so a running job keeps its connection — only the record changes.
+    job.proxyUrl = domain.url;
+    await saveStoredLoginCredentials(job.email, job);
+    recordProxyUsage(domain.url, job.email);
+    appendJobLog(job, `[proxy] 代理记录已由 IP ${parsed.host} 覆盖为域名 ${domain.host}（出口 IP 相同）。\n`);
+    touch(job);
+    await saveJobMetadata(job);
+  }
+
+  for (const [key, entry] of [...usedProxyLedger]) {
+    const domain = net.isIP(entry.host || "") !== 0 ? domainByExitIp.get(entry.host) : null;
+    if (!domain) continue;
+    for (const email of entry.emails.length ? entry.emails : [null]) recordProxyUsage(domain.url, email);
+    usedProxyLedger.delete(key);
+    try { usedProxyDao.remove(key); } catch {}
+  }
+  return probed;
 }
 
 function isProxyEverUsed(key) {
@@ -4566,7 +4818,9 @@ function publicJob(job) {
     email: job.email,
     status: job.status,
     prompt: job.status === "queued"
-      ? `排队中，前方还有 ${Math.max(0, getQueuePosition(job) - 1)} 条任务`
+      ? (job.proxyCooldownUntil > Date.now()
+        ? `同一代理 IP 刚注册过其他账号，等到 ${formatClockTime(job.proxyCooldownUntil)} 再开始`
+        : `排队中，前方还有 ${Math.max(0, getQueuePosition(job) - 1)} 条任务`)
       : job.prompt,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
@@ -4839,6 +5093,10 @@ function occupiesActiveSlot(job) {
   return isActive(job.status) && job.status !== "queued" && job.status !== "idle";
 }
 
+function formatClockTime(timestamp) {
+  return new Date(timestamp).toLocaleTimeString("en-GB", { hour12: false });
+}
+
 function getQueuePosition(job) {
   if (job.status !== "queued") return 0;
   return [...jobs.values()]
@@ -5011,6 +5269,7 @@ async function syncCompletedOutputs(force = false) {
           phoneError: null,
           restartRequired: false,
           attempt: Math.max(1, Number(metadata.attempt || 1)),
+          tlsProfile: restoredTlsProfile(metadata),
           runId: null,
           runMode: null,
           fallbackInProgress: false,
@@ -5107,6 +5366,7 @@ async function syncCompletedOutputs(force = false) {
           phoneError: null,
           restartRequired: false,
           attempt: Math.max(1, Number(metadata.attempt || 1)),
+          tlsProfile: restoredTlsProfile(metadata),
           runId: null,
           runMode: null,
           fallbackInProgress: false,
@@ -5201,6 +5461,7 @@ async function syncCompletedOutputs(force = false) {
           phoneError: null,
           restartRequired: restoredStatus === "reauth_required",
           attempt: Math.max(1, Number(metadata.attempt || 1)),
+          tlsProfile: restoredTlsProfile(metadata),
           runId: null,
           runMode: null,
           queuedMode: restoredStatus === "queued" && metadata.queued_mode === "refresh" ? "refresh" : "full",
@@ -6295,6 +6556,7 @@ async function saveJobMetadata(job) {
         auto_repair_pending_backend: job.autoRepairPendingBackend || null,
         sub2api_uploaded_at: job.sub2apiUploadedAt || null,
         sub2api_uploaded_base_url: job.sub2apiUploadedBaseUrl || null,
+        tls_profile: job.tlsProfile || null,
         updated_at: new Date().toISOString(),
       };
       const tempPath = `${metadataPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
@@ -6400,10 +6662,25 @@ async function beginMailPolling(job) {
           markAuthorizationRequirement(job, "emailOtp");
           markAuthorizationAutomatic(job, "emailOtp");
           job.parserTail = "";
+          job.mailAutoResendCount = 0;
           appendJobLog(job, "[mail] 已从收码接口自动取得新验证码并提交。\n");
           setStage(job, "working", "已自动获取邮箱验证码，正在验证");
           job.child.stdin.write(`${fresh.code}\n`);
           return;
+        }
+        if (
+          Date.now() - startedAt >= MAIL_AUTO_RESEND_AFTER_MS &&
+          (job.mailAutoResendCount || 0) < MAIL_AUTO_RESEND_MAX
+        ) {
+          // Resending restarts polling once the login flow prompts for the code again.
+          const resent = await withEmailJobLock(job.email, async () => {
+            if (job.mailPollToken !== pollToken || job.status !== "email_otp" || !job.child) return false;
+            job.mailAutoResendCount = (job.mailAutoResendCount || 0) + 1;
+            appendJobLog(job, `[mail] ${Math.round(MAIL_AUTO_RESEND_AFTER_MS / 1000)} 秒内未收到验证码，自动重新发送（第 ${job.mailAutoResendCount}/${MAIL_AUTO_RESEND_MAX} 次）。\n`);
+            await submitJobInput(job, { action: "resend_email" });
+            return true;
+          });
+          if (resent) return;
         }
       } catch (error) {
         if (job.mailPollToken !== pollToken) return;

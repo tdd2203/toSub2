@@ -4,6 +4,7 @@
 // dictionary entry. Missing entries fall back to the Chinese source.
 
 import { SERVER_VI, SERVER_VI_FRAGMENTS } from "./i18n-server.js";
+import { getItem, setItem } from "./settings-store.js";
 
 export const LANG_STORAGE_KEY = "chatgpt-onboarding.lang-v1";
 
@@ -30,7 +31,7 @@ export function getLang() {
 
 export function readInitialLang() {
   try {
-    const stored = window.localStorage.getItem(LANG_STORAGE_KEY);
+    const stored = getItem(LANG_STORAGE_KEY);
     if (stored && Object.hasOwn(LANGS, stored)) return stored;
   } catch {}
   return "zh";
@@ -38,7 +39,7 @@ export function readInitialLang() {
 
 export function persistLang(lang) {
   try {
-    window.localStorage.setItem(LANG_STORAGE_KEY, lang);
+    setItem(LANG_STORAGE_KEY, lang);
   } catch {}
 }
 
@@ -205,6 +206,7 @@ const VI = {
   "ChatGPT 账号授权控制台": "Bảng điều khiển ủy quyền tài khoản ChatGPT",
   "本地多任务协议登录": "Đăng nhập giao thức đa tác vụ cục bộ",
   "任务统计": "Thống kê tác vụ",
+  "待启动": "Chờ khởi động",
   "进行中": "Đang chạy",
   "排队中": "Đang chờ",
   "已完成": "Hoàn tất",
@@ -284,6 +286,10 @@ const VI = {
   "每行一个，例如 socks5h://user:pass@host:port": "Mỗi dòng một proxy, ví dụ socks5h://user:pass@host:port",
   "每个 IP 最多账号数": "Số tài khoản tối đa mỗi IP",
   "默认 {0}": "mặc định {0}",
+  "同一 IP 两次注册的最短间隔（分钟）": "Khoảng nghỉ tối thiểu giữa hai lần đăng ký trên cùng một IP (phút)",
+  "默认 {0}，0 = 不等待": "mặc định {0}, 0 = không chờ",
+  "同一 IP 连续注册时，服务端可能不发送验证邮件；间隔内的注册任务会留在队列中等待。":
+    "Khi cùng một IP đăng ký liên tiếp, phía dịch vụ có thể không gửi email xác minh; tác vụ đăng ký trong khoảng nghỉ sẽ chờ trong hàng đợi.",
   "每个账号使用它注册时的代理，上传时自动创建并关联。": "Mỗi tài khoản dùng proxy lúc đăng ký; khi tải lên tự tạo và liên kết.",
   "完成": "Xong",
   "，创建代理 {0} 个": "，đã tạo {0} proxy",
@@ -304,14 +310,17 @@ const VI = {
   "已退款": "Đã hoàn",
   "待验证": "Chờ xác minh",
   "必须先配置代理 IP，或在“格式”里选择“本机 IP”": "Cần cấu hình proxy IP trước, hoặc chọn “IP máy” ở mục “Định dạng”",
+  "请先在“代理 IP 列表”中添加代理 IP": "Hãy thêm proxy IP vào “Danh sách proxy IP” trước",
 
   // Proxy IP list dialog
   "{0} 个 IP 活跃 · 剩余约 {1} 次注册": "{0} IP hoạt động · còn ~{1} lần đăng ký",
   "{0}/{1} 个 IP 活跃 · 剩余约 {2} 次注册 · 上限 {3}/IP": "{0}/{1} IP hoạt động · còn ~{2} lần đăng ký · tối đa {3}/IP",
   "批量模式 · 正在统计代理": "Chế độ nhiều IP · đang thống kê proxy",
+  "批量模式 · 请添加代理": "Chế độ nhiều IP · hãy thêm proxy",
   "管理代理、查看每个 IP 已注册的邮箱与连接状态": "Quản lý proxy, xem email đã đăng ký và trạng thái kết nối của từng IP",
   "批量添加代理": "Thêm proxy hàng loạt",
   "已识别 {0} 个 SOCKS5 · {1} 个 HTTP": "Nhận diện {0} SOCKS5 · {1} HTTP",
+  "{0} SOCKS5 · {1} HTTP · {2} 个未识别（点按钮指定协议）": "{0} SOCKS5 · {1} HTTP · {2} chưa rõ (chọn nút để ép giao thức)",
   "粘贴后自动识别 HTTP / SOCKS5": "Dán vào để tự nhận diện HTTP / SOCKS5",
   "添加 SOCKS5（{0}）": "Thêm SOCKS5 ({0})",
   "添加 HTTP（{0}）": "Thêm HTTP ({0})",
@@ -323,6 +332,24 @@ const VI = {
   "上限可在“配置”中调整": "Có thể chỉnh giới hạn trong Cấu hình",
   "已连接": "Đã kết nối",
   "连接失败": "Mất kết nối",
+  "IP 活跃 / 总数": "IP hoạt động / tổng",
+  "剩余可注册次数（估算）": "Lần đăng ký còn lại (ước lượng)",
+  "每个 IP 上限": "Giới hạn mỗi IP",
+  "协议": "Giao thức",
+  "已注册邮箱": "Email đã đăng ký",
+  "剩余额度": "Còn lại",
+  "出口 {0}": "IP ra {0}",
+  "粘贴后自动识别 HTTP / SOCKS5（每个 IP 只添加一次）": "Dán vào để tự nhận diện HTTP / SOCKS5 (mỗi IP chỉ thêm 1 lần)",
+  "已配置 {0} 个代理 IP。代理请在“代理 IP 列表”中添加与管理。": "Đã cấu hình {0} proxy IP. Thêm và quản lý proxy trong “Danh sách proxy IP”.",
+  "使用中": "Đang sử dụng",
+  "未使用": "Chưa sử dụng",
+  "已用完": "Đã sử dụng",
+  "没有符合筛选条件的代理": "Không có proxy khớp bộ lọc",
+  "IP 旧": "IP cũ",
+  "从列表中删除该代理": "Xoá proxy này khỏi danh sách",
+  "旧 IP（不在配置列表中）": "IP cũ (không có trong danh sách cấu hình)",
+  "{0} 个已注册邮箱": "{0} email đã đăng ký",
+  "复制全部": "Copy tất cả",
 
   // Global banners
   "关闭": "Đóng",
@@ -331,6 +358,14 @@ const VI = {
   "当前页 {0} 条，跨页已选 {1} 条，可下载 {2} 条": "Trang này {0}, đã chọn {1} (mọi trang), tải được {2}",
   "本页全选": "Chọn hết trang này",
   "清除选择": "Bỏ chọn",
+  "开始运行": "Bắt đầu chạy",
+  "将选中的待启动任务加入队列并开始运行": "Đưa các tác vụ chờ khởi động đã chọn vào hàng đợi và bắt đầu chạy",
+  "选中的任务都不是待启动状态": "Các tác vụ đã chọn đều không ở trạng thái chờ khởi động",
+  "已加入运行列表（待启动）{0} 个，选中后点击“开始运行”即可启动": "Đã thêm {0} email vào danh sách chạy (chờ khởi động); chọn rồi bấm “Bắt đầu chạy” để khởi động",
+  "加入运行列表失败：{0}": "Thêm vào danh sách chạy thất bại: {0}",
+  "已创建 {0} 个邮箱 — 已自动加入运行列表（待启动）": "Đã tạo {0} email — đã tự động thêm vào danh sách chạy (chờ khởi động)",
+  "创建临时邮箱，自动加入运行列表（待启动），稍后再开始运行": "Tạo hộp thư tạm, tự động thêm vào danh sách chạy (chờ khởi động), sau đó mới bắt đầu chạy",
+  "待启动，选中后点击“开始运行”即可加入队列": "Chờ khởi động — chọn rồi bấm “Bắt đầu chạy” để vào hàng đợi",
   "停止全部": "Dừng tất cả",
   "批量下载": "Tải hàng loạt",
   "上传到 Sub2API": "Tải lên Sub2API",
@@ -363,6 +398,22 @@ const VI = {
   "请先查询实时价格": "Hãy truy vấn giá thời gian thực trước",
   "查询中": "Đang truy vấn",
   "查询价格": "Truy vấn giá",
+  "查询服务": "Truy vấn dịch vụ",
+  "余额": "Số dư",
+  "一次查询即可加载平台、国家、运营商和价格": "Một lần truy vấn sẽ tải nền tảng, quốc gia, nhà mạng và giá",
+  "{0} 个国家可用": "{0} quốc gia khả dụng",
+  "查询服务后选择平台": "Truy vấn dịch vụ trước rồi chọn nền tảng",
+  "搜索平台": "Tìm nền tảng",
+  "没有匹配的平台": "Không tìm thấy nền tảng phù hợp",
+  "查询服务后选择国家": "Truy vấn dịch vụ trước rồi chọn quốc gia",
+  "搜索国家、区号或代码": "Tìm quốc gia, mã vùng hoặc mã quốc gia",
+  "没有匹配的国家": "Không tìm thấy quốc gia phù hợp",
+  "该平台暂无可用国家": "Nền tảng này hiện không có quốc gia khả dụng",
+  "选择国家后显示运营商": "Chọn quốc gia để hiển thị nhà mạng",
+  "选择国家后显示价格": "Chọn quốc gia để hiển thị giá",
+  "{0} 起": "từ {0}",
+  "还有 {0} 项，请输入关键字筛选": "Còn {0} mục nữa, hãy nhập từ khóa để lọc",
+  "当前没有可用的服务": "Hiện không có dịch vụ nào khả dụng",
   "SMSBower 国家与价格": "Quốc gia và giá SMSBower",
   "取消": "Hủy",
   "保存配置": "Lưu cấu hình",
@@ -437,8 +488,27 @@ const VI = {
   "全部": "Tất cả",
   "未创建": "Chưa tạo",
   "已创建": "Đã tạo",
+  "已停用": "Đã vô hiệu hóa",
+  "按邮箱搜索任务": "Tìm tác vụ theo email",
+  "搜索邮箱": "Tìm kiếm email",
+  "搜索": "Tìm kiếm",
+  "清除搜索": "Xóa tìm kiếm",
+  "找到 {0} 条": "Tìm thấy {0} tác vụ",
+  "{0} 个邮箱，找到 {1} 条": "{0} email, tìm thấy {1} tác vụ",
+  "{0} 个邮箱没有任务": "{0} email chưa có tác vụ",
+  "每个手机号最多使用次数": "Số lần dùng tối đa mỗi số điện thoại",
+  "0 = 不限制使用次数；被风控的号码始终跳过；记录保存在服务器，不使用浏览器存储": "0 = không giới hạn lần dùng. Số bị cơ chế rủi ro luôn bị tránh. Lưu trên máy chủ, không dùng localStorage.",
+  "已记录 {0} 个号码 · {1} 个被风控拦截 · 共 {2} 次使用": "Đã ghi {0} số · {1} số bị chặn (rủi ro) · {2} lượt dùng",
+  "使用次数上限必须是 0 到 1000 的整数": "Số lần dùng tối đa phải là số nguyên từ 0 đến 1000",
   "已建号": "Đã tạo TK",
   "全选（{0}）": "Chọn tất cả ({0})",
+  " · 步骤 4 活跃 {0}": " · Bước 4 hoạt động {0}",
+  "补打 ChatGPT Team 标签": "Gắn tag ChatGPT Team",
+  "停用未建号邮箱（{0}）": "Vô hiệu hoá email chưa tạo TK ({0})",
+  "没有需要补打标签的邮箱": "Không có email nào cần gắn tag",
+  "没有需要停用的邮箱": "Không có email nào cần vô hiệu hoá",
+  "将为 {0} 个无标签邮箱补打「ChatGPT Team」标签，确认？": "Sẽ gắn tag \"ChatGPT Team\" cho {0} email chưa có tag, xác nhận?",
+  "将停用 {0} 个有 ChatGPT Team 标签但未在步骤 4 的邮箱，确认？": "Sẽ vô hiệu hoá {0} email có tag ChatGPT Team nhưng không có tác vụ trong bước 4, xác nhận?",
 
   // Email API row + "Tạo email" / "Danh sách email" popups
   "创建邮箱": "Tạo email",
@@ -458,9 +528,12 @@ const VI = {
   "继续创建": "Tạo thêm",
   "复制邮箱": "Copy email",
   "加入批量添加": "Đưa vào Thêm hàng loạt",
+  "加入批量添加（{0}）": "Đưa vào Thêm hàng loạt ({0})",
   "加载中…": "Đang tải…",
   "{0}/{1} 个邮箱": "{0}/{1} hộp thư",
   " · 已选 {0}": " · đã chọn {0}",
+  "已选 {0}/{1}": "Đã chọn {0}/{1}",
+  "移除": "Xoá",
   "刷新": "Tải lại",
   "按邮箱、标签、类型搜索…": "Tìm theo email, tag, loại…",
   "取消选择": "Bỏ chọn",
@@ -498,6 +571,7 @@ const VI = {
   "复制 2FA 密钥": "Sao chép khóa 2FA",
   "重发": "Gửi lại",
   "换号": "Đổi số",
+  "已重发 {0} 次": "Đã gửi lại {0} lần",
   "使用 {0} 取号": "Lấy số bằng {0}",
   "请先完成接码平台配置": "Hãy cấu hình nền tảng nhận mã trước",
   "平台": "Nền tảng",
@@ -586,6 +660,27 @@ const VI = {
   "已取消": "Đã hủy",
   "待重新授权": "Chờ ủy quyền lại",
   "可继续": "Có thể tiếp tục",
+  "代理连接失败": "Lỗi kết nối proxy",
+
+  // Proxy connection error + change proxy
+  "代理连接失败，请更换代理": "Proxy lỗi kết nối, vui lòng đổi proxy",
+  "代理连接失败：{0} 无法连接": "Lỗi kết nối proxy: {0} không kết nối được",
+  "从系统代理池中选择一个未使用过的代理替换失败的代理": "Chọn một proxy chưa từng dùng trong kho proxy của hệ thống để thay proxy bị lỗi",
+  "重新连接": "Kết nối lại",
+  "重新测试并使用原代理继续登录，适用于代理只是临时断开的情况": "Kiểm tra lại và dùng chính proxy cũ để tiếp tục đăng nhập — phù hợp khi proxy chỉ tạm thời mất kết nối",
+  "更换代理": "Đổi proxy",
+  "失败代理：{0}。请选择一个未使用过的代理。": "Proxy lỗi: {0}. Hãy chọn một proxy chưa từng dùng.",
+  "请从系统代理池中选择一个未使用过的代理": "Hãy chọn một proxy chưa từng dùng trong kho proxy của hệ thống",
+  "将代理导入系统代理池": "Nạp proxy vào kho proxy của hệ thống",
+  "导入": "Nạp",
+  "选择": "Chọn",
+  "代理池中没有未使用过的代理，请先在上方导入": "Kho proxy không còn proxy chưa dùng, hãy nạp thêm ở trên",
+  "该代理线路曾被使用，但当前没有账号在用。确认要重复使用吗？": "Proxy này đã từng được dùng nhưng hiện không còn tài khoản nào dùng. Xác nhận dùng lại?",
+  "代理已更换，但同步到 Sub2API 失败：{0}": "Đã đổi proxy, nhưng đồng bộ lên Sub2API thất bại: {0}",
+
+  // Per-IP registration limit
+  "代理 IP 注册名额已满，已自动取消该任务": "IP proxy đã đủ lượt đăng ký, đã tự động huỷ tác vụ này",
+  "已自动取消 {0} 个账号：所在代理 IP 的注册名额已满": "Đã tự động huỷ {0} tài khoản: IP proxy đã đủ lượt đăng ký",
 
   // LoginMethodBadge
   "密码": "Mật khẩu",
@@ -626,6 +721,7 @@ const VI = {
   "已更新 {0} 条": "Đã cập nhật {0}",
   "永久跳过 {0} 条": "Bỏ qua vĩnh viễn {0}",
   "需人工 {0} 条": "Cần thủ công {0}",
+  "已停止调度 {0} 条": "Đã ngừng điều phối {0}",
   "本地无任务 {0} 条": "Không có tác vụ cục bộ {0}",
   "正在运行 {0} 条": "Đang chạy {0}",
   "冷却中 {0} 条": "Đang chờ nguội {0}",

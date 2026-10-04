@@ -79,7 +79,7 @@ const childExit = new Promise((resolve) => child.once("exit", resolve));
 
 try {
   const bootstrap = await waitForJson(`${baseUrl}/api/bootstrap`);
-  assert.deepEqual(bootstrap.features.smsProviders.map((provider) => provider.id), ["luban", "smsbower", "viotp", "custom"]);
+  assert.deepEqual(bootstrap.features.smsProviders.map((provider) => provider.id), ["luban", "smsbower", "viotp", "smscode", "custom"]);
   const headers = { "content-type": "application/json", "x-console-token": bootstrap.token };
   const optionsResponse = await fetch(`${baseUrl}/api/sms-providers/smsbower/options`, {
     method: "POST",
@@ -152,6 +152,49 @@ try {
     smsActions.filter((item) => item.action === "setStatus" && item.status === "8").length,
     releasedOrderCount + 1,
   );
+
+  // ---- Account closed while the code is checked: the code was right, so no resend/new number may be offered ----
+  const completedBeforeClosed = smsActions.filter((item) => item.action === "setStatus" && item.status === "6").length;
+  const releasedBeforeClosed = smsActions.filter((item) => item.action === "setStatus" && item.status === "8").length;
+  const closedResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ email: "sms-account-closed@example.com" }),
+  });
+  assert.equal(closedResponse.status, 201);
+  const closed = await closedResponse.json();
+  await waitForJob(headers, closed.job.id, (job) => job.status === "phone");
+  const closedNumberResponse = await fetch(`${baseUrl}/api/jobs/${closed.job.id}/sms-number`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      providerId: "smsbower",
+      config: { apiKey: "test-api-key", service: "dr", country: "1001", maxPrice: "0.42" },
+    }),
+  });
+  assert.equal(closedNumberResponse.status, 200, await closedNumberResponse.text());
+  const getNumbersAtClose = smsActions.filter((item) => item.action === "getNumber").length;
+  // No pool backend is configured here, so a confirmed-deactivated account's task is dropped right away,
+  // exactly as for a deactivation found at any other step.
+  let closedListed = true;
+  for (const deadline = Date.now() + 10_000; closedListed && Date.now() < deadline;) {
+    const page = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
+    closedListed = page.jobs.some((item) => item.id === closed.job.id);
+    if (closedListed) await delay(25);
+  }
+  assert.equal(closedListed, false, "the task ends instead of waiting for another code or number");
+  await delay(200);
+  assert.equal(
+    smsActions.filter((item) => item.action === "setStatus" && item.status === "6").length,
+    completedBeforeClosed + 1,
+    "the delivered SMS is settled as used",
+  );
+  assert.equal(
+    smsActions.filter((item) => item.action === "setStatus" && item.status === "8").length,
+    releasedBeforeClosed,
+    "a used number is not canceled",
+  );
+  assert.equal(smsActions.filter((item) => item.action === "getNumber").length, getNumbersAtClose, "no further number is bought");
 
   // ---- Phone-number reuse filter (each number used at most `maxUses` times) ----
   const usageCfg = await (await fetch(`${baseUrl}/api/sms/number-usage`, { headers })).json();

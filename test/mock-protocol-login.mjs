@@ -107,7 +107,11 @@ try {
     return;
   }
 
-  if (["proxy-connection-retry@example.com", "proxy-connection-always@example.com"].includes(args.email)) {
+  if ([
+    "proxy-connection-retry@example.com",
+    "proxy-connection-always@example.com",
+    "proxy-reconnect-retry@example.com",
+  ].includes(args.email)) {
     const attemptPath = `${args.sub2apiOut}.proxy-connection-attempt`;
     let attempt = 0;
     try {
@@ -205,7 +209,7 @@ try {
     return;
   }
 
-  if (["luban@example.com", "sms-provider@example.com", "custom-sms@example.com", "manual-phone-automation@example.com"].includes(args.email)) {
+  if (["luban@example.com", "sms-provider@example.com", "custom-sms@example.com", "manual-phone-automation@example.com", "phone-filter-a@example.com", "phone-filter-b@example.com"].includes(args.email)) {
     await rl.question("Phone number, E.164 format (p=quit): ");
     console.log("Phone OTP (r=resend, p=change phone, q=quit): ");
     await rl.question("");
@@ -223,6 +227,17 @@ try {
     if (action !== "p") throw new Error(`expected automatic phone change, received ${action}`);
     console.log("[info] Change phone number.");
     await rl.question("Phone number, E.164 format (p=quit): ");
+    return;
+  }
+
+  if (args.email === "sms-account-closed@example.com") {
+    await rl.question("Phone number, E.164 format (p=quit): ");
+    console.log("Phone OTP (r=resend, p=change phone, q=quit): ");
+    await rl.question("");
+    console.log('[warn] Phone OTP validation failed: POST https://auth.openai.com/api/accounts/phone-otp/validate failed with HTTP 403: { "error": { "message": "You do not have an account because it has been deleted or deactivated. If you believe this was an error, please contact us through our help center at help.openai.com.", "type": "invalid_request_error", "param": null, "code": "account_deactivated" } }');
+    console.log("[info] Enter another code, r to resend, p to change phone, or q to quit.");
+    // The real script keeps asking here; the console has to end the run instead of offering another code or number.
+    await rl.question("Phone OTP (r=resend, p=change phone, q=quit): ");
     return;
   }
 

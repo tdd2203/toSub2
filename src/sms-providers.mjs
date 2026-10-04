@@ -1,6 +1,7 @@
 import { createLubanSmsClient } from "./luban-sms.mjs";
 import { createSmsBowerClient } from "./smsbower.mjs";
 import { createViOtpClient } from "./viotp-sms.mjs";
+import { createSmsCodeClient } from "./smscode-sms.mjs";
 import { createCustomSmsClient } from "./custom-sms.mjs";
 
 // How far above the chosen tier's price a fallback purchase may go when that tier
@@ -45,8 +46,27 @@ export const SMS_PROVIDER_DEFINITIONS = [
         { value: "vn", label: "越南" },
         { value: "la", label: "老挝" },
       ]},
-      { key: "serviceId", label: "服务与价格", type: "price-select", defaultValue: "", summaryKey: "serviceLabel" },
+      { key: "serviceId", label: "服务与价格", type: "service-select", defaultValue: "", summaryKey: "serviceLabel" },
       { key: "serviceLabel", label: "服务名称", type: "hidden", required: false },
+    ],
+  },
+  {
+    id: "smscode",
+    name: "SMSCode",
+    description: "SMSCode 全球接码平台 (smscode.gg)",
+    optionsEndpoint: "/api/sms-providers/smscode/options",
+    fields: [
+      { key: "apiKey", label: "API Token", type: "password", placeholder: "输入 SMSCode API Token" },
+      { key: "platformId", label: "平台", type: "smscode-platform" },
+      { key: "countryId", label: "国家", type: "smscode-country" },
+      { key: "operatorId", label: "运营商", type: "smscode-operator", required: false },
+      { key: "maxPriceIdr", label: "最高价格", type: "smscode-tier", summaryKey: "serviceLabel" },
+      { key: "catalogProductId", label: "目录产品", type: "hidden", required: false },
+      { key: "maxPrice", label: "最高价格 (USD)", type: "hidden", required: false },
+      { key: "serviceLabel", label: "服务名称", type: "hidden", required: false },
+      { key: "platformLabel", label: "平台名称", type: "hidden", required: false },
+      { key: "countryLabel", label: "国家名称", type: "hidden", required: false },
+      { key: "operatorLabel", label: "运营商名称", type: "hidden", required: false },
     ],
   },
   {
@@ -130,7 +150,6 @@ export function createSmsProvider(providerIdValue, configValue = {}, options = {
   if (providerId === "viotp") {
     const apiKey = validateApiKey(config.apiKey, "ViOTP");
     const serviceId = String(config.serviceId || "").trim();
-    if (!/^\d{1,10}$/.test(serviceId)) throw new Error("请选择 ViOTP 服务");
     const country = String(config.country || "vn").trim().toLowerCase();
     const client = createViOtpClient({ apiKey, apiBase: options.viOtpApiBase, fetchImpl: options.fetchImpl });
     return {
@@ -138,10 +157,46 @@ export function createSmsProvider(providerIdValue, configValue = {}, options = {
       name: "ViOTP",
       apiKey,
       serviceLabel: config.serviceLabel || serviceId,
-      getNumber: () => client.getNumber(serviceId, { country }),
+      getNumber: () => {
+        if (!/^\d{1,10}$/.test(serviceId)) throw new Error("请选择 ViOTP 服务");
+        return client.getNumber(serviceId, { country });
+      },
       listNumberOptions: () => client.listServiceOptions(country),
       getSms: (requestId) => client.getSms(requestId),
       release: (requestId) => client.release(requestId),
+    };
+  }
+
+  if (providerId === "smscode") {
+    const apiKey = validateApiKey(config.apiKey, "SMSCode");
+    const catalogProductId = String(config.catalogProductId || "").trim();
+    const operatorId = String(config.operatorId || "").trim();
+    const maxPriceIdr = String(config.maxPriceIdr || "").trim();
+    const maxPrice = String(config.maxPrice || "").trim();
+    const client = createSmsCodeClient({ apiKey, apiBase: options.smsCodeApiBase, fetchImpl: options.fetchImpl });
+    return {
+      id: "smscode",
+      name: "SMSCode",
+      apiKey,
+      serviceLabel: config.serviceLabel || catalogProductId,
+      getNumber: () => {
+        if (!/^\d{1,10}$/.test(catalogProductId)) throw new Error("请先查询并选择 SMSCode 国家");
+        if (operatorId && !/^\d{1,10}$/.test(operatorId)) throw new Error("请重新选择 SMSCode 运营商");
+        // An order without a cap may be routed to any tier, however expensive.
+        const cappedByIdr = /^[1-9]\d{0,11}$/.test(maxPriceIdr);
+        const cappedByUsd = /^\d+(?:\.\d{1,6})?$/.test(maxPrice) && Number(maxPrice) > 0;
+        if (!cappedByIdr && !cappedByUsd) throw new Error("请重新查询并选择 SMSCode 最高价格");
+        return client.createOrder(catalogProductId, {
+          operatorId,
+          maxPriceIdr: cappedByIdr ? maxPriceIdr : "",
+          maxPrice: cappedByUsd ? maxPrice : "",
+        });
+      },
+      listNumberOptions: () => client.listServiceOptions({ platformId: config.platformId, countryId: config.countryId }),
+      getSms: (requestId) => client.pollActiveOrder(requestId),
+      markReady: (requestId) => client.requestNextSms(requestId),
+      complete: (requestId) => client.finishOrder(requestId),
+      release: (requestId) => client.releaseOrder(requestId),
     };
   }
 

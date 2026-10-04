@@ -133,6 +133,8 @@ const child = spawn(process.execPath, [
     ONBOARDING_PROTOCOL_SCRIPT: path.join(projectRoot, "test", "mock-protocol-login.mjs"),
     TOSUB2_TLS_PROFILE: "chrome142",
     PROXY_CONNECTION_RETRY_BASE_MS: "1",
+    PROXY_CHANGE_SKIP_LIVE_CHECK: "1",
+    PROXY_EXIT_IP_TEST_MAP: JSON.stringify({ "line.example.test": "10.9.8.7", "10.9.8.7": "10.9.8.7" }),
     SUB2API_AUTO_REPAIR_COOLDOWN_MS: "0",
     TOSUB2_MAC_CREDENTIAL_ROOT: path.join(outputRoot, "test-mac-credentials"),
   },
@@ -155,6 +157,23 @@ try {
   const pageResponse = await fetch(`${baseUrl}/`);
   assert.equal(pageResponse.status, 200);
   assert.match(pageResponse.headers.get("content-type") || "", /text\/html;\s*charset=utf-8/i);
+
+  // Console UI settings are stored in the database, not the browser.
+  const settingsUrl = `${baseUrl}/api/settings`;
+  assert.equal((await fetch(settingsUrl)).status, 403, "settings require the console token");
+  assert.deepEqual((await (await fetch(settingsUrl, { headers })).json()).settings, {});
+  const putSettings = (settings) => fetch(settingsUrl, { method: "PUT", headers, body: JSON.stringify({ settings }) });
+  assert.equal((await putSettings({
+    "chatgpt-onboarding.proxy-link-config-v1": "{\"mode\":\"batch\"}",
+    "chatgpt-onboarding.lang-v1": "vi",
+  })).status, 200);
+  assert.equal((await putSettings({ "chatgpt-onboarding.lang-v1": null })).status, 200);
+  assert.deepEqual((await (await fetch(settingsUrl, { headers })).json()).settings, {
+    "chatgpt-onboarding.proxy-link-config-v1": "{\"mode\":\"batch\"}",
+  });
+  assert.equal((await putSettings({ phone_max_uses: "9" })).status, 400, "only console UI keys are writable");
+  assert.equal((await putSettings({ "chatgpt-onboarding.lang-v1": 1 })).status, 400);
+  await putSettings({ "chatgpt-onboarding.proxy-link-config-v1": null });
 
   const mailRequestConfigResponse = await fetch(`${baseUrl}/api/mail-request-config`, {
     method: "POST",
@@ -241,6 +260,28 @@ try {
 
   let job = await waitForJob(headers, jobId, (value) => value.status === "completed");
   assert.equal(job.canDownload, true);
+
+  // Bulk search: a pasted account table is reduced to its emails and matched exactly.
+  const bulkSearchResponse = await fetch(`${baseUrl}/api/jobs/query`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      page: 1,
+      search: "Huỳnh Mai Giang\nCross-Platform@example.com\n#165\tOpenAI\n10/02/2026, 03:28:55\nKiều Tùng\nno-job@example.com\n#151",
+    }),
+  });
+  assert.equal(bulkSearchResponse.status, 200, await bulkSearchResponse.clone().text());
+  const bulkSearch = await bulkSearchResponse.json();
+  assert.deepEqual(bulkSearch.jobs.map((item) => item.email), ["cross-platform@example.com"]);
+  assert.equal(bulkSearch.filter.searchEmails, 2);
+  assert.deepEqual(bulkSearch.filter.missing, ["no-job@example.com"]);
+  const substringSearch = await fetch(`${baseUrl}/api/jobs/query`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ page: 1, search: "cross-plat" }),
+  }).then((response) => response.json());
+  assert.ok(substringSearch.jobs.some((item) => item.email === "cross-platform@example.com"));
+  assert.equal(substringSearch.filter.searchEmails, 0);
 
   const downloadResponse = await fetch(`${baseUrl}/api/jobs/${jobId}/download`, { headers });
   assert.equal(downloadResponse.status, 200);
@@ -940,6 +981,22 @@ try {
   const blockedCheck = JSON.parse(blockedCheckText);
   assert.equal(blockedCheck.result.started, 0);
   assert.equal(blockedCheck.result.blocked, 1);
+  // A permanently blocked account the console can't recover must be pulled out of
+  // the Sub2API schedule (schedulable=false), not left dispatching a broken account.
+  assert.equal(blockedCheck.result.disabled, 1);
+  assert.equal(scheduledRemoteAccounts.get(92), false);
+  // Once Sub2API scheduling is off, a confirmed-deactivated account is dropped from
+  // the task list entirely — only its mailbox remains (flagged deactivated in the
+  // registry) so the operator has the list to clean up on the workspace.
+  assert.equal(blockedCheck.result.removed, 1);
+  let bannedStillListed = false;
+  for (let pageNumber = 1, totalPages = 1; pageNumber <= totalPages; pageNumber += 1) {
+    const pageResponse = await fetch(`${baseUrl}/api/jobs?page=${pageNumber}`, { headers });
+    const page = await pageResponse.json();
+    totalPages = page.pagination?.totalPages || 1;
+    if (page.jobs.some((item) => item.id === bannedJobId)) bannedStillListed = true;
+  }
+  assert.equal(bannedStillListed, false, "deactivated account's task must be removed from the task list");
 
   const directRiskResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",
@@ -997,6 +1054,8 @@ try {
   assert.equal((proxyAlwaysLogs.logs.match(/个新代理会话/g) || []).length, 10);
   assert.doesNotMatch(proxyAlwaysLogs.logs, /正在检测第 11\//);
 
+  // A proxy CONNECTION failure must stop immediately in a proxy_error state that
+  // names the failing proxy — no auto session rotation, no auto proxy switch.
   const proxyConnectionResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",
     headers,
@@ -1004,12 +1063,63 @@ try {
   });
   assert.equal(proxyConnectionResponse.status, 201);
   const proxyConnectionCreated = await proxyConnectionResponse.json();
-  await waitForJob(headers, proxyConnectionCreated.job.id, (value) => value.status === "completed");
+  const proxyConnectionFailed = await waitForJob(
+    headers,
+    proxyConnectionCreated.job.id,
+    (value) => value.status === "proxy_error",
+  );
+  assert.equal(proxyConnectionFailed.proxyConnectionError, true);
+  assert.equal(proxyConnectionFailed.failedProxyLabel, "proxy.example:5000");
+  assert.equal(proxyConnectionFailed.canChangeProxy, true);
   const proxyConnectionLogs = await fetch(`${baseUrl}/api/jobs/${proxyConnectionCreated.job.id}/logs`, { headers })
     .then((response) => response.json());
-  assert.match(proxyConnectionLogs.logs, /HTTP 检测次数仍为 0\/10；连接失败 1\/20/);
-  assert.equal((proxyConnectionLogs.logs.match(/个新代理会话/g) || []).length, 1);
+  // Stopped on the first failure: no session was rotated.
+  assert.equal((proxyConnectionLogs.logs.match(/个新代理会话/g) || []).length, 0);
 
+  // Changing to a proxy that is not in the loaded pool is rejected.
+  const notPooledResponse = await fetch(`${baseUrl}/api/jobs/${proxyConnectionCreated.job.id}/change-proxy`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ proxyUrl: "socks5h://user-sid-abc-t-20:password@proxy2.example:6000" }),
+  });
+  assert.equal(notPooledResponse.status, 400);
+
+  // Changing to the same failing proxy is rejected (must pick a different one).
+  // First load it into the pool so it passes the pool check and trips the
+  // same-proxy guard instead.
+  await fetch(`${baseUrl}/api/proxy-pool/import`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ text: `${rotatingProxy}\nsocks5h://user-sid-new-t-20:password@proxy2.example:6000` }),
+  });
+  const pool = await fetch(`${baseUrl}/api/proxy-pool`, { headers }).then((response) => response.json());
+  // proxy.example is already used (the failing job holds it); proxy2.example is not.
+  const usedEntry = pool.proxies.find((entry) => entry.label === "proxy.example:5000");
+  const freeEntry = pool.proxies.find((entry) => entry.label === "proxy2.example:6000");
+  assert.equal(Boolean(usedEntry && usedEntry.used), true);
+  assert.equal(Boolean(freeEntry && freeEntry.used), false);
+  const sameProxyResponse = await fetch(`${baseUrl}/api/jobs/${proxyConnectionCreated.job.id}/change-proxy`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ proxyUrl: rotatingProxy }),
+  });
+  assert.equal(sameProxyResponse.status, 409);
+
+  // Changing to a pooled, never-used proxy succeeds and resumes the login (the
+  // mock completes on its second attempt).
+  const changeProxyResponse = await fetch(`${baseUrl}/api/jobs/${proxyConnectionCreated.job.id}/change-proxy`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ proxyUrl: "socks5h://user-sid-new-t-20:password@proxy2.example:6000" }),
+  });
+  const changeProxyResult = await changeProxyResponse.json();
+  assert.equal(changeProxyResponse.status, 200, JSON.stringify(changeProxyResult));
+  assert.equal(changeProxyResult.changed, true);
+  assert.equal(changeProxyResult.sub2apiSync.attempted, false);
+  await waitForJob(headers, proxyConnectionCreated.job.id, (value) => value.status === "completed");
+
+  // A second account whose proxy always fails also stops at proxy_error, and it
+  // may NOT take the proxy the first account is now using.
   const proxyConnectionAlwaysResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",
     headers,
@@ -1020,9 +1130,40 @@ try {
   const proxyConnectionAlwaysFailed = await waitForJob(
     headers,
     proxyConnectionAlwaysCreated.job.id,
-    (value) => value.status === "failed",
+    (value) => value.status === "proxy_error",
   );
-  assert.match(proxyConnectionAlwaysFailed.lastError || "", /连续失败 20 次/);
+  assert.equal(proxyConnectionAlwaysFailed.proxyConnectionError, true);
+  const inUseResponse = await fetch(`${baseUrl}/api/jobs/${proxyConnectionAlwaysCreated.job.id}/change-proxy`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ proxyUrl: "socks5h://user-sid-new-t-20:password@proxy2.example:6000" }),
+  });
+  assert.equal(inUseResponse.status, 409);
+
+  // A transient proxy failure can be retried on the SAME proxy via reconnect-proxy
+  // (no pool selection, no different proxy required). The mock fails the first
+  // attempt then completes on the second, so the reconnect resumes to completion.
+  const reconnectResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ email: "proxy-reconnect-retry@example.com", proxyUrl: rotatingProxy }),
+  });
+  assert.equal(reconnectResponse.status, 201);
+  const reconnectCreated = await reconnectResponse.json();
+  const reconnectFailed = await waitForJob(
+    headers,
+    reconnectCreated.job.id,
+    (value) => value.status === "proxy_error",
+  );
+  assert.equal(reconnectFailed.canReconnectProxy, true);
+  const reconnectAction = await fetch(`${baseUrl}/api/jobs/${reconnectCreated.job.id}/reconnect-proxy`, {
+    method: "POST",
+    headers,
+  });
+  const reconnectResult = await reconnectAction.json();
+  assert.equal(reconnectAction.status, 200, JSON.stringify(reconnectResult));
+  assert.equal(reconnectResult.reconnected, true);
+  await waitForJob(headers, reconnectCreated.job.id, (value) => value.status === "completed");
 
   const deleteResponse = await fetch(`${baseUrl}/api/jobs/delete-batch`, {
     method: "POST",
@@ -1037,8 +1178,10 @@ try {
       proxyAlwaysCreated.job.id,
       proxyConnectionCreated.job.id,
       proxyConnectionAlwaysCreated.job.id,
+      reconnectCreated.job.id,
       directRiskCreated.job.id,
-      bannedJobId,
+      // bannedJobId is intentionally omitted — the confirmed-deactivated task was
+      // already removed by the monitor above.
       manualPhoneJobId,
       phoneFallbackJobId,
       incompleteAuthorizationId,
@@ -1053,6 +1196,27 @@ try {
 
   const finalPage = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
   assert.equal(finalPage.pagination.total, 0);
+
+  // A domain proxy with the same exit IP as a proxy stored by raw IP is the same
+  // line: the domain overwrites the raw IP on the account.
+  const rawIpJobResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ email: "raw-ip-proxy@example.com", proxyUrl: "socks5h://user:password@10.9.8.7:1080" }),
+  });
+  assert.equal(rawIpJobResponse.status, 201);
+  const proxyStatusBody = (proxies) => JSON.stringify({ mode: "batch", proxies, limitPerIp: 15 });
+  const beforeOverwrite = await (await fetch(`${baseUrl}/api/proxies/status`, {
+    method: "POST", headers, body: proxyStatusBody("socks5h://user:password@10.9.8.7:1080"),
+  })).json();
+  assert.deepEqual(beforeOverwrite.proxies.map((p) => [p.host, p.emails]), [["10.9.8.7", ["raw-ip-proxy@example.com"]]]);
+  const afterOverwrite = await (await fetch(`${baseUrl}/api/proxies/status`, {
+    method: "POST", headers, body: proxyStatusBody("socks5h://user:password@line.example.test:1080"),
+  })).json();
+  assert.deepEqual(
+    afterOverwrite.proxies.map((p) => [p.host, p.ip, p.emails]),
+    [["line.example.test", "10.9.8.7", ["raw-ip-proxy@example.com"]]],
+  );
   console.log("console smoke tests passed");
 } catch (error) {
   error.message = `${error.message}\nConsole output:\n${logs}`;
@@ -1080,11 +1244,18 @@ async function waitForJson(url) {
 async function waitForJob(headers, jobId, predicate) {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
-    const response = await fetch(`${baseUrl}/api/jobs`, { headers });
-    assert.equal(response.status, 200);
-    const page = await response.json();
-    const job = page.jobs.find((item) => item.id === jobId);
-    if (job && predicate(job)) return job;
+    // The list is sorted by status (running first, completed last), so a job can be on any page.
+    let pageNumber = 1;
+    let totalPages = 1;
+    do {
+      const response = await fetch(`${baseUrl}/api/jobs?page=${pageNumber}`, { headers });
+      assert.equal(response.status, 200);
+      const page = await response.json();
+      totalPages = page.pagination?.totalPages || 1;
+      const job = page.jobs.find((item) => item.id === jobId);
+      if (job && predicate(job)) return job;
+      pageNumber += 1;
+    } while (pageNumber <= totalPages);
     await delay(100);
   }
   throw new Error(`job ${jobId} did not reach the expected state`);

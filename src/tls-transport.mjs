@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -34,10 +35,10 @@ export function browserIdentityForTlsProfile(profile = DEFAULT_PROFILE) {
       `"Chromium";v="${majorVersion}", "Google Chrome";v="${majorVersion}", "Not.A/Brand";v="99"`,
     secChUaMobile: "?0",
     secChUaPlatform: `"${platform}"`,
-    acceptLanguage: "zh-CN,zh;q=0.9,en;q=0.8",
-    locale: "zh-CN",
-    languages: ["zh-CN", "zh", "en"],
-    timezoneId: "Asia/Shanghai",
+    acceptLanguage: "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+    locale: "vi-VN",
+    languages: ["vi-VN", "vi", "en-US", "en"],
+    timezoneId: "Asia/Ho_Chi_Minh",
     os: usesMacOs ? "macos" : "windows",
     osVersion: usesMacOs ? "15.7.0" : "10.0",
     platform: usesMacOs ? "MacIntel" : "Win32",
@@ -453,8 +454,8 @@ function findPythonCommand() {
   const candidates = configured
     ? [{ command: configured, args: [] }]
     : process.platform === "win32"
-      ? [{ command: "python", args: [] }, { command: "py", args: ["-3"] }]
-      : [{ command: "python3", args: [] }, { command: "python", args: [] }];
+      ? [...venvPythonCandidates(), { command: "python", args: [] }, { command: "py", args: ["-3"] }]
+      : [...venvPythonCandidates(), { command: "python3", args: [] }, { command: "python", args: [] }];
   for (const candidate of candidates) {
     const check = spawnSync(candidate.command, [...candidate.args, "-c", "import curl_cffi"], {
       stdio: "ignore",
@@ -463,6 +464,19 @@ function findPythonCommand() {
     if (check.status === 0) return candidate;
   }
   return null;
+}
+
+function venvPythonCandidates() {
+  const projectRoot = path.join(__dirname, "..");
+  const relativePaths = process.platform === "win32"
+    ? [path.join(".venv", "Scripts", "python.exe")]
+    : [path.join(".venv", "bin", "python3"), path.join(".venv", "bin", "python")];
+  const candidates = [];
+  for (const relativePath of relativePaths) {
+    const command = path.join(projectRoot, relativePath);
+    if (existsSync(command)) candidates.push({ command, args: [] });
+  }
+  return candidates;
 }
 
 function encodeBody(body) {

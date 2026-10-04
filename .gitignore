@@ -23,6 +23,11 @@ credentials/
 secrets.json
 *.secret
 
+# SQLite database
+*.db
+*.db-wal
+*.db-shm
+
 # Job / session artifacts produced at runtime
 chatgpt-protocol-session.json
 sub2api-import*.json

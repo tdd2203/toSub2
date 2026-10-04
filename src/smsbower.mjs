@@ -54,16 +54,42 @@ export function createSmsBowerClient(options = {}) {
   }
 
   return {
-    async getNumber(service, country, maxPrice = "") {
-      const params = { service, country };
-      if (maxPrice !== "") params.maxPrice = maxPrice;
-      const text = await request("getNumber", params);
-      const match = /^ACCESS_NUMBER:([^:]+):(\+?\d+)$/.exec(text);
-      if (!match) throw responseError(text, "获取手机号失败");
-      return {
-        number: normalizePhoneNumber(match[2]),
-        requestId: match[1],
+    async getNumber(service, country, maxPrice = "", options = {}) {
+      const buy = async (params) => {
+        const text = await request("getNumber", params);
+        const match = /^ACCESS_NUMBER:([^:]+):(\+?\d+)$/.exec(text);
+        if (!match) throw responseError(text, "获取手机号失败");
+        return { number: normalizePhoneNumber(match[2]), requestId: match[1] };
       };
+
+      // Lock the exact quality tier / agent chosen in the config. In SMSBower's
+      // catalog each position exposes agent_ids; the getNumber action accepts the
+      // same value as providerIds to buy only from that provider/rank.
+      const providerIds = String(options.providerIds ?? "").trim();
+      const fallbackMaxPrice = String(options.fallbackMaxPrice ?? "").trim();
+
+      if (!providerIds) {
+        const params = { service, country };
+        if (maxPrice !== "") params.maxPrice = maxPrice;
+        return buy(params);
+      }
+
+      // Priority: buy from exactly the configured tier/agent (capped at its price).
+      const pinned = { service, country, providerIds };
+      if (maxPrice !== "") pinned.maxPrice = maxPrice;
+      try {
+        return await buy(pinned);
+      } catch (error) {
+        // Only fall back when that specific tier is simply out of stock.
+        if (error?.code !== "NO_NUMBERS") throw error;
+      }
+
+      // Fallback: any tier in the same country, capped at fallbackMaxPrice
+      // (chosen price × multiplier) so replacements never cost more than allowed.
+      const fallback = { service, country };
+      if (fallbackMaxPrice !== "") fallback.maxPrice = fallbackMaxPrice;
+      else if (maxPrice !== "") fallback.maxPrice = maxPrice;
+      return buy(fallback);
     },
 
     async getPriceOptions(service) {
@@ -218,4 +244,67 @@ function normalizePhoneNumber(value) {
 
 function safeMessage(value) {
   return String(value || "").replace(/[\r\n]+/g, " ").trim().slice(0, 240);
+}
+
+// ---- Public service catalog (country -> quality/rank positions) ----
+// SMSBower's website exposes a keyless endpoint with, per service, every country
+// and its "positions" (rank gold/silver/bronze + price + stock + agent id). This
+// is exactly the price table the picker shows.
+const DEFAULT_WEB_BASE = "https://smsbower.app";
+const RANK_NAMES = { 1: "gold", 2: "silver", 3: "bronze" };
+
+export async function fetchSmsBowerServiceCatalog(serviceId, options = {}) {
+  const webBase = options.webBase || DEFAULT_WEB_BASE;
+  const fetchImpl = options.fetchImpl || fetch;
+  const timeoutMs = options.timeoutMs || 20_000;
+  const url = new URL("/activations/getPricesByService", webBase);
+  url.searchParams.set("serviceId", String(serviceId));
+  url.searchParams.set("withPopular", "true");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetchImpl(url, { headers: { accept: "application/json" }, signal: controller.signal });
+    if (!res.ok) throw new SmsBowerError(`价格目录接口返回 HTTP ${res.status}`, { terminal: res.status < 500 });
+    return await res.json();
+  } catch (error) {
+    if (error?.name === "AbortError") throw new SmsBowerError("价格目录请求超时");
+    if (error instanceof SmsBowerError) throw error;
+    throw new SmsBowerError(`价格目录请求失败：${safeMessage(error?.message)}`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Trim the raw catalog for one service into { serviceCode, title, countries[] }.
+export function parseSmsBowerServiceCatalog(raw, serviceId) {
+  const svc = raw?.services?.[String(serviceId)];
+  if (!svc || typeof svc !== "object") return null;
+  const serviceCode = String(svc.activate_org_code || "");
+  const countries = Object.values(svc.countries || {})
+    .map((country) => {
+      const positions = Object.values(country.positions || {})
+        .map((p) => ({
+          rankId: Number(p?.rank?.id) || 0,
+          rank: String(p?.rank?.description || RANK_NAMES[p?.rank?.id] || ""),
+          price: Number(p?.price),
+          count: Number(p?.count) || 0,
+          agentId: Array.isArray(p?.agent_ids) ? Number(p.agent_ids[0]) || 0 : 0,
+        }))
+        .filter((p) => Number.isFinite(p.price) && p.price >= 0)
+        // Best quality first (gold=1 < silver=2 < bronze=3), then cheaper, then more stock.
+        .sort((a, b) => (a.rankId - b.rankId) || (a.price - b.price) || (b.count - a.count));
+      return {
+        code: String(country.activate_org_code ?? ""),
+        title: safeMessage(country.title || country.activate_org_code || ""),
+        iso: /^[A-Z]{2}$/.test(String(country.iso || "").toUpperCase()) ? String(country.iso).toUpperCase() : "",
+        prefix: String(country.prefix || "").replace(/\D/g, "").slice(0, 4),
+        count: Number(country.count) || 0,
+        minPrice: Number(country.min_price) || 0,
+        isPopular: Boolean(country.is_popular),
+        positions,
+      };
+    })
+    .filter((c) => /^\d{1,5}$/.test(c.code) && c.positions.length > 0)
+    .sort((a, b) => (Number(b.isPopular) - Number(a.isPopular)) || (b.count - a.count) || a.title.localeCompare(b.title));
+  return { serviceId: Number(serviceId), serviceCode, title: safeMessage(svc.title || ""), countries };
 }

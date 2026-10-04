@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Ban,
@@ -24,7 +24,10 @@ import {
   Network,
   LogIn,
   Mail,
+  Play,
+  Search,
   MailCheck,
+  Plug,
   Plus,
   RefreshCw,
   RotateCcw,
@@ -38,6 +41,7 @@ import {
 } from "lucide-react";
 import "./styles.css";
 import { t, tf, ts, tsLines, LANGS, getLang, setActiveLang, readInitialLang, persistLang, currentLocale, regionLabel } from "./i18n.js";
+import * as settingsStore from "./settings-store.js";
 
 const POLL_INTERVAL_MS = 900;
 const LUBAN_API_KEY_STORAGE_KEY = "chatgpt-onboarding.luban-api-key";
@@ -48,7 +52,7 @@ const SUB2API_UPLOAD_SETTINGS_KEY = "chatgpt-onboarding.sub2api-upload-settings-
 const ACCOUNT_PROXY_STORAGE_KEY = "chatgpt-onboarding.account-proxy-v1";
 const USE_MACHINE_IP_STORAGE_KEY = "chatgpt-onboarding.use-machine-ip-v1";
 const PROXY_LINK_CONFIG_KEY = "chatgpt-onboarding.proxy-link-config-v1";
-const DEFAULT_PROXY_LINK_CONFIG = { mode: "single", proxies: "", limitPerIp: 15 };
+const DEFAULT_PROXY_LINK_CONFIG = { mode: "single", proxies: "", limitPerIp: 15, cooldownMinutes: 10 };
 const SMS_PROVIDER_EXTERNAL_LINKS = {
   luban: {
     href: "https://lubansms.com/",
@@ -56,6 +60,10 @@ const SMS_PROVIDER_EXTERNAL_LINKS = {
   },
   smsbower: {
     href: "https://smsbower.app/cabinet/profile",
+    label: "点击获取 API 密钥",
+  },
+  smscode: {
+    href: "https://smscode.gg/dashboard",
     label: "点击获取 API 密钥",
   },
 };
@@ -69,7 +77,11 @@ function App() {
   const [batchText, setBatchText] = useState("");
   const [batchBusy, setBatchBusy] = useState(false);
   const [batchError, setBatchError] = useState("");
+  const [batchUnchecked, setBatchUnchecked] = useState(() => new Set()); // dòng bị bỏ chọn trong ô "Thêm hàng loạt"; còn lại sẽ chạy khi tạo tác vụ
   const [filterOpen, setFilterOpen] = useState(false);
+  const [emailSearch, setEmailSearch] = useState("");   // applied quick-search term (server-side, all pages)
+  const [emailSearchDraft, setEmailSearchDraft] = useState(""); // the search input's current text
+  const [bulkSearchInfo, setBulkSearchInfo] = useState({ count: 0, missing: [] }); // set when the search holds several emails
   const [filterText, setFilterText] = useState("");
   const [filterError, setFilterError] = useState("");
   const [emailFilter, setEmailFilter] = useState([]);
@@ -85,14 +97,16 @@ function App() {
   const [smsSettingsOpen, setSmsSettingsOpen] = useState(false);
   const [smsSettingsDraft, setSmsSettingsDraft] = useState(readSmsProviderSettings);
   const [smsSettingsError, setSmsSettingsError] = useState("");
+  // Per-number reuse cap + ledger stats — stored on the server (not localStorage).
+  const [phoneMaxUses, setPhoneMaxUses] = useState("1");
+  const [phoneUsageStats, setPhoneUsageStats] = useState(null); // { maxUses, totalNumbers, blocked, totalUses }
   const [smsNumberOptions, setSmsNumberOptions] = useState([]);
   const [smsOptionsLoading, setSmsOptionsLoading] = useState(false);
+  const [smsBalance, setSmsBalance] = useState(null);
+  const [smsCodeCatalog, setSmsCodeCatalog] = useState(null); // SMSCode: { balance, platforms, platformId, countries, countryId, operators:[{value,label,tiers,defaultTier}] }
   const [smsCatalog, setSmsCatalog] = useState(null); // SMSBower: { title, serviceCode, countries:[{code,title,positions:[...]}] }
   const [smsCountryQuery, setSmsCountryQuery] = useState(""); // filter text for the SMSBower country dropdown
   const [smsCountryOpen, setSmsCountryOpen] = useState(false); // open state of the searchable country dropdown
-  const [smsCostsOpen, setSmsCostsOpen] = useState(false);
-  const [smsCosts, setSmsCosts] = useState({ rows: [], totals: { charged: 0, chargedCount: 0, refundedCount: 0, heldCount: 0, currency: "$" } });
-  const [smsCostsLoading, setSmsCostsLoading] = useState(false);
   const [mailRequestSettings, setMailRequestSettings] = useState(readMailRequestSettings);
   const [mailRequestSettingsDraft, setMailRequestSettingsDraft] = useState(readMailRequestSettings);
   const [mailRequestSettingsOpen, setMailRequestSettingsOpen] = useState(false);
@@ -109,6 +123,7 @@ function App() {
   const [createCount, setCreateCount] = useState(10);
   const [createTag, setCreateTag] = useState("ChatGPT Team");
   const [createResult, setCreateResult] = useState(null); // { boxes, errors, domain, tag } after a create
+  const [createUnchecked, setCreateUnchecked] = useState(() => new Set()); // email bỏ chọn trong kết quả tạo email
   // "Danh sách email" — list existing mailboxes, filter by tag, copy / push to batch.
   const [listOpen, setListOpen] = useState(false);
   const [listBusy, setListBusy] = useState(false);
@@ -119,6 +134,9 @@ function App() {
   const [listSearch, setListSearch] = useState("");
   const [listSelected, setListSelected] = useState(() => new Set());
   const [listDeleting, setListDeleting] = useState("");
+  const [listCounts, setListCounts] = useState({ totalInStep4: 0, totalActiveStable: 0, totalDeactivated: 0, totalUncreated: 0 });
+  const [listTagging, setListTagging] = useState(false); // bulk-tagging untagged emails
+  const [listDeactivating, setListDeactivating] = useState(false); // deactivating orphan emails
   const [sub2apiSettings, setSub2apiSettings] = useState(readSub2ApiSettings);
   const [sub2apiSettingsDraft, setSub2apiSettingsDraft] = useState(readSub2ApiSettings);
   const [sub2apiGroups, setSub2apiGroups] = useState([]);
@@ -147,7 +165,7 @@ function App() {
   const [proxyCheck, setProxyCheck] = useState({ state: "idle", ip: "", url: "" }); // state: idle|checking|ok|fail
   const [proxyLinkConfig, setProxyLinkConfig] = useState(() => {
     try {
-      const stored = JSON.parse(window.localStorage.getItem(PROXY_LINK_CONFIG_KEY) || "null");
+      const stored = JSON.parse(settingsStore.getItem(PROXY_LINK_CONFIG_KEY) || "null");
       return { ...DEFAULT_PROXY_LINK_CONFIG, ...(stored && typeof stored === "object" ? stored : {}) };
     } catch {
       return { ...DEFAULT_PROXY_LINK_CONFIG };
@@ -161,6 +179,7 @@ function App() {
   const [proxyStatus, setProxyStatus] = useState(null); // { limitPerIp, activeCount, totalCount, remaining, proxies:[...] }
   const [proxyExpanded, setProxyExpanded] = useState(() => new Set()); // proxy labels whose email list is expanded
   const [proxyBulkText, setProxyBulkText] = useState(""); // dán nhanh danh sách proxy để nhận diện HTTP/SOCKS5
+  const [proxyFilter, setProxyFilter] = useState(null); // null=tất cả · "unused" · "inuse" · "used"
   const [lang, setLang] = useState(readInitialLang);
   setActiveLang(lang);
 
@@ -220,16 +239,20 @@ function App() {
   }, [accountProxyUrl, useMachineIp, token]);
 
   // ---- "Danh sách proxy IP": trạng thái kết nối + email đã đăng ký theo từng IP ----
-  async function fetchProxyStatus({ silent } = {}) {
+  async function fetchProxyStatus({ silent, refresh } = {}) {
     if (!token) return;
     if (!silent) { setProxyListBusy(true); setProxyListError(""); }
     try {
+      // "Danh sách proxy IP" luôn quản lý danh sách IP (batch), độc lập với chế độ đang chọn.
+      // refresh=true buộc đo lại exit IP; polling định kỳ dùng cache để chỉ làm
+      // mới số lần đăng ký theo thời gian thực mà không đo mạng liên tục.
       const data = await apiFetch(token, "/api/proxies/status", {
         method: "POST",
         body: JSON.stringify({
-          mode: proxyLinkConfig.mode,
-          proxies: proxyLinkConfig.mode === "batch" ? proxyLinkConfig.proxies : accountProxyUrl,
+          mode: "batch",
+          proxies: proxyLinkConfig.proxies,
           limitPerIp: Number(proxyLinkConfig.limitPerIp) || 15,
+          refresh: Boolean(refresh),
         }),
       });
       setProxyStatus(data);
@@ -243,8 +266,24 @@ function App() {
     setProxyListError("");
     setProxyExpanded(new Set());
     setProxyBulkText("");
-    setProxyListOpen(true);
-    void fetchProxyStatus();
+    setProxyFilter(null);
+    setProxyListOpen(true); // effect bên dưới sẽ tự lấy trạng thái theo danh sách proxy
+  }
+  // Xoá 1 proxy khỏi danh sách cấu hình theo IP (host). Chỉ áp dụng proxy đang cấu hình.
+  function removeProxy(host) {
+    setProxyLinkConfig((c) => {
+      const lines = String(c.proxies || "").split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+      const kept = lines.filter((line) => {
+        const e = parseProxyPasteList(line)[0];
+        return !e || e.host !== host;
+      });
+      return { ...c, proxies: kept.join("\n") };
+    });
+  }
+  async function copyProxyEmails(emails) {
+    const text = (emails || []).join("\n");
+    if (!text) return;
+    try { await navigator.clipboard.writeText(text); } catch {}
   }
   function toggleProxyEmails(label) {
     setProxyExpanded((prev) => {
@@ -256,20 +295,72 @@ function App() {
   // "kind": "socks5" | "http" | "all" — lấy các dòng khớp giao thức và thêm vào danh sách.
   function addBulkProxies(kind) {
     const entries = parseProxyPasteList(proxyBulkText);
-    const want = kind === "socks5" ? "socks5h" : kind === "http" ? "http" : null;
-    const picked = want ? entries.filter((e) => e.protocol === want) : entries;
+    const forced = kind === "socks5" ? "socks5h" : kind === "http" ? "http" : null;
+    // Nút SOCKS5/HTTP nhận cả dòng khớp giao thức LẪN dòng chưa rõ (ambiguous) và ép theo nút.
+    // "Thêm tất cả" giữ giao thức đã nhận diện.
+    const picked = forced
+      ? entries.filter((e) => e.ambiguous || e.protocol === forced)
+      : entries;
     if (!picked.length) return;
     let added = 0;
     setProxyLinkConfig((c) => {
       const lines = String(c.proxies || "").split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-      const existing = new Set(lines);
+      // Mỗi IP (host) chỉ được thêm 1 lần — tránh 1 IP dùng cả HTTP lẫn SOCKS5.
+      const existingHosts = new Set(parseProxyPasteList(lines.join("\n")).map((e) => e.host));
       for (const e of picked) {
-        if (!existing.has(e.url)) { existing.add(e.url); lines.push(e.url); added += 1; }
+        if (existingHosts.has(e.host)) continue;
+        existingHosts.add(e.host);
+        const scheme = forced || e.protocol;
+        const auth = e.user ? `${e.user}:${e.pass}@` : "";
+        lines.push(`${scheme}://${auth}${e.host}:${e.port}`);
+        added += 1;
       }
-      return { ...c, mode: "batch", proxies: lines.join("\n") };
+      // Chỉ cập nhật danh sách proxy, KHÔNG đổi chế độ — chế độ chỉ đổi trong "Cấu hình".
+      return { ...c, proxies: lines.join("\n") };
     });
-    if (added) { setProxyBulkText(""); void fetchProxyStatus(); }
+    if (added) setProxyBulkText(""); // effect theo dõi proxyLinkConfig.proxies sẽ tự làm mới bảng
   }
+  // Khi popup "Danh sách proxy IP" đang mở: tự lấy trạng thái theo danh sách hiện tại
+  // (mọi chế độ), và làm mới mỗi khi danh sách / giới hạn đổi.
+  useEffect(() => {
+    if (!proxyListOpen || !token) return undefined;
+    const timer = setTimeout(() => { void fetchProxyStatus({ silent: Boolean(proxyStatus) }); }, 250);
+    return () => clearTimeout(timer);
+  }, [proxyListOpen, proxyLinkConfig.proxies, proxyLinkConfig.limitPerIp, token]);
+  // Real-time refresh of the registration counts while the popup is open: poll
+  // every 3s (silent). The server caches the exit-IP probe, so this mainly
+  // recomputes "còn N lần đăng ký" as accounts reach the SMS step.
+  useEffect(() => {
+    if (!proxyListOpen || !token) return undefined;
+    const interval = setInterval(() => { void fetchProxyStatus({ silent: true }); }, 3_000);
+    return () => clearInterval(interval);
+  }, [proxyListOpen, proxyLinkConfig.proxies, proxyLinkConfig.limitPerIp, token]);
+  // Nếu 2 proxy có cùng IP xuất (một bản nhập bằng IP, một bản nhập bằng domain),
+  // tự thay thế: giữ bản domain, bỏ bản nhập bằng IP thô.
+  useEffect(() => {
+    if (!proxyStatus || !Array.isArray(proxyStatus.proxies)) return;
+    const isDomain = (host) => /[a-z]/i.test(String(host || ""));
+    const byExit = new Map();
+    for (const p of proxyStatus.proxies) {
+      if (!p.configured || !p.connected || !p.ip) continue;
+      if (!byExit.has(p.ip)) byExit.set(p.ip, []);
+      byExit.get(p.ip).push(p);
+    }
+    const removeHosts = new Set();
+    for (const group of byExit.values()) {
+      if (group.length < 2 || !group.some((p) => isDomain(p.host))) continue;
+      for (const p of group) if (!isDomain(p.host)) removeHosts.add(p.host);
+    }
+    if (!removeHosts.size) return;
+    setProxyLinkConfig((c) => {
+      const lines = String(c.proxies || "").split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+      const kept = lines.filter((line) => {
+        const e = parseProxyPasteList(line)[0];
+        return !e || !removeHosts.has(e.host);
+      });
+      return { ...c, proxies: kept.join("\n") };
+    });
+  }, [proxyStatus]);
   // Ở chế độ "nhiều IP": tự động (debounce) lấy trạng thái để ô tóm tắt trên thanh công cụ hiển thị số IP hoạt động.
   useEffect(() => {
     if (!token || proxyLinkConfig.mode !== "batch") return undefined;
@@ -322,10 +413,10 @@ function App() {
     let timer;
     const poll = async () => {
       try {
-        const data = emailFilter.length
+        const data = (emailFilter.length || emailSearch.trim())
           ? await apiFetch(token, "/api/jobs/query", {
               method: "POST",
-              body: JSON.stringify({ page, emails: emailFilter }),
+              body: JSON.stringify({ page, emails: emailFilter, search: emailSearch.trim() }),
             })
           : await apiFetch(token, `/api/jobs?page=${page}`);
         if (!stopped) {
@@ -333,6 +424,7 @@ function App() {
           setJobSelectionIndex(data.selection || data.jobs);
           setPagination(data.pagination || { page, pageSize: 20, total: data.jobs.length, totalPages: 1 });
           setStats(data.stats || { active: 0, queued: 0, completed: 0 });
+          setBulkSearchInfo({ count: data.filter?.searchEmails || 0, missing: data.filter?.missing || [] });
           if (data.pagination?.page && data.pagination.page !== page) setPage(data.pagination.page);
           setError("");
         }
@@ -347,7 +439,7 @@ function App() {
       stopped = true;
       window.clearTimeout(timer);
     };
-  }, [token, page, emailFilter]);
+  }, [token, page, emailFilter, emailSearch]);
 
   useEffect(() => {
     if (!token || !features.sub2apiMonitor) return undefined;
@@ -379,6 +471,22 @@ function App() {
     () => resolveSmsProvider(smsProviderDefinitions, smsSettingsDraft),
     [smsProviderDefinitions, smsSettingsDraft, lang],
   );
+  const smsCodePlatformItems = useMemo(
+    () => (smsCodeCatalog?.platforms || []).map((platform) => ({
+      value: platform.value,
+      text: platform.label,
+      search: platform.label.toLowerCase(),
+    })),
+    [smsCodeCatalog],
+  );
+  const smsCodeCountryItems = useMemo(
+    () => (smsCodeCatalog?.countries || []).map((country) => ({
+      value: country.value,
+      text: formatSmsCodeCountry(country),
+      search: `${country.label} ${country.code} ${country.dialCode}`.toLowerCase(),
+    })),
+    [smsCodeCatalog, lang],
+  );
   const selectedJobs = useMemo(
     () => jobSelectionIndex.filter((job) => selectedJobIds.has(job.id)),
     [jobSelectionIndex, selectedJobIds],
@@ -399,12 +507,23 @@ function App() {
   const passwordAddSelectedCount = selectedJobs.filter((job) => job.canAddPassword).length;
   const canAddPasswordSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && passwordAddSelectedCount > 0;
+  const startableSelectedCount = selectedJobs.filter((job) => job.canStart).length;
+  const canStartSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
+    && startableSelectedCount > 0;
 
-  function openSmsSettings() {
+  async function openSmsSettings() {
     const draft = withSmsProviderDefaults(smsProviderDefinitions, smsSettings);
     setSmsSettingsDraft(draft);
     setSmsSettingsError("");
+    setSmsCodeCatalog(null);
     setSmsSettingsOpen(true);
+    if (token) {
+      try {
+        const data = await apiFetch(token, "/api/sms/number-usage");
+        setPhoneUsageStats(data);
+        setPhoneMaxUses(String(data.maxUses ?? 1));
+      } catch { /* keep last known value */ }
+    }
   }
 
   function openMailRequestSettings() {
@@ -591,23 +710,71 @@ function App() {
         method: "POST",
         body: JSON.stringify({ config: resolved.config }),
       });
-      const options = Array.isArray(data.options) ? data.options : [];
-      setSmsNumberOptions(options);
-      const current = resolved.config.maxPrice
-        ? options.find((option) => option.country === resolved.config.country) || options[0]
-        : options[0];
-      if (!current) throw new Error(t("当前没有可购买的国家号码"));
-      updateSmsProviderConfig(resolved.id, {
-        country: current.country,
-        maxPrice: String(current.price),
-        countryLabel: formatSmsCountryName(current),
-      });
+      if (resolved.id === "viotp") {
+        const services = Array.isArray(data.options?.services) ? data.options.services : [];
+        setSmsNumberOptions(services);
+        setSmsBalance(data.options?.balance || null);
+        if (services.length === 0) throw new Error(t("当前没有可用的服务"));
+        const current = services.find((s) => s.value === resolved.config.serviceId)
+          || services.find((s) => /openai|chatgpt/i.test(s.label))
+          || services[0];
+        updateSmsProviderConfig(resolved.id, {
+          serviceId: current.value,
+          serviceLabel: current.label,
+        });
+      } else if (resolved.id === "smscode") {
+        const catalog = normalizeSmsCodeCatalog(data.options);
+        if (catalog.platforms.length === 0) throw new Error(t("当前没有可用的服务"));
+        setSmsCodeCatalog(catalog);
+        updateSmsProviderConfig(resolved.id, pickSmsCodeSelection(catalog, resolved.config));
+      } else {
+        const options = Array.isArray(data.options) ? data.options : [];
+        setSmsNumberOptions(options);
+        const current = resolved.config.maxPrice
+          ? options.find((option) => option.country === resolved.config.country) || options[0]
+          : options[0];
+        if (!current) throw new Error(t("当前没有可购买的国家号码"));
+        updateSmsProviderConfig(resolved.id, {
+          country: current.country,
+          maxPrice: String(current.price),
+          countryLabel: formatSmsCountryName(current),
+        });
+      }
     } catch (requestError) {
       setSmsNumberOptions([]);
+      setSmsBalance(null);
+      setSmsCodeCatalog(null);
       setSmsSettingsError(requestError.message);
     } finally {
       setSmsOptionsLoading(false);
     }
+  }
+
+  // SMSCode cascade: operators and prices belong to one platform + country, so a change of either queries again.
+  function changeSmsCodeSelection(change) {
+    const next = {
+      ...smsSettingsDraft,
+      configs: {
+        ...(smsSettingsDraft.configs || {}),
+        smscode: {
+          ...(smsSettingsDraft.configs?.smscode || {}),
+          // Everything below the changed level is derived again from the fresh catalog.
+          countryLabel: "",
+          catalogProductId: "",
+          operatorId: "",
+          operatorLabel: "",
+          maxPriceIdr: "",
+          maxPrice: "",
+          serviceLabel: "",
+          ...change,
+        },
+      },
+    };
+    setSmsSettingsDraft(next);
+    setSmsCodeCatalog((catalog) => (catalog
+      ? { ...catalog, operators: [], countries: "platformId" in change ? [] : catalog.countries }
+      : catalog));
+    loadSmsNumberOptions(next);
   }
 
   async function loadSmsCatalog() {
@@ -654,21 +821,6 @@ function App() {
     });
   }
 
-  async function openSmsCosts() {
-    setSmsCostsOpen(true);
-    setSmsCostsLoading(true);
-    try {
-      const data = await apiFetch(token, "/api/sms-costs");
-      setSmsCosts({
-        rows: Array.isArray(data.rows) ? data.rows : [],
-        totals: data.totals || { charged: 0, chargedCount: 0, refundedCount: 0, heldCount: 0, currency: "$" },
-      });
-    } catch {
-      setSmsCosts({ rows: [], totals: { charged: 0, chargedCount: 0, refundedCount: 0, heldCount: 0, currency: "$" } });
-    } finally {
-      setSmsCostsLoading(false);
-    }
-  }
 
   function updateSmsProviderConfig(providerId, values) {
     setSmsSettingsDraft((current) => ({
@@ -683,7 +835,7 @@ function App() {
     }));
   }
 
-  function saveSmsSettings(event) {
+  async function saveSmsSettings(event) {
     event.preventDefault();
     const resolved = resolveSmsProvider(smsProviderDefinitions, smsSettingsDraft);
     if (!resolved.definition) {
@@ -704,6 +856,21 @@ function App() {
         return;
       }
     }
+    // Persist the per-number reuse cap on the server (not in the browser).
+    const n = Number(phoneMaxUses);
+    if (!Number.isInteger(n) || n < 0 || n > 1000) {
+      setSmsSettingsError(t("使用次数上限必须是 0 到 1000 的整数"));
+      return;
+    }
+    try {
+      if (token) {
+        const data = await apiFetch(token, "/api/sms/number-usage", { method: "POST", body: JSON.stringify({ maxUses: n }) });
+        setPhoneUsageStats(data);
+      }
+    } catch (error) {
+      setSmsSettingsError(error.message);
+      return;
+    }
     setSmsSettings(withSmsProviderDefaults(smsProviderDefinitions, smsSettingsDraft));
     setSmsSettingsOpen(false);
     setSmsSettingsError("");
@@ -722,15 +889,36 @@ function App() {
     setExpandedJobId(null);
   }, [page]);
 
+  // Chế độ nhiều IP: gửi danh sách để backend tự gán IP kế tiếp (round-robin, theo giới hạn).
+  // Chế độ 1 IP: gửi proxy đang nhập ở thanh công cụ.
+  const proxyBatchMode = proxyLinkConfig.mode === "batch";
+  function newJobProxyPayload() {
+    return proxyBatchMode
+      ? { proxyMode: "batch", proxies: proxyLinkConfig.proxies, limitPerIp: Number(proxyLinkConfig.limitPerIp) || 15 }
+      : { proxyUrl: accountProxyUrl.trim() };
+  }
+  // Với thao tác trên tài khoản đã có (cấp lại/đăng nhập lại…): ở chế độ nhiều IP giữ nguyên proxy đã gán.
+  function reuseProxyPayload() {
+    return proxyBatchMode ? {} : { proxyUrl: accountProxyUrl.trim() };
+  }
+  function ensureProxyReady(setErr) {
+    if (proxyBatchMode) {
+      if (!parseProxyPasteList(proxyLinkConfig.proxies).length) { setErr(t("请先在“代理 IP 列表”中添加代理 IP")); return false; }
+      return true;
+    }
+    if (!accountProxyUrl.trim() && !useMachineIp) { setErr(t("必须先配置代理 IP，或在“格式”里选择“本机 IP”")); return false; }
+    return true;
+  }
+
   async function createJob(event) {
     event.preventDefault();
     if (!email.trim() || busy) return;
-    if (!accountProxyUrl.trim() && !useMachineIp) { setError(t("必须先配置代理 IP，或在“格式”里选择“本机 IP”")); return; }
+    if (!ensureProxyReady(setError)) return;
     setBusy(true);
     try {
       const data = await apiFetch(token, "/api/jobs", {
         method: "POST",
-        body: JSON.stringify({ email: email.trim(), proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({ email: email.trim(), ...newJobProxyPayload() }),
       });
       setPage(1);
       if (page === 1) setJobs((current) => mergeJobs([data.job], current).slice(0, 20));
@@ -743,21 +931,66 @@ function App() {
     }
   }
 
+  // Ô "Thêm hàng loạt" giữ nguyên là nguồn dữ liệu (textarea). Dưới nó liệt kê
+  // từng dòng kèm ô tick: bỏ tick để loại khỏi lần chạy này, nút xoá để bỏ hẳn.
+  const batchLines = useMemo(
+    () => batchText.split(/\r?\n/).map((raw) => raw.trim()).filter(Boolean)
+      .map((raw) => ({ raw, email: extractLineEmail(raw) })),
+    [batchText],
+  );
+  // Còn được tick (không nằm trong batchUnchecked) = sẽ tạo tác vụ.
+  const batchRunLines = useMemo(
+    () => batchLines.filter((line) => !batchUnchecked.has(line.raw)),
+    [batchLines, batchUnchecked],
+  );
+  const batchAllChecked = batchLines.length > 0 && batchRunLines.length === batchLines.length;
+
+  function toggleBatchLine(raw) {
+    setBatchUnchecked((prev) => {
+      const next = new Set(prev);
+      if (next.has(raw)) next.delete(raw); else next.add(raw);
+      return next;
+    });
+  }
+
+  function toggleAllBatchLines() {
+    setBatchUnchecked((prev) => {
+      // Đang chọn hết → bỏ chọn hết; ngược lại → chọn hết.
+      if (!prev.size) return new Set(batchLines.map((line) => line.raw));
+      return new Set();
+    });
+  }
+
+  function removeBatchLine(raw) {
+    setBatchText((prev) => prev.split(/\r?\n/).filter((line) => line.trim() !== raw).join("\n"));
+    setBatchUnchecked((prev) => {
+      if (!prev.has(raw)) return prev;
+      const next = new Set(prev);
+      next.delete(raw);
+      return next;
+    });
+  }
+
   async function createBatch(event) {
     event.preventDefault();
-    if (!batchText.trim() || batchBusy) return;
-    if (!accountProxyUrl.trim() && !useMachineIp) { setBatchError(t("必须先配置代理 IP，或在“格式”里选择“本机 IP”")); return; }
+    const runText = batchRunLines.map((line) => line.raw).join("\n");
+    if (!runText.trim() || batchBusy) return;
+    if (!ensureProxyReady(setBatchError)) return;
     setBatchBusy(true);
     try {
       const data = await apiFetch(token, "/api/jobs/batch", {
         method: "POST",
-        body: JSON.stringify({ text: batchText, proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({ text: runText, ...newJobProxyPayload() }),
       });
       setPage(1);
       if (page === 1) setJobs((current) => mergeJobs(data.jobs, current).slice(0, 20));
-      setBatchText("");
-      setBatchError("");
-      setBatchOpen(false);
+      // Chỉ tạo tác vụ cho dòng đã tick; dòng bỏ tick giữ lại trong ô để chạy sau.
+      const ran = new Set(batchRunLines.map((line) => line.raw));
+      const remaining = batchLines.filter((line) => !ran.has(line.raw)).map((line) => line.raw);
+      setBatchText(remaining.join("\n"));
+      setBatchUnchecked(new Set());
+      setBatchError(data.canceled ? tf("已自动取消 {0} 个账号：所在代理 IP 的注册名额已满", data.canceled) : "");
+      if (!remaining.length) setBatchOpen(false);
       setError("");
     } catch (requestError) {
       setBatchError(requestError.message);
@@ -797,9 +1030,11 @@ function App() {
         method: "POST",
         body: JSON.stringify({ count: Number(createCount), domain, tag: createTag.trim() }),
       });
-      // Show the created addresses in the popup; the user then copies them or
-      // pushes them into the batch box.
+      // Only create the mailboxes and show them in the popup. Do NOT add them to the
+      // step-4 task list here — the user pushes them to the batch box and presses
+      // "Thêm tác vụ" to create tasks, as before.
       setCreateResult({ boxes: data.boxes || [], errors: data.errors || [], domain, tag: createTag.trim() });
+      setCreateUnchecked(new Set());
       setError("");
     } catch (requestError) {
       setCreateError(requestError.message);
@@ -809,17 +1044,20 @@ function App() {
   }
 
   function sendCreatedToBatch() {
-    const lines = (createResult?.boxes || []).map((box) => box.line).join("\n");
+    const checked = (createResult?.boxes || []).filter((box) => !createUnchecked.has(box.email));
+    const lines = checked.map((box) => box.line).join("\n");
     if (!lines) return;
     setBatchText((prev) => (prev.trim() ? `${prev.trim()}\n${lines}` : lines));
     setCreateResult(null);
     setCreateOpen(false);
+    setCreateUnchecked(new Set());
     setBatchError("");
     setBatchOpen(true);
   }
 
   async function copyCreatedEmails() {
-    const text = (createResult?.boxes || []).map((box) => box.email).join("\n");
+    const checked = (createResult?.boxes || []).filter((box) => !createUnchecked.has(box.email));
+    const text = checked.map((box) => box.email).join("\n");
     if (!text) return;
     try { await navigator.clipboard.writeText(text); } catch {}
   }
@@ -839,30 +1077,42 @@ function App() {
     [mailboxes, mailRequestSettings.domains],
   );
 
-  // Đếm số email đã / chưa tạo tài khoản để hiện trên chip lọc.
+  // Đếm số email đã / chưa tạo tài khoản + đã vô hiệu hoá để hiện trên chip lọc.
+  // Email vô hiệu hoá tách thành nhóm riêng, không tính vào đã tạo / chưa tạo.
+  const deactivatedCount = useMemo(
+    () => scopedMailboxes.filter((m) => m.deactivated).length,
+    [scopedMailboxes],
+  );
   const accountCreatedCount = useMemo(
-    () => scopedMailboxes.filter((m) => m.accountCreated).length,
+    () => scopedMailboxes.filter((m) => m.accountCreated && !m.deactivated).length,
     [scopedMailboxes],
   );
   const accountFilterChips = useMemo(() => [
     { value: null, label: "全部", count: scopedMailboxes.length },
-    { value: "uncreated", label: "未创建", count: scopedMailboxes.length - accountCreatedCount },
+    { value: "uncreated", label: "未创建", count: scopedMailboxes.filter((m) => !m.accountCreated && !m.deactivated).length },
     { value: "created", label: "已创建", count: accountCreatedCount },
-  ], [scopedMailboxes, accountCreatedCount]);
+    { value: "deactivated", label: "已停用", count: deactivatedCount },
+  ], [scopedMailboxes, accountCreatedCount, deactivatedCount]);
 
   const visibleMailboxes = useMemo(() => {
     const q = listSearch.trim().toLowerCase();
     const filtered = scopedMailboxes.filter((m) => {
       if (listTag !== null && (m.tag || UNTAGGED) !== listTag) return false;
-      if (listAccountFilter === "created" && !m.accountCreated) return false;
-      if (listAccountFilter === "uncreated" && m.accountCreated) return false;
+      if (listAccountFilter === "created" && (!m.accountCreated || m.deactivated)) return false;
+      if (listAccountFilter === "uncreated" && (m.accountCreated || m.deactivated)) return false;
+      if (listAccountFilter === "deactivated" && !m.deactivated) return false;
       if (q && !`${m.email} ${m.tag || ""} ${m.category || ""}`.toLowerCase().includes(q)) return false;
       return true;
     });
-    // Email đã tạo tài khoản luôn nằm cuối danh sách (giữ nguyên thứ tự trong mỗi nhóm).
+    // Email vô hiệu hoá luôn ở cuối, rồi tới email đã tạo tài khoản (giữ nguyên
+    // thứ tự trong mỗi nhóm).
     return filtered
       .map((m, i) => [m, i])
-      .sort(([a, ai], [b, bi]) => (a.accountCreated === b.accountCreated ? ai - bi : a.accountCreated ? 1 : -1))
+      .sort(([a, ai], [b, bi]) => {
+        if (a.deactivated !== b.deactivated) return a.deactivated ? 1 : -1;
+        if (a.accountCreated !== b.accountCreated) return a.accountCreated ? 1 : -1;
+        return ai - bi;
+      })
       .map(([m]) => m);
   }, [scopedMailboxes, listTag, listAccountFilter, listSearch]);
 
@@ -879,6 +1129,12 @@ function App() {
     try {
       const data = await apiFetch(token, "/api/mail/mailboxes");
       setMailboxes(data.mailboxes || []);
+      setListCounts({
+        totalInStep4: data.totalInStep4 ?? 0,
+        totalActiveStable: data.totalActiveStable ?? 0,
+        totalDeactivated: data.totalDeactivated ?? 0,
+        totalUncreated: data.totalUncreated ?? 0,
+      });
     } catch (requestError) {
       setListError(requestError.message);
     } finally {
@@ -946,6 +1202,42 @@ function App() {
     }
   }
 
+  async function batchTagUntagged() {
+    const untagged = scopedMailboxes.filter((m) => !m.tag && !m.accountCreated && !m.deactivated);
+    if (!untagged.length) { setListError(t("没有需要补打标签的邮箱")); return; }
+    if (!window.confirm(tf("将为 {0} 个无标签邮箱补打「ChatGPT Team」标签，确认？", untagged.length))) return;
+    setListTagging(true);
+    setListError("");
+    try {
+      const data = await apiFetch(token, "/api/mail/batch-tag", {
+        method: "POST",
+        body: JSON.stringify({ emails: untagged.map((m) => m.email), tag: "ChatGPT Team" }),
+      });
+      setListError("");
+      await openMailboxList();
+    } catch (requestError) {
+      setListError(requestError.message);
+    } finally {
+      setListTagging(false);
+    }
+  }
+
+  async function deactivateOrphans() {
+    const orphans = scopedMailboxes.filter((m) => !m.accountCreated && !m.deactivated);
+    if (!orphans.length) { setListError(t("没有需要停用的邮箱")); return; }
+    if (!window.confirm(tf("将停用 {0} 个有 ChatGPT Team 标签但未在步骤 4 的邮箱，确认？", orphans.length))) return;
+    setListDeactivating(true);
+    setListError("");
+    try {
+      await apiFetch(token, "/api/mail/deactivate-orphans", { method: "POST" });
+      await openMailboxList();
+    } catch (requestError) {
+      setListError(requestError.message);
+    } finally {
+      setListDeactivating(false);
+    }
+  }
+
   function applyEmailFilter(event) {
     event.preventDefault();
     try {
@@ -1009,13 +1301,36 @@ function App() {
     }
   }
 
+  async function startSelectedJobs() {
+    if (!canStartSelected || batchAction) return;
+    if (!ensureProxyReady(setError)) return;
+    setBatchAction("start");
+    try {
+      const data = await apiFetch(token, "/api/jobs/start-batch", {
+        method: "POST",
+        body: JSON.stringify({
+          ids: [...selectedJobIds],
+          ...reuseProxyPayload(),
+          // Chế độ nhiều IP: gửi giới hạn để server chặn theo số chỗ còn lại của IP.
+          ...(proxyBatchMode ? { limitPerIp: Number(proxyLinkConfig.limitPerIp) || 15 } : {}),
+        }),
+      });
+      setSelectedJobIds(new Set());
+      setError(data.canceled ? tf("已自动取消 {0} 个账号：所在代理 IP 的注册名额已满", data.canceled) : "");
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBatchAction("");
+    }
+  }
+
   async function reauthorizeSelected() {
     if (!canReauthorizeSelected || batchAction) return;
     setBatchAction("reauthorize");
     try {
       await apiFetch(token, "/api/jobs/reauthorize-batch", {
         method: "POST",
-        body: JSON.stringify({ ids: [...selectedJobIds], proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({ ids: [...selectedJobIds], ...reuseProxyPayload() }),
       });
       setSelectedJobIds(new Set());
       setError("");
@@ -1035,7 +1350,7 @@ function App() {
     try {
       const data = await apiFetch(token, "/api/jobs/setup-2fa-batch", {
         method: "POST",
-        body: JSON.stringify({ ids: [...selectedJobIds], proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({ ids: [...selectedJobIds], ...reuseProxyPayload() }),
       });
       setUploadNotice(`${tf("已开始为 {0} 个账号设置 2FA", data.started)}${data.skipped ? tf("，跳过 {0} 个", data.skipped) : ""}`);
       setSelectedJobIds(new Set());
@@ -1056,7 +1371,7 @@ function App() {
     try {
       const data = await apiFetch(token, "/api/jobs/add-password-batch", {
         method: "POST",
-        body: JSON.stringify({ ids: [...selectedJobIds], proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({ ids: [...selectedJobIds], ...reuseProxyPayload() }),
       });
       setUploadNotice(`${tf("已开始为 {0} 个账号添加密码", data.started)}${data.skipped ? tf("，跳过 {0} 个", data.skipped) : ""}`);
       setSelectedJobIds(new Set());
@@ -1077,7 +1392,7 @@ function App() {
     try {
       const data = await apiFetch(token, "/api/jobs/relogin-batch", {
         method: "POST",
-        body: JSON.stringify({ ids: [...selectedJobIds], proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({ ids: [...selectedJobIds], ...reuseProxyPayload() }),
       });
       setUploadNotice(`${tf("已开始重新登录并授权 {0} 个账号", data.started)}${data.skipped ? tf("，跳过 {0} 个", data.skipped) : ""}`);
       setSelectedJobIds(new Set());
@@ -1155,6 +1470,7 @@ function App() {
         </div>
         <div className="topbar-right">
           <div className="summary" aria-label={t("任务统计")}>
+            <span><i className="status-dot idle" />{t("待启动")} <strong>{stats.idle || 0}</strong></span>
             <span><i className="status-dot active" />{t("进行中")} <strong>{stats.active}</strong></span>
             <span><i className="status-dot queued" />{t("排队中")} <strong>{stats.queued || 0}</strong></span>
             <span><i className="status-dot complete" />{t("已完成")} <strong>{stats.completed}</strong></span>
@@ -1188,36 +1504,38 @@ function App() {
           <div className="step-body">
             <div className="provider-toolbar account-proxy-toolbar" aria-label={t("代理 IP 配置")}>
               <div className="provider-heading"><Globe2 size={17} /><strong>{t("代理 IP")}</strong></div>
-              <div className="account-proxy-input" style={{ display: "flex", gap: 0, alignItems: "center", flex: "1 1 auto", minWidth: 0, maxWidth: "min(480px, 50vw)" }}>
-                <div className="proxy-fmt-dropdown" title={t("将 proxy host:port:user:pass 转为正确格式的 URL（socks5h/http）")}>
-                  <span className="proxy-fmt-trigger">{useMachineIp ? t("本机 IP") : t("格式")} <ChevronDown size={13} /></span>
-                  <div className="proxy-fmt-menu">
-                    <button type="button" onClick={() => { setUseMachineIp(false); setAccountProxyUrl((v) => toProxyUrl(v, "socks5h")); }}>SOCKS5</button>
-                    <button type="button" onClick={() => { setUseMachineIp(false); setAccountProxyUrl((v) => toProxyUrl(v, "http")); }}>HTTP</button>
-                    <button type="button" onClick={chooseMachineIp}>{t("本机 IP")}</button>
+              {proxyLinkConfig.mode !== "batch" && (
+                <div className="account-proxy-input" style={{ display: "flex", gap: 0, alignItems: "center", flex: "1 1 auto", minWidth: 0, maxWidth: "min(480px, 50vw)" }}>
+                  <div className="proxy-fmt-dropdown" title={t("将 proxy host:port:user:pass 转为正确格式的 URL（socks5h/http）")}>
+                    <span className="proxy-fmt-trigger">{useMachineIp ? t("本机 IP") : t("格式")} <ChevronDown size={13} /></span>
+                    <div className="proxy-fmt-menu">
+                      <button type="button" onClick={() => { setUseMachineIp(false); setAccountProxyUrl((v) => toProxyUrl(v, "socks5h")); }}>SOCKS5</button>
+                      <button type="button" onClick={() => { setUseMachineIp(false); setAccountProxyUrl((v) => toProxyUrl(v, "http")); }}>HTTP</button>
+                      <button type="button" onClick={chooseMachineIp}>{t("本机 IP")}</button>
+                    </div>
                   </div>
+                  <label className="provider-field account-proxy-field" style={{ flex: 1, minWidth: 0, width: "auto", borderTopLeftRadius: 0, borderBottomLeftRadius: 0, marginLeft: -1 }} title={t("支持 http://、https://、socks5:// 和 socks5h://；用户名中包含 -sid- 时会自动轮换会话编号")}>
+                    <Globe2 size={15} aria-hidden="true" />
+                    <input
+                      value={useMachineIp ? (machineIpBusy ? t("正在获取本机 IP…") : (machineIp ? tf("本机 IP：{0}", machineIp) : t("本机 IP（无代理）"))) : accountProxyUrl}
+                      onChange={(event) => { setUseMachineIp(false); setAccountProxyUrl(event.target.value); }}
+                      placeholder={t("socks5h://用户名:密码@主机:端口")}
+                      spellCheck="false"
+                      aria-label={t("代理 IP 地址")}
+                      readOnly={useMachineIp}
+                      style={useMachineIp ? { cursor: "default" } : undefined}
+                    />
+                  </label>
                 </div>
-                <label className="provider-field account-proxy-field" style={{ flex: 1, minWidth: 0, width: "auto", borderTopLeftRadius: 0, borderBottomLeftRadius: 0, marginLeft: -1 }} title={t("支持 http://、https://、socks5:// 和 socks5h://；用户名中包含 -sid- 时会自动轮换会话编号")}>
-                  <Globe2 size={15} aria-hidden="true" />
-                  <input
-                    value={useMachineIp ? (machineIpBusy ? t("正在获取本机 IP…") : (machineIp ? tf("本机 IP：{0}", machineIp) : t("本机 IP（无代理）"))) : accountProxyUrl}
-                    onChange={(event) => { setUseMachineIp(false); setAccountProxyUrl(event.target.value); }}
-                    placeholder={t("socks5h://用户名:密码@主机:端口")}
-                    spellCheck="false"
-                    aria-label={t("代理 IP 地址")}
-                    readOnly={useMachineIp}
-                    style={useMachineIp ? { cursor: "default" } : undefined}
-                  />
-                </label>
-              </div>
+              )}
               {proxyLinkConfig.mode === "batch" ? (
-                <span className={`provider-ready ${proxyStatus && proxyStatus.activeCount ? "" : "incomplete"}`}>
+                <span className={`provider-ready ${proxyStatus && proxyStatus.activeCount ? "" : "incomplete"}`} style={{ flex: "1 1 auto", minWidth: 0 }}>
                   {proxyStatus
                     ? (proxyStatus.activeCount ? <Check size={14} /> : <CircleAlert size={14} />)
-                    : <LoaderCircle className="spin" size={14} />}
+                    : (proxyLinkConfig.proxies.trim() ? <LoaderCircle className="spin" size={14} /> : <CircleAlert size={14} />)}
                   {proxyStatus
                     ? tf("{0} 个 IP 活跃 · 剩余约 {1} 次注册", proxyStatus.activeCount, proxyStatus.remaining)
-                    : t("批量模式 · 正在统计代理")}
+                    : (proxyLinkConfig.proxies.trim() ? t("批量模式 · 正在统计代理") : t("批量模式 · 请添加代理"))}
                 </span>
               ) : (
                 <span className={`provider-ready ${(useMachineIp || accountProxyUrl.trim()) && proxyCheck.state !== "fail" ? "" : "incomplete"}`}>
@@ -1368,9 +1686,6 @@ function App() {
                 <p>{emailFilter.length
                   ? tf("匹配 {0} 条，共 {1} 条任务", pagination.total, pagination.totalAll ?? pagination.total)
                   : (pagination.total ? tf("共 {0} 条任务", pagination.total) : t("添加邮箱后开始第一条任务"))}</p>
-                <button type="button" className="selection-text-button" style={{ marginTop: 6 }} onClick={openSmsCosts} disabled={!token}>
-                  <FileText size={14} /> {t("短信费用")}
-                </button>
               </div>
               <form className="add-form" onSubmit={createJob}>
                 <div className="email-field">
@@ -1437,6 +1752,62 @@ function App() {
           </div>
         )}
 
+        {/* Quick email search — filters the task list across every page (step 4) */}
+        <div
+          className="task-search"
+          style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", margin: "2px 0 14px" }}
+        >
+          <div className="email-field" style={{ flex: "1 1 220px", maxWidth: 360 }}>
+            <Search size={16} aria-hidden="true" />
+            <input
+              type="search"
+              value={emailSearchDraft}
+              onChange={(event) => {
+                const v = event.target.value;
+                setEmailSearchDraft(v);
+                clearTimeout(window._emailSearchTimer);
+                window._emailSearchTimer = setTimeout(() => { setEmailSearch(v.trim()); setPage(1); }, 300);
+              }}
+              onPaste={(event) => {
+                // A bulk paste (e.g. a copied account table) is reduced to its emails before the
+                // single-line input can strip the line breaks and glue neighbouring cells together.
+                const emails = extractEmails(event.clipboardData?.getData("text"));
+                if (emails.length < 2) return;
+                event.preventDefault();
+                const v = emails.join(", ");
+                clearTimeout(window._emailSearchTimer);
+                setEmailSearchDraft(v);
+                setEmailSearch(v);
+                setPage(1);
+              }}
+              placeholder={t("按邮箱搜索任务")}
+              aria-label={t("搜索邮箱")}
+              disabled={!token}
+            />
+          </div>
+          {emailSearch && (
+            <>
+              <span style={{ fontSize: 12.5, opacity: 0.7 }}>
+                {bulkSearchInfo.count > 1
+                  ? tf("{0} 个邮箱，找到 {1} 条", bulkSearchInfo.count, pagination.total)
+                  : tf("找到 {0} 条", pagination.total)}
+              </span>
+              {bulkSearchInfo.count > 1 && bulkSearchInfo.missing.length > 0 && (
+                <span style={{ fontSize: 12.5, color: "#b4532a" }} title={bulkSearchInfo.missing.join("\n")}>
+                  {tf("{0} 个邮箱没有任务", bulkSearchInfo.missing.length)}
+                </span>
+              )}
+              <button
+                type="button"
+                className="selection-text-button clear-filter-button"
+                onClick={() => { clearTimeout(window._emailSearchTimer); setEmailSearchDraft(""); setEmailSearch(""); setPage(1); }}
+              >
+                {t("清除搜索")}
+              </button>
+            </>
+          )}
+        </div>
+
         {features.bulkActions && jobs.length > 0 && (
           <div className="selection-toolbar">
             <div className="selection-summary">
@@ -1449,6 +1820,16 @@ function App() {
               </button>
             </div>
             <div className="bulk-actions">
+              <button
+                type="button"
+                className="start-button bulk-button"
+                onClick={startSelectedJobs}
+                disabled={!canStartSelected || Boolean(batchAction)}
+                title={t("将选中的待启动任务加入队列并开始运行")}
+              >
+                {batchAction === "start" ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}
+                {t("开始运行")}
+              </button>
               {features.cancelAll && (
                 <button
                   type="button"
@@ -1548,6 +1929,8 @@ function App() {
                     passwordAddAvailable={Boolean(features.passwordAdd)}
                     forceReloginAvailable={Boolean(features.forceRelogin)}
                     accountProxyUrl={accountProxyUrl}
+                    proxyBatchMode={proxyBatchMode}
+                    sub2apiConfig={sub2apiSettings}
                   />
                   {expandedJobId === job.id && (
                     <tr className="log-row">
@@ -1602,6 +1985,9 @@ function App() {
                       selectedProviderId: provider.id,
                     }));
                     setSmsSettingsError("");
+                    setSmsNumberOptions([]);
+                    setSmsBalance(null);
+                    setSmsCodeCatalog(null);
                   }}
                 >
                   {ts(provider.name)}
@@ -1626,8 +2012,21 @@ function App() {
                   )}
                 </div>
                 <div className="provider-config-grid">
-                  {draftSmsProvider.definition.fields.filter((field) => field.type !== "hidden").map((field) => (
-                    <label key={field.key} className={`settings-field ${["price-select", "textarea"].includes(field.type) ? "wide-settings-field" : ""}`}>
+                  {draftSmsProvider.definition.fields.filter((field) => field.type !== "hidden").map((field) => (String(field.type).startsWith("smscode-") ? (
+                    <SmsCodeField
+                      key={field.key}
+                      field={field}
+                      config={draftSmsProvider.config}
+                      catalog={smsCodeCatalog}
+                      loading={smsOptionsLoading}
+                      platformItems={smsCodePlatformItems}
+                      countryItems={smsCodeCountryItems}
+                      onQuery={() => loadSmsNumberOptions()}
+                      onChangeSelection={changeSmsCodeSelection}
+                      onUpdate={(patch) => updateSmsProviderConfig("smscode", patch)}
+                    />
+                  ) : (
+                    <label key={field.key} className={`settings-field ${["price-select", "service-select", "textarea"].includes(field.type) ? "wide-settings-field" : ""}`}>
                       <span>{ts(field.label)}</span>
                       {field.type === "price-select" ? (
                         (() => {
@@ -1728,6 +2127,62 @@ function App() {
                             </div>
                           );
                         })()
+                      ) : field.type === "service-select" ? (
+                        <div style={{ display: "grid", gap: 8, height: "auto", padding: 0, border: "none", background: "transparent" }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                            <button
+                              type="button"
+                              className="price-refresh-button"
+                              onClick={() => loadSmsNumberOptions()}
+                              disabled={smsOptionsLoading}
+                            >
+                              {smsOptionsLoading ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}
+                              {smsOptionsLoading ? t("查询中") : t("查询服务")}
+                            </button>
+                            {smsBalance && <span style={{ fontSize: 12, color: "var(--muted)" }}>{t("余额")}: {smsBalance}</span>}
+                          </div>
+                          {smsNumberOptions.length > 0 && (
+                            <div className="price-select-box">
+                              <Settings2 size={15} />
+                              <select
+                                value={draftSmsProvider.config[field.key] || ""}
+                                onChange={(event) => {
+                                  const service = smsNumberOptions.find((s) => s.value === event.target.value);
+                                  updateSmsProviderConfig(draftSmsProvider.id, {
+                                    [field.key]: event.target.value,
+                                    serviceLabel: service?.label || "",
+                                  });
+                                }}
+                                aria-label={ts(field.label)}
+                                style={{ flex: 1, minWidth: 0, border: 0, outline: 0, background: "transparent", color: "inherit", fontSize: 12.5 }}
+                              >
+                                {smsNumberOptions.map((s) => (
+                                  <option key={s.value} value={s.value}>
+                                    {s.label} · {s.priceLabel}
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+                          )}
+                        </div>
+                      ) : field.type === "select" && field.options ? (
+                        <div>
+                          <Settings2 size={15} />
+                          <select
+                            value={draftSmsProvider.config[field.key] || field.defaultValue || ""}
+                            onChange={(event) => {
+                              updateSmsProviderConfig(draftSmsProvider.id, { [field.key]: event.target.value });
+                              setSmsNumberOptions([]);
+                              setSmsBalance(null);
+                            }}
+                            aria-label={ts(field.label)}
+                            style={{ flex: 1, minWidth: 0, border: 0, outline: 0, background: "transparent", color: "inherit", fontSize: 13 }}
+                          >
+                            {field.options.map((opt) => (
+                              <option key={opt.value} value={opt.value}>{ts(opt.label)}</option>
+                            ))}
+                          </select>
+                        </div>
                       ) : field.type === "textarea" ? (
                         <textarea
                           className="settings-textarea"
@@ -1752,10 +2207,35 @@ function App() {
                         </div>
                       )}
                     </label>
-                  ))}
+                  )))}
                 </div>
               </div>
             )}
+
+            <div className="provider-config-section" style={{ marginTop: 12 }}>
+              <label style={{ display: "block" }}>
+                <span style={{ display: "block", fontSize: 13, fontWeight: 600, marginBottom: 4 }}>
+                  {t("每个手机号最多使用次数")}
+                </span>
+                <input
+                  type="number"
+                  min="0"
+                  max="1000"
+                  step="1"
+                  value={phoneMaxUses}
+                  onChange={(event) => setPhoneMaxUses(event.target.value)}
+                  style={{ width: 120 }}
+                />
+                <span style={{ display: "block", fontSize: 12, opacity: 0.7, marginTop: 4 }}>
+                  {t("0 = 不限制使用次数；被风控的号码始终跳过；记录保存在服务器，不使用浏览器存储")}
+                </span>
+                {phoneUsageStats ? (
+                  <span style={{ display: "block", fontSize: 12, opacity: 0.7, marginTop: 2 }}>
+                    {tf("已记录 {0} 个号码 · {1} 个被风控拦截 · 共 {2} 次使用", phoneUsageStats.totalNumbers ?? 0, phoneUsageStats.blocked ?? 0, phoneUsageStats.totalUses ?? 0)}
+                  </span>
+                ) : null}
+              </label>
+            </div>
 
             {smsSettingsError && <div className="dialog-error" role="alert"><CircleAlert size={15} />{ts(smsSettingsError)}</div>}
             <div className="dialog-footer">
@@ -1765,72 +2245,6 @@ function App() {
               </button>
             </div>
           </form>
-        </div>
-      )}
-      {smsCostsOpen && (
-        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
-          if (event.target === event.currentTarget) setSmsCostsOpen(false);
-        }}>
-          <div className="batch-dialog" role="dialog" aria-modal="true" aria-labelledby="sms-costs-title">
-            <div className="dialog-header">
-              <div>
-                <h2 id="sms-costs-title">{t("短信费用")}</h2>
-                <span>{t("取号会扣费；验证成功才计入，取消/换号会退款")}</span>
-              </div>
-              <div style={{ display: "flex", gap: 6 }}>
-                <button type="button" className="icon-button" onClick={openSmsCosts} disabled={smsCostsLoading} title={t("刷新")}>
-                  <RefreshCw className={smsCostsLoading ? "spin" : ""} size={17} />
-                </button>
-                <button type="button" className="icon-button" onClick={() => setSmsCostsOpen(false)} title={t("关闭")}>
-                  <X size={18} />
-                </button>
-              </div>
-            </div>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10, marginTop: 8 }}>
-              <div style={{ padding: "10px 12px", borderRadius: 8, background: "rgba(16,162,113,0.1)" }}>
-                <div style={{ fontSize: 20, fontWeight: 700, color: "#10a271" }}>{smsCosts.totals.currency}{smsCosts.totals.charged}</div>
-                <div style={{ fontSize: 12, opacity: 0.75 }}>{tf("已扣费 · 成功 {0} 个", smsCosts.totals.chargedCount)}</div>
-              </div>
-              <div style={{ padding: "10px 12px", borderRadius: 8, background: "rgba(37,99,235,0.1)" }}>
-                <div style={{ fontSize: 20, fontWeight: 700, color: "#2563eb" }}>{smsCosts.totals.refundedCount}</div>
-                <div style={{ fontSize: 12, opacity: 0.75 }}>{t("已退款（取消/换号）")}</div>
-              </div>
-              <div style={{ padding: "10px 12px", borderRadius: 8, background: "rgba(128,128,128,0.12)" }}>
-                <div style={{ fontSize: 20, fontWeight: 700 }}>{smsCosts.totals.heldCount}</div>
-                <div style={{ fontSize: 12, opacity: 0.75 }}>{t("待验证（暂扣）")}</div>
-              </div>
-            </div>
-            <div style={{ marginTop: 12, height: "46vh", overflowY: "auto", border: "1px solid rgba(128,128,128,0.25)", borderRadius: 8 }}>
-              {smsCostsLoading ? (
-                <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", opacity: 0.7 }}><LoaderCircle className="spin" size={20} /></div>
-              ) : smsCosts.rows.length === 0 ? (
-                <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", opacity: 0.6, fontSize: 13 }}>{t("暂无取号记录")}</div>
-              ) : (
-                smsCosts.rows.map((row, i) => {
-                  const badge = row.status === "charged"
-                    ? { bg: "rgba(16,162,113,0.15)", color: "#10a271", label: t("已扣费") }
-                    : row.status === "refunded"
-                      ? { bg: "rgba(37,99,235,0.14)", color: "#2563eb", label: t("已退款") }
-                      : { bg: "rgba(234,179,8,0.16)", color: "#a16207", label: t("待验证") };
-                  return (
-                    <div key={row.email + row.number + i} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 11px", borderBottom: "1px solid rgba(128,128,128,0.12)", fontSize: 12.5 }}>
-                      <span style={{ flex: 1, minWidth: 0, fontFamily: "ui-monospace, Menlo, monospace", wordBreak: "break-all" }}>
-                        {row.email}
-                        <span style={{ display: "block", opacity: 0.6, fontSize: 11 }}>{row.serviceLabel || row.provider || ""}{row.number ? ` · ${row.number}` : ""}</span>
-                      </span>
-                      <span style={{ whiteSpace: "nowrap", fontVariantNumeric: "tabular-nums" }}>{row.price == null ? "—" : `${row.currency}${row.price}`}</span>
-                      <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 999, background: badge.bg, color: badge.color, whiteSpace: "nowrap" }}>{badge.label}</span>
-                    </div>
-                  );
-                })
-              )}
-            </div>
-            <div className="dialog-footer">
-              <button type="button" className="primary-button" onClick={() => setSmsCostsOpen(false)}>
-                <Check size={17} />{t("完成")}
-              </button>
-            </div>
-          </div>
         </div>
       )}
       {proxyLinkOpen && (
@@ -1864,17 +2278,6 @@ function App() {
             {proxyLinkConfig.mode === "batch" ? (
               <div className="provider-config-grid mail-request-config-grid">
                 <label className="settings-field wide-settings-field">
-                  <span>{t("代理 IP 列表")} <small>{t("每行一个，例如 socks5h://user:pass@host:port")}</small></span>
-                  <textarea
-                    className="settings-textarea"
-                    value={proxyLinkConfig.proxies}
-                    onChange={(event) => setProxyLinkConfig((c) => ({ ...c, proxies: event.target.value }))}
-                    placeholder={"socks5h://user:pass@host1:port\nsocks5h://user:pass@host2:port"}
-                    rows="7"
-                    spellCheck="false"
-                  />
-                </label>
-                <label className="settings-field wide-settings-field">
                   <span>{t("每个 IP 最多账号数")} <small>{tf("默认 {0}", 15)}</small></span>
                   <div>
                     <input
@@ -1886,12 +2289,35 @@ function App() {
                     />
                   </div>
                 </label>
+                <div className="settings-field wide-settings-field" style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 10, fontSize: 13, opacity: 0.85 }}>
+                  <span>{tf("已配置 {0} 个代理 IP。代理请在“代理 IP 列表”中添加与管理。", parseProxyPasteList(proxyLinkConfig.proxies).length)}</span>
+                  <button type="button" className="secondary-button" onClick={() => { setProxyLinkOpen(false); openProxyList(); }}>
+                    <List size={16} />{t("代理 IP 列表")}
+                  </button>
+                </div>
               </div>
             ) : (
               <div style={{ fontSize: 13, opacity: 0.78, margin: "14px 2px" }}>
                 {t("每个账号使用它注册时的代理，上传时自动创建并关联。")}
               </div>
             )}
+            <div className="provider-config-grid mail-request-config-grid">
+              <label className="settings-field wide-settings-field">
+                <span>{t("同一 IP 两次注册的最短间隔（分钟）")} <small>{tf("默认 {0}，0 = 不等待", 10)}</small></span>
+                <div>
+                  <input
+                    type="number"
+                    min="0"
+                    max="240"
+                    value={proxyLinkConfig.cooldownMinutes}
+                    onChange={(event) => setProxyLinkConfig((c) => ({ ...c, cooldownMinutes: event.target.value }))}
+                  />
+                </div>
+              </label>
+            </div>
+            <div style={{ fontSize: 13, opacity: 0.78, margin: "10px 2px 0" }}>
+              {t("同一 IP 连续注册时，服务端可能不发送验证邮件；间隔内的注册任务会留在队列中等待。")}
+            </div>
             <div className="dialog-footer">
               <button type="button" className="primary-button" onClick={() => setProxyLinkOpen(false)}>
                 <Check size={17} />{t("完成")}
@@ -1904,21 +2330,14 @@ function App() {
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
           if (event.target === event.currentTarget) setProxyListOpen(false);
         }}>
-          <div className="batch-dialog" role="dialog" aria-modal="true" aria-labelledby="proxy-list-title">
+          <div className="batch-dialog proxy-list-dialog" role="dialog" aria-modal="true" aria-labelledby="proxy-list-title">
             <div className="dialog-header">
               <div>
                 <h2 id="proxy-list-title">{t("代理 IP 列表")}</h2>
-                <span>
-                  {proxyListBusy
-                    ? t("加载中…")
-                    : proxyStatus
-                      ? tf("{0}/{1} 个 IP 活跃 · 剩余约 {2} 次注册 · 上限 {3}/IP",
-                          proxyStatus.activeCount, proxyStatus.totalCount, proxyStatus.remaining, proxyStatus.limitPerIp)
-                      : t("管理代理、查看每个 IP 已注册的邮箱与连接状态")}
-                </span>
+                <span>{t("管理代理、查看每个 IP 已注册的邮箱与连接状态")}</span>
               </div>
               <div style={{ display: "flex", gap: 6 }}>
-                <button type="button" className="icon-button" onClick={() => fetchProxyStatus()} disabled={proxyListBusy} title={t("刷新")}>
+                <button type="button" className="icon-button" onClick={() => fetchProxyStatus({ refresh: true })} disabled={proxyListBusy} title={t("刷新")}>
                   <RefreshCw className={proxyListBusy ? "spin" : ""} size={17} />
                 </button>
                 <button type="button" className="icon-button" onClick={() => setProxyListOpen(false)} title={t("关闭")}>
@@ -1927,28 +2346,51 @@ function App() {
               </div>
             </div>
 
-            {/* Thêm mới hàng loạt: dán danh sách, tự nhận diện HTTP / SOCKS5 */}
-            <div style={{ marginTop: 12, border: "1px solid rgba(128,128,128,0.25)", borderRadius: 10, padding: 12 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, fontWeight: 600, marginBottom: 8 }}>
-                <ListPlus size={15} /> {t("批量添加代理")}
+            {/* Thẻ tóm tắt: IP hoạt động · còn bao nhiêu lần đăng ký · giới hạn mỗi IP */}
+            <div className="proxy-stats">
+              <div className="proxy-stat">
+                <div className={`num ${proxyStatus && proxyStatus.activeCount ? "ok" : ""}`}>
+                  {proxyStatus ? `${proxyStatus.activeCount}/${proxyStatus.totalCount}` : "—"}
+                </div>
+                <div className="lbl">{t("IP 活跃 / 总数")}</div>
               </div>
+              <div className="proxy-stat">
+                <div className={`num ${proxyStatus && !proxyStatus.remaining ? "warn" : "ok"}`}>
+                  {proxyStatus ? proxyStatus.remaining : "—"}
+                </div>
+                <div className="lbl">{t("剩余可注册次数（估算）")}</div>
+              </div>
+              <div className="proxy-stat">
+                <div className="num">{proxyStatus ? proxyStatus.limitPerIp : (Number(proxyLinkConfig.limitPerIp) || 15)}</div>
+                <div className="lbl">{t("每个 IP 上限")}</div>
+              </div>
+            </div>
+
+            {/* Thêm mới hàng loạt: dán danh sách, tự nhận diện HTTP / SOCKS5 */}
+            <div className="proxy-bulk">
+              <div className="proxy-bulk-head"><ListPlus size={16} /> {t("批量添加代理")}</div>
               <textarea
-                className="settings-textarea"
                 value={proxyBulkText}
                 onChange={(event) => setProxyBulkText(event.target.value)}
                 placeholder={"# IF_163 · 116.96.82.180 · HTTP 22030 / SOCKS5 23030\n116.96.82.180:22030:user:pass\n116.96.82.180:23030:user:pass"}
-                rows="5"
                 spellCheck="false"
-                style={{ width: "100%", fontFamily: "ui-monospace, Menlo, monospace", fontSize: 12.5 }}
               />
               {(() => {
                 const parsed = parseProxyPasteList(proxyBulkText);
-                const socksN = parsed.filter((e) => e.protocol === "socks5h").length;
-                const httpN = parsed.length - socksN;
+                const ambN = parsed.filter((e) => e.ambiguous).length;
+                const explicitSocks = parsed.filter((e) => !e.ambiguous && e.protocol === "socks5h").length;
+                const explicitHttp = parsed.filter((e) => !e.ambiguous && e.protocol === "http").length;
+                // Dòng chưa rõ giao thức được tính cho cả 2 nút; bấm nút nào sẽ ép theo nút đó.
+                const socksN = explicitSocks + ambN;
+                const httpN = explicitHttp + ambN;
                 return (
-                  <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8, marginTop: 8 }}>
-                    <span style={{ fontSize: 12, opacity: 0.7, marginRight: "auto" }}>
-                      {parsed.length ? tf("已识别 {0} 个 SOCKS5 · {1} 个 HTTP", socksN, httpN) : t("粘贴后自动识别 HTTP / SOCKS5")}
+                  <div className="proxy-bulk-actions">
+                    <span className="proxy-bulk-hint">
+                      {parsed.length
+                        ? (ambN
+                            ? tf("{0} SOCKS5 · {1} HTTP · {2} 个未识别（点按钮指定协议）", explicitSocks, explicitHttp, ambN)
+                            : tf("已识别 {0} 个 SOCKS5 · {1} 个 HTTP", explicitSocks, explicitHttp))
+                        : t("粘贴后自动识别 HTTP / SOCKS5（每个 IP 只添加一次）")}
                     </span>
                     <button type="button" className="secondary-button" onClick={() => addBulkProxies("socks5")} disabled={!socksN}>
                       <Plus size={15} />{tf("添加 SOCKS5（{0}）", socksN)}
@@ -1964,66 +2406,106 @@ function App() {
               })()}
             </div>
 
-            {proxyListError && <div className="dialog-error" role="alert" style={{ marginTop: 10 }}><CircleAlert size={15} />{ts(proxyListError)}</div>}
+            {proxyListError && <div className="dialog-error" role="alert" style={{ marginTop: 12 }}><CircleAlert size={15} />{ts(proxyListError)}</div>}
 
-            <div style={{ marginTop: 12, maxHeight: "46vh", overflowY: "auto", border: "1px solid rgba(128,128,128,0.25)", borderRadius: 10 }}>
-              {proxyListBusy && !proxyStatus ? (
-                <div style={{ padding: 40, display: "flex", alignItems: "center", justifyContent: "center", opacity: 0.7 }}><LoaderCircle className="spin" size={20} /></div>
-              ) : !proxyStatus || !proxyStatus.proxies.length ? (
-                <div style={{ padding: 32, textAlign: "center", opacity: 0.65, fontSize: 13 }}>
-                  {t("暂无代理，请在“配置”中选择“批量连接”并填入代理，或使用上方批量添加")}
-                </div>
-              ) : (
-                proxyStatus.proxies.map((p) => {
-                  const expanded = proxyExpanded.has(p.label);
-                  const isSocks = /socks/i.test(p.protocol);
-                  return (
-                    <div key={p.label} style={{ borderBottom: "1px solid rgba(128,128,128,0.12)" }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 12px", fontSize: 13 }}>
-                        <Network size={15} style={{ opacity: 0.6, flex: "0 0 auto" }} />
-                        <span style={{ display: "inline-flex", alignItems: "center", fontSize: 11, padding: "2px 8px", borderRadius: 999, whiteSpace: "nowrap", background: isSocks ? "rgba(124,58,237,0.14)" : "rgba(37,99,235,0.14)", color: isSocks ? "#7c3aed" : "#2563eb", flex: "0 0 auto" }}>
-                          {(p.protocol || "?").toUpperCase()}
-                        </span>
-                        <span style={{ flex: 1, minWidth: 0, fontFamily: "ui-monospace, Menlo, monospace", wordBreak: "break-all" }}>
-                          {p.label}
-                          {p.connected && p.ip && p.ip !== p.host ? <span style={{ opacity: 0.55 }}>{tf(" · 出口 {0}", p.ip)}</span> : null}
-                        </span>
-                        <span
-                          title={p.connected ? "" : (p.error || "")}
-                          style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 11.5, padding: "2px 9px", borderRadius: 999, whiteSpace: "nowrap", flex: "0 0 auto", background: p.connected ? "rgba(16,162,113,0.15)" : "rgba(220,38,38,0.13)", color: p.connected ? "#10a271" : "#dc2626" }}
-                        >
-                          {p.connected ? <Check size={12} /> : <CircleAlert size={12} />}
-                          {p.connected ? t("已连接") : t("连接失败")}
-                        </span>
-                        <span style={{ fontSize: 11.5, opacity: 0.7, whiteSpace: "nowrap", flex: "0 0 auto", minWidth: 72, textAlign: "right" }}>
-                          {tf("剩余 {0}", p.remaining)}
-                        </span>
-                        <button
-                          type="button"
-                          className="selection-text-button"
-                          onClick={() => toggleProxyEmails(p.label)}
-                          disabled={!p.emailCount}
-                          style={{ flex: "0 0 auto", minWidth: 96, justifyContent: "flex-end" }}
-                        >
-                          <Mail size={13} /> {tf("{0} 个邮箱", p.emailCount)}
-                          {p.emailCount ? (expanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />) : null}
-                        </button>
-                      </div>
-                      {expanded && p.emails.length ? (
-                        <div style={{ padding: "0 12px 10px 37px", display: "flex", flexWrap: "wrap", gap: 6 }}>
-                          {p.emails.map((em) => (
-                            <span key={em} style={{ fontSize: 11.5, fontFamily: "ui-monospace, Menlo, monospace", padding: "2px 8px", borderRadius: 6, background: "rgba(128,128,128,0.12)", wordBreak: "break-all" }}>{em}</span>
-                          ))}
+            {proxyStatus && proxyStatus.proxies.length ? (
+              <div className="proxy-filters">
+                {[
+                  [null, t("全部"), proxyStatus.proxies.length],
+                  ["inuse", t("使用中"), proxyStatus.usageCounts?.inuse ?? 0],
+                  ["unused", t("未使用"), proxyStatus.usageCounts?.unused ?? 0],
+                  ["used", t("已用完"), proxyStatus.usageCounts?.used ?? 0],
+                ].map(([value, label, count]) => (
+                  <button
+                    key={value === null ? "__all__" : value}
+                    type="button"
+                    className={`proxy-chip ${proxyFilter === value ? "active" : ""}`}
+                    onClick={() => setProxyFilter(value)}
+                  >
+                    {label}<span className="cnt">{count}</span>
+                  </button>
+                ))}
+              </div>
+            ) : null}
+
+            <div className="proxy-table">
+              <div className="proxy-thead">
+                <span>{t("协议")}</span>
+                <span>{t("代理 IP")}</span>
+                <span>{t("状态")}</span>
+                <span>{t("已注册邮箱")}</span>
+                <span style={{ textAlign: "right" }}>{t("剩余额度")}</span>
+                <span />
+              </div>
+              <div className="proxy-scroll">
+                {proxyListBusy && !proxyStatus ? (
+                  <div className="proxy-empty"><LoaderCircle className="spin" size={20} /></div>
+                ) : !proxyStatus || !proxyStatus.proxies.length ? (
+                  <div className="proxy-empty">{t("暂无代理，请在“配置”中选择“批量连接”并填入代理，或使用上方批量添加")}</div>
+                ) : (() => {
+                  const rows = proxyStatus.proxies.filter((p) => proxyFilter === null || p.usage === proxyFilter);
+                  if (!rows.length) return <div className="proxy-empty">{t("没有符合筛选条件的代理")}</div>;
+                  return rows.map((p) => {
+                    const expanded = proxyExpanded.has(p.label);
+                    const isSocks = /socks/i.test(p.protocol);
+                    return (
+                      <div key={p.label} className="proxy-row">
+                        <div className="proxy-row-main">
+                          <span className={`proxy-pill ${isSocks ? "socks" : "http"}`}>
+                            <Network size={12} />{isSocks ? "SOCKS5" : (p.protocol || "?").toUpperCase()}
+                          </span>
+                          <div className="proxy-ipcell">
+                            <div className="addr" title={p.label}>
+                              {p.label}
+                              {!p.configured ? <span className="proxy-old">{t("IP 旧")}</span> : null}
+                            </div>
+                            {p.connected && p.ip ? <div className="exit">{tf("出口 {0}", p.ip)}</div> : (!p.connected && p.error ? <div className="exit" title={p.error}>{ts(p.error)}</div> : null)}
+                          </div>
+                          <span className={`proxy-pill ${p.connected ? "ok" : "down"}`} title={p.connected ? "" : (p.error || "")}>
+                            {p.connected ? <Check size={12} /> : <CircleAlert size={12} />}
+                            {p.connected ? t("已连接") : t("连接失败")}
+                          </span>
+                          <button type="button" className="proxy-emailbtn" onClick={() => toggleProxyEmails(p.label)} disabled={!p.emailCount}>
+                            <Mail size={14} />{tf("{0} 个邮箱", p.emailCount)}
+                            {p.emailCount ? (expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />) : null}
+                          </button>
+                          <span className="proxy-remain" style={{ textAlign: "right" }}>
+                            {p.remaining}<small>{tf(" / {0}", proxyStatus.limitPerIp)}</small>
+                          </span>
+                          <button
+                            type="button"
+                            className="proxy-del"
+                            onClick={() => removeProxy(p.host)}
+                            disabled={!p.configured}
+                            title={p.configured ? t("从列表中删除该代理") : t("旧 IP（不在配置列表中）")}
+                          >
+                            <Trash2 size={15} />
+                          </button>
                         </div>
-                      ) : null}
-                    </div>
-                  );
-                })
-              )}
+                        {expanded && p.emails.length ? (
+                          <div className="proxy-emails">
+                            <div className="proxy-emails-head">
+                              <Mail size={13} />{tf("{0} 个已注册邮箱", p.emails.length)}
+                              <button type="button" className="proxy-emails-copy" onClick={() => copyProxyEmails(p.emails)}>
+                                <Copy size={13} />{t("复制全部")}
+                              </button>
+                            </div>
+                            <div className="proxy-emails-grid">
+                              {p.emails.map((em) => (
+                                <div key={em} className="item" title={em}><span className="dot" /><span>{em}</span></div>
+                              ))}
+                            </div>
+                          </div>
+                        ) : null}
+                      </div>
+                    );
+                  });
+                })()}
+              </div>
             </div>
 
             <div className="dialog-footer">
-              <div style={{ marginRight: "auto", alignSelf: "center", fontSize: 12.5, opacity: 0.7 }}>
+              <div style={{ marginRight: "auto", alignSelf: "center", fontSize: 12.5, color: "var(--muted)" }}>
                 {proxyStatus
                   ? tf("预计：{0} 个 IP 活跃 · 剩余约 {1} 次注册", proxyStatus.activeCount, proxyStatus.remaining)
                   : t("上限可在“配置”中调整")}
@@ -2334,7 +2816,10 @@ function App() {
             <div className="dialog-header">
               <div>
                 <h2 id="batch-title">{t("批量添加账号")}</h2>
-                <span>{tf("{0} 条，超出并发上限后自动排队", countBatchLines(batchText))}</span>
+                <span>
+                  {tf("{0} 条，超出并发上限后自动排队", batchLines.length)}
+                  {batchLines.length && !batchAllChecked ? tf(" · 已选 {0}", batchRunLines.length) : ""}
+                </span>
               </div>
               <button type="button" className="icon-button" onClick={() => setBatchOpen(false)} disabled={batchBusy} title={t("关闭")}>
                 <X size={18} />
@@ -2355,12 +2840,52 @@ function App() {
               spellCheck="false"
               autoFocus
             />
+            {batchLines.length > 0 ? (
+              <div style={{ marginTop: 10, maxHeight: "34vh", overflowY: "auto", border: "1px solid rgba(128,128,128,0.25)", borderRadius: 8 }}>
+                <label style={{
+                  position: "sticky", top: 0, zIndex: 1, display: "flex", alignItems: "center", gap: 10,
+                  padding: "8px 11px", borderBottom: "1px solid rgba(128,128,128,0.2)",
+                  background: "var(--surface, #fff)", fontSize: 12.5, fontWeight: 600, cursor: "pointer",
+                }}>
+                  <input type="checkbox" checked={batchAllChecked} onChange={toggleAllBatchLines} disabled={batchBusy} />
+                  <span>{batchAllChecked ? tf("全选（{0}）", batchLines.length) : tf("已选 {0}/{1}", batchRunLines.length, batchLines.length)}</span>
+                </label>
+                {batchLines.map((line, index) => {
+                  const checked = !batchUnchecked.has(line.raw);
+                  return (
+                    <label
+                      key={`${line.raw}__${index}`}
+                      style={{
+                        display: "flex", alignItems: "center", gap: 10, padding: "7px 11px",
+                        borderBottom: "1px solid rgba(128,128,128,0.12)", fontSize: 13, cursor: "pointer",
+                        background: checked ? "rgba(16,162,113,0.06)" : "transparent",
+                      }}
+                    >
+                      <input type="checkbox" checked={checked} onChange={() => toggleBatchLine(line.raw)} disabled={batchBusy} />
+                      <span style={{ flex: 1, minWidth: 0, fontFamily: "ui-monospace, Menlo, monospace", wordBreak: "break-all", opacity: checked ? 1 : 0.5 }} title={line.raw}>
+                        {line.email}
+                      </span>
+                      <button
+                        type="button"
+                        className="icon-button danger"
+                        style={{ flex: "0 0 auto", minWidth: 28, height: 28, padding: 0 }}
+                        title={t("移除")}
+                        onClick={(event) => { event.preventDefault(); removeBatchLine(line.raw); }}
+                        disabled={batchBusy}
+                      >
+                        <Trash2 size={15} />
+                      </button>
+                    </label>
+                  );
+                })}
+              </div>
+            ) : null}
             {batchError && <div className="dialog-error" role="alert"><CircleAlert size={15} />{ts(batchError)}</div>}
             <div className="dialog-footer">
               <button type="button" className="cancel-button" onClick={() => setBatchOpen(false)} disabled={batchBusy}>{t("取消")}</button>
-              <button type="submit" className="primary-button" disabled={!batchText.trim() || batchBusy || countBatchLines(batchText) > 500}>
+              <button type="submit" className="primary-button" disabled={!batchRunLines.length || batchBusy || batchRunLines.length > 500}>
                 {batchBusy ? <LoaderCircle className="spin" size={17} /> : <ListPlus size={17} />}
-                {tf("创建 {0} 条任务", countBatchLines(batchText) || "")}
+                {tf("创建 {0} 条任务", batchRunLines.length || "")}
               </button>
             </div>
           </form>
@@ -2418,25 +2943,66 @@ function App() {
                 <div style={{ fontSize: 13, opacity: 0.85, margin: "6px 0 8px" }}>
                   {t("已创建")} <b>{createResult.boxes.length}</b> {t("个邮箱，域名")} <b>{createResult.domain}</b>
                   {createResult.tag ? <> · {t("标签")} <b>{createResult.tag}</b></> : null}
+                  {createUnchecked.size > 0 ? <> · {tf("已选 {0}", createResult.boxes.length - createUnchecked.size)}</> : null}
                   {createResult.errors?.length ? <> · <span style={{ color: "#dc2626" }}>{tf("{0} 个错误", createResult.errors.length)}</span></> : null}
                 </div>
                 <div style={{ maxHeight: 270, overflowY: "auto", border: "1px solid rgba(128,128,128,0.25)", borderRadius: 8 }}>
-                  {createResult.boxes.map((box) => (
-                    <div key={box.email} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, padding: "7px 11px", borderBottom: "1px solid rgba(128,128,128,0.12)", fontSize: 13 }}>
-                      <span style={{ fontFamily: "ui-monospace, Menlo, monospace", wordBreak: "break-all" }}>{box.email}</span>
-                      {box.tag ? <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 999, background: "rgba(16,162,113,0.15)", color: "#10a271", whiteSpace: "nowrap" }}>{box.tag}</span> : null}
-                    </div>
-                  ))}
+                  <label style={{
+                    position: "sticky", top: 0, zIndex: 1, display: "flex", alignItems: "center", gap: 10,
+                    padding: "8px 11px", borderBottom: "1px solid rgba(128,128,128,0.2)",
+                    background: "var(--surface, #fff)", fontSize: 12.5, fontWeight: 600, cursor: "pointer",
+                  }}>
+                    <input
+                      type="checkbox"
+                      checked={createUnchecked.size === 0}
+                      onChange={() => {
+                        setCreateUnchecked((prev) => {
+                          if (!prev.size) return new Set(createResult.boxes.map((box) => box.email));
+                          return new Set();
+                        });
+                      }}
+                    />
+                    <span>{createUnchecked.size === 0
+                      ? tf("全选（{0}）", createResult.boxes.length)
+                      : tf("已选 {0}/{1}", createResult.boxes.length - createUnchecked.size, createResult.boxes.length)}</span>
+                  </label>
+                  {createResult.boxes.map((box) => {
+                    const checked = !createUnchecked.has(box.email);
+                    return (
+                      <label
+                        key={box.email}
+                        style={{
+                          display: "flex", alignItems: "center", gap: 10, padding: "7px 11px",
+                          borderBottom: "1px solid rgba(128,128,128,0.12)", fontSize: 13, cursor: "pointer",
+                          background: checked ? "rgba(16,162,113,0.06)" : "transparent",
+                        }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => {
+                            setCreateUnchecked((prev) => {
+                              const next = new Set(prev);
+                              if (next.has(box.email)) next.delete(box.email); else next.add(box.email);
+                              return next;
+                            });
+                          }}
+                        />
+                        <span style={{ flex: 1, minWidth: 0, fontFamily: "ui-monospace, Menlo, monospace", wordBreak: "break-all", opacity: checked ? 1 : 0.5 }}>{box.email}</span>
+                        {box.tag ? <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 999, background: "rgba(16,162,113,0.15)", color: "#10a271", whiteSpace: "nowrap" }}>{box.tag}</span> : null}
+                      </label>
+                    );
+                  })}
                 </div>
                 {createResult.errors?.length ? (
                   <div className="dialog-error" role="alert" style={{ marginTop: 8 }}><CircleAlert size={15} />{createResult.errors.join("; ")}</div>
                 ) : null}
                 <div className="dialog-footer">
                   <button type="button" className="cancel-button" onClick={() => setCreateResult(null)}>{t("继续创建")}</button>
-                  <button type="button" className="cancel-button" onClick={copyCreatedEmails}>{t("复制邮箱")}</button>
-                  <button type="button" className="primary-button" onClick={sendCreatedToBatch}>
+                  <button type="button" className="cancel-button" onClick={copyCreatedEmails} disabled={createUnchecked.size >= createResult.boxes.length}>{t("复制邮箱")}</button>
+                  <button type="button" className="primary-button" onClick={sendCreatedToBatch} disabled={createUnchecked.size >= createResult.boxes.length}>
                     <ListPlus size={17} />
-                    {t("加入批量添加")}
+                    {tf("加入批量添加（{0}）", createResult.boxes.length - createUnchecked.size)}
                   </button>
                 </div>
               </>
@@ -2455,6 +3021,9 @@ function App() {
                 <span>
                   {listBusy ? t("加载中…") : tf("{0}/{1} 个邮箱", visibleMailboxes.length, scopedMailboxes.length)}
                   {listSelected.size ? tf(" · 已选 {0}", listSelected.size) : ""}
+                  {!listBusy && accountCreatedCount > 0
+                    ? tf(" · 步骤 4 活跃 {0}", accountCreatedCount)
+                    : ""}
                 </span>
               </div>
               <div style={{ display: "flex", gap: 6 }}>
@@ -2495,13 +3064,34 @@ function App() {
                       color: active ? "#fff" : "inherit",
                     }}
                   >
-                    {chip.value === "created" ? <CheckCircle2 size={12} /> : chip.value === "uncreated" ? <Filter size={12} /> : null}
+                    {chip.value === "created" ? <CheckCircle2 size={12} /> : chip.value === "uncreated" ? <Filter size={12} /> : chip.value === "deactivated" ? <CircleAlert size={12} /> : null}
                     {t(chip.label)}
                     <span style={{ opacity: 0.7, fontVariantNumeric: "tabular-nums" }}>{chip.count}</span>
                   </button>
                 );
               })}
             </div>
+            {(() => {
+              const uncreatedScoped = scopedMailboxes.filter((m) => !m.accountCreated && !m.deactivated).length;
+              const untaggedScoped = scopedMailboxes.some((m) => !m.tag && !m.accountCreated && !m.deactivated);
+              if (listBusy || (!uncreatedScoped && !untaggedScoped)) return null;
+              return (
+                <div style={{ display: "flex", gap: 6, margin: "6px 0 0", flexWrap: "wrap" }}>
+                  {untaggedScoped && (
+                    <button type="button" className="selection-text-button" onClick={batchTagUntagged} disabled={listTagging}>
+                      {listTagging ? <LoaderCircle className="spin" size={13} /> : null}
+                      {t("补打 ChatGPT Team 标签")}
+                    </button>
+                  )}
+                  {uncreatedScoped > 0 && (
+                    <button type="button" className="selection-text-button" style={{ color: "#dc2626" }} onClick={deactivateOrphans} disabled={listDeactivating}>
+                      {listDeactivating ? <LoaderCircle className="spin" size={13} /> : <CircleAlert size={13} />}
+                      {tf("停用未建号邮箱（{0}）", uncreatedScoped)}
+                    </button>
+                  )}
+                </div>
+              );
+            })()}
             {listError && <div className="dialog-error" role="alert"><CircleAlert size={15} />{ts(listError)}</div>}
             <div style={{ marginTop: 8, height: "52vh", overflowY: "auto", border: "1px solid rgba(128,128,128,0.25)", borderRadius: 8 }}>
               {!listBusy && visibleMailboxes.length > 0 ? (
@@ -2532,11 +3122,19 @@ function App() {
                       }}
                     >
                       <input type="checkbox" checked={checked} onChange={() => toggleMailbox(m.email)} />
-                      <span style={{ flex: 1, minWidth: 0, fontFamily: "ui-monospace, Menlo, monospace", wordBreak: "break-all", opacity: m.suspended ? 0.55 : 1 }}>
+                      <span style={{ flex: 1, minWidth: 0, fontFamily: "ui-monospace, Menlo, monospace", wordBreak: "break-all", opacity: (m.suspended || m.deactivated) ? 0.55 : 1 }}>
                         {m.email}
                         {m.suspended ? <span style={{ marginLeft: 6, fontSize: 11, color: "#dc2626" }}>{t("(已锁定)")}</span> : null}
                       </span>
-                      {m.accountCreated ? (
+                      {m.deactivated ? (
+                        <span
+                          title={m.deactivatedReason ? ts(m.deactivatedReason) : t("账号已确认封禁、删除或永久停用")}
+                          style={{ display: "inline-flex", alignItems: "center", gap: 3, fontSize: 11, padding: "2px 8px", borderRadius: 999, background: "rgba(220,38,38,0.14)", color: "#dc2626", whiteSpace: "nowrap" }}
+                        >
+                          <CircleAlert size={11} /> {t("已停用")}
+                        </span>
+                      ) : null}
+                      {m.accountCreated && !m.deactivated ? (
                         <span style={{ display: "inline-flex", alignItems: "center", gap: 3, fontSize: 11, padding: "2px 8px", borderRadius: 999, background: "rgba(37,99,235,0.14)", color: "#2563eb", whiteSpace: "nowrap" }}>
                           <CheckCircle2 size={11} /> {t("已建号")}
                         </span>
@@ -2629,11 +3227,100 @@ function EmptyState({ filtered = false }) {
   );
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl }) {
+function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, proxyBatchMode, sub2apiConfig }) {
+  // Ở chế độ nhiều IP: thao tác lại trên tài khoản giữ nguyên proxy đã gán (không gửi proxyUrl).
+  const reuseProxyBody = () => (proxyBatchMode ? {} : { proxyUrl: accountProxyUrl.trim() });
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [changeProxyOpen, setChangeProxyOpen] = useState(false);
+  const [poolProxies, setPoolProxies] = useState([]);
+  const [poolLoading, setPoolLoading] = useState(false);
+  const [poolError, setPoolError] = useState("");
+  const [poolImportText, setPoolImportText] = useState("");
+  const [changingKey, setChangingKey] = useState("");
+  const [reconnecting, setReconnecting] = useState(false);
+  const [resendCount, setResendCount] = useState(0);
 
   useEffect(() => setValue(""), [job.status]);
+  // Đếm lại số lần gửi lại SMS mỗi khi đổi sang số điện thoại khác.
+  useEffect(() => setResendCount(0), [job.currentPhone]);
+
+  async function loadProxyPool() {
+    setPoolLoading(true);
+    setPoolError("");
+    try {
+      const data = await apiFetch(token, "/api/proxy-pool");
+      setPoolProxies(Array.isArray(data.proxies) ? data.proxies : []);
+    } catch (requestError) {
+      setPoolError(requestError.message);
+    } finally {
+      setPoolLoading(false);
+    }
+  }
+
+  function openChangeProxy() {
+    setChangeProxyOpen(true);
+    loadProxyPool();
+  }
+
+  // Retry the SAME failed proxy. Useful when the disconnect was transient and the
+  // proxy still shows up in the pool list — no need to switch to a different one.
+  async function reconnectProxy() {
+    setReconnecting(true);
+    onError("");
+    try {
+      const data = await apiFetch(token, `/api/jobs/${job.id}/reconnect-proxy`, { method: "POST" });
+      if (data.reconnected) onError("");
+    } catch (requestError) {
+      onError(requestError.message);
+    } finally {
+      setReconnecting(false);
+    }
+  }
+
+  async function importProxyPool() {
+    if (!poolImportText.trim()) return;
+    setPoolLoading(true);
+    setPoolError("");
+    try {
+      const data = await apiFetch(token, "/api/proxy-pool/import", {
+        method: "POST",
+        body: JSON.stringify({ text: poolImportText }),
+      });
+      setPoolProxies(Array.isArray(data.proxies) ? data.proxies : []);
+      setPoolImportText("");
+    } catch (requestError) {
+      setPoolError(requestError.message);
+    } finally {
+      setPoolLoading(false);
+    }
+  }
+
+  async function chooseProxy(entry, confirmReuse = false) {
+    setChangingKey(entry.key);
+    setPoolError("");
+    try {
+      const data = await apiFetch(token, `/api/jobs/${job.id}/change-proxy`, {
+        method: "POST",
+        body: JSON.stringify({ poolKey: entry.key, confirmReuse, config: sub2apiConfig }),
+      });
+      if (data.needsReuseConfirm && !confirmReuse) {
+        const ok = window.confirm(t("该代理线路曾被使用，但当前没有账号在用。确认要重复使用吗？"));
+        if (ok) return chooseProxy(entry, true);
+        return;
+      }
+      if (data.sub2apiSync && data.sub2apiSync.attempted && !data.sub2apiSync.ok) {
+        onError(tf("代理已更换，但同步到 Sub2API 失败：{0}", ts(data.sub2apiSync.error || t("未知错误"))));
+      } else {
+        onError("");
+      }
+      setChangeProxyOpen(false);
+    } catch (requestError) {
+      setPoolError(requestError.message);
+    } finally {
+      setChangingKey("");
+    }
+  }
 
   async function sendInput(action, submittedValue = value) {
     setSubmitting(true);
@@ -2644,6 +3331,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
       });
       setValue("");
       onError("");
+      if (action === "resend_phone") setResendCount((count) => count + 1);
     } catch (requestError) {
       onError(requestError.message);
     } finally {
@@ -2667,7 +3355,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
     try {
       await apiFetch(token, `/api/jobs/${job.id}/retry`, {
         method: "POST",
-        body: JSON.stringify({ proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify(reuseProxyBody()),
       });
       onError("");
     } catch (requestError) {
@@ -2682,7 +3370,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
     try {
       await apiFetch(token, `/api/jobs/${job.id}/regenerate`, {
         method: "POST",
-        body: JSON.stringify({ proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify(reuseProxyBody()),
       });
       onError("");
     } catch (requestError) {
@@ -2697,7 +3385,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
     try {
       await apiFetch(token, `/api/jobs/${job.id}/relogin`, {
         method: "POST",
-        body: JSON.stringify({ proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify(reuseProxyBody()),
       });
       onError("");
     } catch (requestError) {
@@ -2712,7 +3400,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
     try {
       await apiFetch(token, `/api/jobs/${job.id}/setup-2fa`, {
         method: "POST",
-        body: JSON.stringify({ proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify(reuseProxyBody()),
       });
       onError("");
     } catch (requestError) {
@@ -2728,7 +3416,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
     try {
       await apiFetch(token, `/api/jobs/${job.id}/add-password`, {
         method: "POST",
-        body: JSON.stringify({ proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify(reuseProxyBody()),
       });
       onError("");
     } catch (requestError) {
@@ -2799,15 +3487,25 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
           </span>
         </div>
       </td>
-      <td><StatusBadge status={job.status} /></td>
+      <td>
+        <div className="status-cell">
+          <StatusBadge status={job.status} />
+        </div>
+      </td>
       <td className="step-cell">
         <div className="prompt-line">{ts(job.prompt)}</div>
-        {job.lastError && <div className="row-error">{ts(extractResponseMessage(job.lastError))}</div>}
+        {job.lastError && !job.proxyConnectionError && <div className="row-error">{ts(extractResponseMessage(job.lastError))}</div>}
         {job.autoRepairBlocked && (
           <div className="row-error">{tf("号池监控已永久跳过：{0}", ts(extractResponseMessage(job.autoRepairBlockedReason || t("账号已不可用"))))}</div>
         )}
         {job.totpSetupError && <div className="row-error">{tf("2FA：{0}", ts(extractResponseMessage(job.totpSetupError)))}</div>}
         {job.passwordAddError && <div className="row-error">{tf("添加密码：{0}", ts(extractResponseMessage(job.passwordAddError)))}</div>}
+        {job.proxyConnectionError && (
+          <div className="proxy-error-banner" role="alert">
+            <CircleAlert size={14} />
+            <span>{job.failedProxyLabel ? tf("代理连接失败：{0} 无法连接", job.failedProxyLabel) : t("代理连接失败，请更换代理")}</span>
+          </div>
+        )}
         {job.mailApiError && job.status === "email_otp" && <div className="mail-error">{ts(job.mailApiError)}</div>}
         {job.currentPhone && ["working", "phone", "phone_otp"].includes(job.status) && (
           <div className="phone-target"><Smartphone size={13} />{t("当前手机号：")}<strong>{job.currentPhone}</strong></div>
@@ -2829,7 +3527,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
           </div>
         )}
         {inputConfig && (
-          <div className="inline-entry">
+          <div className={`inline-entry${job.status === "phone_otp" ? " otp-inline" : ""}`}>
             <div className="compact-input">
               {inputConfig.icon}
               <input
@@ -2864,6 +3562,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
                 <button type="button" className="text-action" onClick={() => sendInput("resend_phone", "")} disabled={submitting}>
                   <RefreshCw size={14} />{t("重发")}
                 </button>
+                {resendCount > 0 && <span className="resend-counter">{tf("已重发 {0} 次", resendCount)}</span>}
                 <button type="button" className="text-action" onClick={() => sendInput("change_phone", "")} disabled={submitting}>
                   <RotateCcw size={14} />{t("换号")}
                 </button>
@@ -2932,6 +3631,16 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
               {job.securityCheckRequired ? t("手动重试") : job.canResume ? t("继续流程") : t("重新授权")}
             </button>
           )}
+          {job.canReconnectProxy && (
+            <button type="button" className="retry-button" onClick={reconnectProxy} disabled={submitting || reconnecting} title={t("重新测试并使用原代理继续登录，适用于代理只是临时断开的情况")}>
+              {reconnecting ? <LoaderCircle className="spin" size={16} /> : <Plug size={16} />}{t("重新连接")}
+            </button>
+          )}
+          {job.canChangeProxy && (
+            <button type="button" className="relogin-button" onClick={openChangeProxy} disabled={submitting || reconnecting} title={t("从系统代理池中选择一个未使用过的代理替换失败的代理")}>
+              <RefreshCw size={16} />{t("更换代理")}
+            </button>
+          )}
           <button type="button" className="icon-button" onClick={onToggleLogs} title={expanded ? t("收起日志") : t("查看日志")}>
             <FileText size={17} />
             {expanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
@@ -2942,6 +3651,64 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
             </button>
           )}
         </div>
+        {changeProxyOpen && (
+          <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setChangeProxyOpen(false);
+          }}>
+            <div className="batch-dialog proxy-list-dialog" role="dialog" aria-modal="true" aria-labelledby={`change-proxy-title-${job.id}`}>
+              <div className="dialog-header">
+                <div>
+                  <h2 id={`change-proxy-title-${job.id}`}>{t("更换代理")}</h2>
+                  <span>{job.failedProxyLabel ? tf("失败代理：{0}。请选择一个未使用过的代理。", job.failedProxyLabel) : t("请从系统代理池中选择一个未使用过的代理")}</span>
+                </div>
+                <div style={{ display: "flex", gap: 6 }}>
+                  <button type="button" className="icon-button" onClick={loadProxyPool} disabled={poolLoading} title={t("刷新")}>
+                    <RefreshCw className={poolLoading ? "spin" : ""} size={17} />
+                  </button>
+                  <button type="button" className="icon-button" onClick={() => setChangeProxyOpen(false)} title={t("关闭")}>
+                    <X size={18} />
+                  </button>
+                </div>
+              </div>
+
+              <div className="proxy-bulk">
+                <div className="proxy-bulk-head"><ListPlus size={16} /> {t("将代理导入系统代理池")}</div>
+                <textarea
+                  value={poolImportText}
+                  onChange={(event) => setPoolImportText(event.target.value)}
+                  placeholder={"116.96.82.180:22030:user:pass\n116.96.82.180:23030:user:pass"}
+                  spellCheck="false"
+                />
+                <div className="proxy-bulk-actions">
+                  <button type="button" className="secondary-button" onClick={importProxyPool} disabled={poolLoading || !poolImportText.trim()}>
+                    <Plus size={15} />{t("导入")}
+                  </button>
+                </div>
+              </div>
+
+              {poolError && <div className="dialog-error" role="alert" style={{ marginTop: 12 }}><CircleAlert size={15} />{ts(poolError)}</div>}
+
+              <div className="proxy-pool-list">
+                {poolProxies.filter((entry) => !entry.used).length ? (
+                  poolProxies.filter((entry) => !entry.used).map((entry) => (
+                    <div className="proxy-pool-row" key={entry.key}>
+                      <div className="proxy-pool-meta">
+                        <strong>{entry.label}</strong>
+                        <span>{entry.protocol}</span>
+                      </div>
+                      <button type="button" className="secondary-button" onClick={() => chooseProxy(entry)} disabled={Boolean(changingKey)}>
+                        {changingKey === entry.key ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}
+                        {t("选择")}
+                      </button>
+                    </div>
+                  ))
+                ) : (
+                  <div className="proxy-pool-empty">{poolLoading ? t("正在加载...") : t("代理池中没有未使用过的代理，请先在上方导入")}</div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
       </td>
     </tr>
   );
@@ -2978,6 +3745,7 @@ function JobLogs({ token, jobId }) {
 
 function StatusBadge({ status }) {
   const config = {
+    idle: [t("待启动"), <Play size={14} />],
     queued: [t("排队中"), <LoaderCircle size={14} />],
     starting: [t("启动中"), <LoaderCircle className="spin" size={14} />],
     working: [t("处理中"), <LoaderCircle className="spin" size={14} />],
@@ -2996,6 +3764,7 @@ function StatusBadge({ status }) {
     canceled: [t("已取消"), <Ban size={14} />],
     reauth_required: [t("待重新授权"), <RefreshCw size={14} />],
     resume_available: [t("可继续"), <RotateCcw size={14} />],
+    proxy_error: [t("代理连接失败"), <CircleAlert size={14} />],
   }[status] || [status, null];
   return <span className={`status-badge ${status}`}>{config[1]}{config[0]}</span>;
 }
@@ -3116,6 +3885,7 @@ function formatMonitorResult(result) {
   if (result.updated) parts.push(tf("已更新 {0} 条", result.updated));
   if (result.blocked) parts.push(tf("永久跳过 {0} 条", result.blocked));
   if (result.ineligible) parts.push(tf("需人工 {0} 条", result.ineligible));
+  if (result.disabled) parts.push(tf("已停止调度 {0} 条", result.disabled));
   if (result.missingTask) parts.push(tf("本地无任务 {0} 条", result.missingTask));
   if (result.busy) parts.push(tf("正在运行 {0} 条", result.busy));
   if (result.cooldown) parts.push(tf("冷却中 {0} 条", result.cooldown));
@@ -3178,6 +3948,7 @@ function parseProxyPasteList(text) {
     let user = "";
     let pass = "";
     let protocol = "";
+    let ambiguous = false; // true = không có tín hiệu rõ về giao thức (nút SOCKS5/HTTP tự quyết)
     const schemeM = line.match(/^([a-z][a-z0-9+.-]*):\/\//i);
     if (schemeM) {
       protocol = /socks/i.test(schemeM[1]) ? "socks5h" : "http";
@@ -3200,10 +3971,11 @@ function parseProxyPasteList(text) {
     if (!protocol) {
       if (socksPort && port === socksPort) protocol = "socks5h";
       else if (httpPort && port === httpPort) protocol = "http";
-      else protocol = lineInBlock % 2 === 1 ? "socks5h" : "http"; // dòng 1 = HTTP, dòng 2 = SOCKS5
+      else if (httpPort || socksPort) protocol = lineInBlock % 2 === 1 ? "socks5h" : "http"; // có header → đoán theo thứ tự dòng
+      else { protocol = "socks5h"; ambiguous = true; } // không header, không scheme → để nút chọn; mặc định SOCKS5
     }
     const auth = user ? `${user}:${pass}@` : "";
-    entries.push({ protocol, host, port, user, pass, url: `${protocol}://${auth}${host}:${port}`, label: line });
+    entries.push({ protocol, ambiguous, host, port, user, pass, url: `${protocol}://${auth}${host}:${port}`, label: line });
     lineInBlock += 1;
   }
   return entries;
@@ -3276,6 +4048,19 @@ function countBatchLines(value) {
   return String(value || "").split(/\r?\n/).filter((line) => line.trim()).length;
 }
 
+// Rút địa chỉ email để hiển thị trong danh sách "Thêm hàng loạt"; dòng vẫn giữ
+// nguyên định dạng gốc (email----body, url|pass|email|totp, …) khi gửi lên server.
+function extractLineEmail(raw) {
+  const match = String(raw || "").match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/);
+  return match ? match[0] : String(raw || "").trim();
+}
+
+// Every distinct email found in free-form text (lower-cased), in order of appearance.
+function extractEmails(value) {
+  const matches = String(value || "").toLowerCase().match(/[a-z0-9._%+-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+/g) || [];
+  return [...new Set(matches)];
+}
+
 function parseEmailFilter(value) {
   const lines = String(value || "")
     .split(/\r?\n/)
@@ -3314,7 +4099,7 @@ function extractResponseMessage(value) {
 
 function readLocalSetting(key) {
   try {
-    return window.localStorage.getItem(key) || "";
+    return settingsStore.getItem(key) || "";
   } catch {
     return "";
   }
@@ -3337,7 +4122,7 @@ function readLocalTextSetting(key) {
 
 function readSmsProviderSettings() {
   try {
-    const stored = JSON.parse(window.localStorage.getItem(SMS_PROVIDER_SETTINGS_KEY) || "null");
+    const stored = JSON.parse(settingsStore.getItem(SMS_PROVIDER_SETTINGS_KEY) || "null");
     if (stored && typeof stored === "object" && stored.configs && typeof stored.configs === "object") {
       return stored;
     }
@@ -3370,7 +4155,7 @@ function normalizeMailRequestSettings(value) {
 
 function readMailRequestSettings(value) {
   try {
-    const stored = value || JSON.parse(window.localStorage.getItem(MAIL_REQUEST_SETTINGS_KEY) || "null");
+    const stored = value || JSON.parse(settingsStore.getItem(MAIL_REQUEST_SETTINGS_KEY) || "null");
     return normalizeMailRequestSettings(stored);
   } catch {
     return normalizeMailRequestSettings({});
@@ -3438,7 +4223,7 @@ function normalizeSub2ApiSettings(value) {
 
 function readSub2ApiSettings(value) {
   try {
-    const stored = value || JSON.parse(window.localStorage.getItem(SUB2API_UPLOAD_SETTINGS_KEY) || "null");
+    const stored = value || JSON.parse(settingsStore.getItem(SUB2API_UPLOAD_SETTINGS_KEY) || "null");
     if (stored && typeof stored === "object") return normalizeSub2ApiSettings(stored);
   } catch {}
   return normalizeSub2ApiSettings({});
@@ -3525,6 +4310,267 @@ function formatSmsCountryName(option) {
   return regionLabel(option.iso) || ts(option.title) || tf("国家 {0}", option.country);
 }
 
+// The dialog can outlive a server restart, so tolerate a reply in an older shape instead of crashing on it.
+function normalizeSmsCodeCatalog(options) {
+  const list = (value) => (Array.isArray(value) ? value : []);
+  return {
+    balance: options?.balance || null,
+    platforms: list(options?.platforms),
+    platformId: String(options?.platformId || ""),
+    countries: list(options?.countries),
+    countryId: String(options?.countryId || ""),
+    operators: list(options?.operators).map((operator) => ({ ...operator, tiers: list(operator?.tiers) })),
+    loadedAt: Date.now(),
+  };
+}
+
+// One consistent SMSCode configuration for what the catalog offers, keeping saved choices that are still valid.
+function pickSmsCodeSelection(catalog, config) {
+  const platform = catalog.platforms.find((item) => item.value === catalog.platformId);
+  const country = catalog.countries.find((item) => item.value === catalog.countryId);
+  const operator = country
+    ? catalog.operators.find((item) => item.value === String(config.operatorId || "")) || catalog.operators[0]
+    : null;
+  const tier = operator
+    ? operator.tiers.find((item) => item.value === String(config.maxPriceIdr || ""))
+      || operator.tiers.find((item) => item.value === operator.defaultTier)
+      || operator.tiers[0]
+    : null;
+  const operatorLabel = operator?.value ? operator.label : "";
+  return {
+    platformId: catalog.platformId,
+    platformLabel: platform?.label || "",
+    countryId: country?.value || "",
+    countryLabel: country?.label || "",
+    catalogProductId: country?.catalogProductId || "",
+    operatorId: operator?.value || "",
+    operatorLabel,
+    maxPriceIdr: tier?.value || "",
+    maxPrice: tier?.price || "",
+    serviceLabel: tier ? [platform?.label, country.label, operatorLabel, tier.priceLabel].filter(Boolean).join(" · ") : "",
+  };
+}
+
+function formatSmsCodeCountry(country) {
+  const name = [country.emoji, country.label, country.dialCode ? `(${country.dialCode})` : ""].filter(Boolean).join(" ");
+  return country.priceLabel ? `${name} · ${tf("{0} 起", country.priceLabel)}` : name;
+}
+
+function SmsCodeField({ field, config, catalog, loading, platformItems, countryItems, onQuery, onChangeSelection, onUpdate }) {
+  const label = ts(field.label);
+  const operators = catalog?.operators || [];
+  const operator = operators.find((item) => item.value === String(config.operatorId || "")) || null;
+  const tiers = operator?.tiers || [];
+  // Before the first query the saved choice is shown as text; the lists only exist once the catalog is loaded.
+  const savedOnly = !catalog && Boolean(config.catalogProductId);
+
+  if (field.type === "smscode-platform") {
+    const info = catalog
+      ? [
+        catalog.balance ? `${t("余额")}: ${catalog.balance}` : "",
+        loading ? "" : tf("{0} 个国家可用", catalog.countries.length),
+      ].filter(Boolean).join(" · ")
+      : t("一次查询即可加载平台、国家、运营商和价格");
+    return (
+      <div className="settings-field wide-settings-field">
+        <span>{label}</span>
+        <div className="smscode-field">
+          <div className="smscode-query-row">
+            <button type="button" className="price-refresh-button" onClick={onQuery} disabled={loading}>
+              {loading ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}
+              {loading ? t("查询中") : t("查询服务")}
+            </button>
+            <span className="smscode-query-info">{info}</span>
+          </div>
+          <SearchPicker
+            icon={<Settings2 size={15} />}
+            items={platformItems}
+            value={config.platformId || ""}
+            placeholder={config.platformLabel || t("查询服务后选择平台")}
+            searchPlaceholder={t("搜索平台")}
+            emptyText={t("没有匹配的平台")}
+            ariaLabel={label}
+            disabled={!catalog || loading}
+            onSelect={(platformId) => onChangeSelection({ platformId, platformLabel: "", countryId: "" })}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  if (field.type === "smscode-country") {
+    let placeholder = config.countryLabel || t("查询服务后选择国家");
+    if (loading) placeholder = t("加载中…");
+    else if (catalog) placeholder = countryItems.length > 0 ? t("选择国家") : t("该平台暂无可用国家");
+    return (
+      <div className="settings-field wide-settings-field">
+        <span>{label}</span>
+        <div className="smscode-field">
+          <SearchPicker
+            key={catalog?.loadedAt || "idle"}
+            defaultOpen={Boolean(catalog) && !catalog.countryId && countryItems.length > 0}
+            icon={<Globe2 size={15} />}
+            items={countryItems}
+            value={config.countryId || ""}
+            placeholder={placeholder}
+            searchPlaceholder={t("搜索国家、区号或代码")}
+            emptyText={t("没有匹配的国家")}
+            ariaLabel={label}
+            disabled={!catalog || loading || countryItems.length === 0}
+            onSelect={(countryId) => onChangeSelection({ countryId })}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  if (field.type === "smscode-operator") {
+    let placeholder = t("选择国家后显示运营商");
+    if (loading) placeholder = t("加载中…");
+    else if (savedOnly) placeholder = config.operatorLabel || ts("不限运营商");
+    return (
+      <div className="settings-field">
+        <span>{label}</span>
+        <div className="smscode-field">
+          <div className="price-select-box">
+            <Smartphone size={15} />
+            <select
+              value={operator ? operator.value : ""}
+              onChange={(event) => onUpdate(pickSmsCodeSelection(catalog, { ...config, operatorId: event.target.value, maxPriceIdr: "" }))}
+              disabled={loading || operators.length === 0}
+              aria-label={label}
+            >
+              {operators.length === 0 && <option value="">{placeholder}</option>}
+              {operators.map((item) => (
+                <option key={item.value} value={item.value}>
+                  {`${ts(item.label)} · ${tf("{0} 起", item.tiers[0]?.priceLabel)}`}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  let placeholder = t("选择国家后显示价格");
+  if (loading) placeholder = t("加载中…");
+  else if (savedOnly && config.maxPrice) placeholder = `$${config.maxPrice}`;
+  return (
+    <div className="settings-field">
+      <span>{label}</span>
+      <div className="smscode-field">
+        <div className="price-select-box">
+          <Settings2 size={15} />
+          <select
+            value={tiers.some((tier) => tier.value === String(config.maxPriceIdr || "")) ? String(config.maxPriceIdr) : ""}
+            onChange={(event) => onUpdate(pickSmsCodeSelection(catalog, { ...config, maxPriceIdr: event.target.value }))}
+            disabled={loading || tiers.length === 0}
+            aria-label={label}
+          >
+            {tiers.length === 0 && <option value="">{placeholder}</option>}
+            {tiers.map((tier) => (
+              <option key={tier.value} value={tier.value}>
+                {`${tier.priceLabel} · ${tf("{0} 个号码", Number(tier.available).toLocaleString(currentLocale()))}`}
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const SEARCH_PICKER_MAX_ROWS = 200;
+
+// Dropdown with a filter box, for lists too long for a native <select> (1,200+ platforms, ~200 countries).
+function SearchPicker({ icon, items, value, placeholder, searchPlaceholder, emptyText, ariaLabel, disabled, defaultOpen = false, onSelect }) {
+  const [open, setOpen] = useState(defaultOpen);
+  const [query, setQuery] = useState("");
+  const rootRef = useRef(null);
+  const panelRef = useRef(null);
+  const expanded = open && !disabled;
+
+  useEffect(() => {
+    if (!expanded) return undefined;
+    panelRef.current?.scrollIntoView({ block: "nearest" });
+    const closeOnOutsidePress = (event) => {
+      if (!rootRef.current?.contains(event.target)) setOpen(false);
+    };
+    document.addEventListener("mousedown", closeOnOutsidePress);
+    return () => document.removeEventListener("mousedown", closeOnOutsidePress);
+  }, [expanded]);
+
+  const selected = items.find((item) => item.value === value);
+  const needle = query.trim().toLowerCase();
+  const matches = needle ? items.filter((item) => item.search.includes(needle)) : items;
+  const shown = matches.slice(0, SEARCH_PICKER_MAX_ROWS);
+  const choose = (item) => {
+    setOpen(false);
+    setQuery("");
+    if (item.value !== value) onSelect(item.value);
+  };
+
+  return (
+    <div className="search-picker" ref={rootRef}>
+      <button
+        type="button"
+        className="price-select-box search-picker-toggle"
+        onClick={() => setOpen((current) => !current)}
+        disabled={disabled}
+        aria-haspopup="listbox"
+        aria-expanded={expanded}
+        aria-label={`${ariaLabel}: ${selected ? selected.text : placeholder}`}
+      >
+        {icon}
+        <span className={`search-picker-value ${selected ? "" : "placeholder"}`}>{selected ? selected.text : placeholder}</span>
+        {expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+      </button>
+      {expanded && (
+        <div className="search-picker-panel" ref={panelRef}>
+          <div className="search-picker-search">
+            <Search size={14} />
+            <input
+              type="text"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter") return;
+                // Enter would otherwise submit the surrounding settings form.
+                event.preventDefault();
+                if (shown[0]) choose(shown[0]);
+              }}
+              placeholder={searchPlaceholder}
+              aria-label={searchPlaceholder}
+              spellCheck="false"
+              autoComplete="off"
+              autoFocus
+            />
+          </div>
+          <div className="search-picker-list" role="listbox" aria-label={ariaLabel}>
+            {shown.map((item) => (
+              <button
+                type="button"
+                role="option"
+                aria-selected={item.value === value}
+                className={item.value === value ? "active" : ""}
+                key={item.value}
+                onClick={() => choose(item)}
+              >
+                {item.text}
+              </button>
+            ))}
+            {shown.length === 0 && <div className="search-picker-note">{emptyText}</div>}
+            {matches.length > shown.length && (
+              <div className="search-picker-note">{tf("还有 {0} 项，请输入关键字筛选", matches.length - shown.length)}</div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function formatSmsPriceOption(option) {
   const name = formatSmsCountryName(option);
   return tf("{0} | 价格 {1} | 库存 {2}", name, option.price, option.count);
@@ -3532,17 +4578,17 @@ function formatSmsPriceOption(option) {
 
 function writeLocalJson(key, value) {
   try {
-    window.localStorage.setItem(key, JSON.stringify(value));
+    settingsStore.setItem(key, JSON.stringify(value));
   } catch {
-    // Private browsing modes may disable localStorage; the current tab still works.
+    // Saving is best-effort; the current tab still works.
   }
 }
 
 function writeLocalTextSetting(key, value) {
   try {
-    window.localStorage.setItem(key, String(value || ""));
+    settingsStore.setItem(key, String(value || ""));
   } catch {
-    // Private browsing modes may disable localStorage; the current tab still works.
+    // Saving is best-effort; the current tab still works.
   }
 }
 
@@ -3556,4 +4602,6 @@ function mergeJobs(...groups) {
 
 const appRoot = globalThis.__chatgptOnboardingRoot || createRoot(document.getElementById("root"));
 globalThis.__chatgptOnboardingRoot = appRoot;
-appRoot.render(<App />);
+// Settings come from the server database, so load them before the first render
+// (the state initializers above read them synchronously).
+void settingsStore.loadSettingsStore().finally(() => appRoot.render(<App />));

@@ -21,13 +21,35 @@ const DEFAULT_PASSWORD_ADD_RESULT = "tmp/chatgpt-password-add-result.json";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const PROFILE_MIN_AGE = 20;
 const PROFILE_MAX_AGE = 50;
-const PROFILE_FIRST_NAMES = [
-  "Alex", "Avery", "Blake", "Cameron", "Casey", "Drew", "Emerson", "Hayden",
-  "Jamie", "Jordan", "Logan", "Morgan", "Parker", "Quinn", "Reese", "Taylor",
+// Vietnamese name pools: full name = surname (họ) + middle (tên đệm) + given (tên).
+// Middle/given names are split by gender so combinations read naturally.
+const PROFILE_SURNAMES = [
+  "Nguyễn", "Trần", "Lê", "Phạm", "Hoàng", "Huỳnh", "Phan", "Vũ", "Võ", "Đặng",
+  "Bùi", "Đỗ", "Hồ", "Ngô", "Dương", "Lý", "Đào", "Đoàn", "Trịnh", "Đinh",
+  "Cao", "Mai", "Lưu", "Tô", "Tạ", "Hà", "Đàm", "Vương", "Chu", "Kiều",
+  "Lương", "Lâm", "Trương", "Quách", "Thái", "Phùng", "Tống", "Hứa", "Tăng", "Trầm",
 ];
-const PROFILE_LAST_NAMES = [
-  "Adams", "Baker", "Brooks", "Carter", "Clark", "Collins", "Cooper", "Evans",
-  "Foster", "Gray", "Hall", "Hayes", "Morgan", "Perry", "Reed", "Walker",
+const PROFILE_MALE_MIDDLE_NAMES = [
+  "Văn", "Hữu", "Đức", "Công", "Minh", "Quang", "Gia", "Bảo", "Nhật", "Hoàng",
+  "Tuấn", "Anh", "Khánh", "Duy", "Đình", "Hải", "Thành", "Trung", "Quốc", "Xuân",
+  "Phú", "Bá", "Đăng", "Ngọc", "Tiến", "Thế", "Việt", "Chí", "Mạnh", "Trọng",
+];
+const PROFILE_MALE_GIVEN_NAMES = [
+  "An", "Bình", "Cường", "Dũng", "Đạt", "Hiếu", "Hoàng", "Huy", "Hùng", "Khoa",
+  "Khánh", "Lâm", "Long", "Minh", "Nam", "Phong", "Phúc", "Quân", "Quang", "Sơn",
+  "Tâm", "Thắng", "Thành", "Trung", "Tú", "Tuấn", "Tùng", "Việt", "Vinh", "Vũ",
+  "Đức", "Kiên", "Lộc", "Nghĩa", "Nhân", "Tài", "Thịnh", "Toàn", "Trí", "Bảo",
+];
+const PROFILE_FEMALE_MIDDLE_NAMES = [
+  "Thị", "Ngọc", "Thanh", "Thu", "Kim", "Mỹ", "Diệu", "Hồng", "Bích", "Thúy",
+  "Phương", "Thùy", "Mai", "Lan", "Hương", "Xuân", "Anh", "Khánh", "Gia", "Quỳnh",
+  "Ái", "Cẩm", "Bảo", "Huyền", "Yến", "Tuyết", "Nhã", "Minh", "Hà", "Vân",
+];
+const PROFILE_FEMALE_GIVEN_NAMES = [
+  "Anh", "Chi", "Dung", "Dương", "Giang", "Hà", "Hằng", "Hạnh", "Hoa", "Hương",
+  "Lan", "Linh", "Mai", "Nga", "Ngân", "Ngọc", "Nhung", "Oanh", "Phương", "Quỳnh",
+  "Thảo", "Thu", "Thủy", "Trang", "Trâm", "Tuyết", "Uyên", "Vân", "Vy", "Yến",
+  "Ánh", "Diễm", "Hiền", "Loan", "My", "Nhi", "Như", "Thắm", "Trinh", "Tường",
 ];
 const HAR_ADD_PHONE_COOKIE_NAMES = new Set([
   "oai-login-csrf_dev_3772291445",
@@ -632,6 +654,7 @@ async function run() {
         concurrency: args.concurrency,
         priority: args.priority,
         rateMultiplier: args.rateMultiplier,
+        proxy: proxyTemplate,
         transport,
         cookie: client.jar.headerFor(authBase),
       });
@@ -938,7 +961,7 @@ function chatgptMfaHeaders({ chatgptBase, accessToken, deviceId }, targetPath) {
     authorization: `Bearer ${accessToken}`,
     "oai-device-id": deviceId,
     "oai-session-id": crypto.randomUUID(),
-    "oai-language": "zh-CN",
+    "oai-language": "vi-VN",
     "x-openai-target-path": targetPath,
     "x-openai-target-route": targetPath,
     origin: chatgptBase,
@@ -1256,6 +1279,11 @@ async function completeAccountProfileIfNeeded(client, { authBase, deviceId, payl
   console.log(
     `[profile] Account profile is incomplete; generating a name and an age between ${PROFILE_MIN_AGE} and ${PROFILE_MAX_AGE}.`,
   );
+  if (client.debugAuth || client.verbose) {
+    // Reveals which fields the server's about-you page expects (e.g. birthdate vs age).
+    console.log(`[debug] about_you server payload: ${JSON.stringify(payload)}`);
+    console.log(`[debug] create_account request body: ${JSON.stringify(profile)}`);
+  }
   console.log("[sentinel] Requesting a fresh security token for account profile creation.");
   let sentinelHeaders;
   try {
@@ -1296,6 +1324,9 @@ async function completeAccountProfileIfNeeded(client, { authBase, deviceId, payl
     }
     throw error;
   }
+  if (client.debugAuth || client.verbose) {
+    console.log(`[debug] create_account response payload: ${JSON.stringify(data)}`);
+  }
   if (isAccountProfileRequired(data)) {
     throw new Error("ACCOUNT_PROFILE_REQUIRED: Account profile submission did not advance the login flow.");
   }
@@ -1318,11 +1349,26 @@ async function completeAccountProfileIfNeeded(client, { authBase, deviceId, payl
   return data;
 }
 
+function pickRandom(list) {
+  return list[crypto.randomInt(list.length)];
+}
+
+function generateVietnameseName() {
+  const surname = pickRandom(PROFILE_SURNAMES);
+  const female = crypto.randomInt(2) === 0;
+  const given = pickRandom(female ? PROFILE_FEMALE_GIVEN_NAMES : PROFILE_MALE_GIVEN_NAMES);
+  // Randomly decide whether to include a middle name (tên đệm):
+  // sometimes just surname + given (họ và tên), sometimes the full name.
+  if (crypto.randomInt(2) === 0) {
+    return `${surname} ${given}`;
+  }
+  const middle = pickRandom(female ? PROFILE_FEMALE_MIDDLE_NAMES : PROFILE_MALE_MIDDLE_NAMES);
+  return `${surname} ${middle} ${given}`;
+}
+
 function generateAccountProfile(now = new Date()) {
-  const firstName = PROFILE_FIRST_NAMES[crypto.randomInt(PROFILE_FIRST_NAMES.length)];
-  const lastName = PROFILE_LAST_NAMES[crypto.randomInt(PROFILE_LAST_NAMES.length)];
   return {
-    name: `${firstName} ${lastName}`,
+    name: generateVietnameseName(),
     birthdate: generateBirthdate(PROFILE_MIN_AGE, PROFILE_MAX_AGE, now),
   };
 }
@@ -1681,6 +1727,7 @@ async function buildSub2apiOauthExport({
   concurrency,
   priority,
   rateMultiplier,
+  proxy,
   transport,
   cookie,
 }) {
@@ -1704,7 +1751,7 @@ async function buildSub2apiOauthExport({
   const chatgptAccountId = claims.sid || "";
   const chatgptUserId = authClaims.user_id || claims.sub || "";
   const account = {
-    name: accountName || buildAccountName(email),
+    name: accountName || claims.name || buildAccountName(email),
     platform: "openai",
     type: "oauth",
     credentials: {
@@ -1731,13 +1778,18 @@ async function buildSub2apiOauthExport({
     auto_pause_on_expired: true,
   };
 
+  // Link the account to the proxy/IP it registered with (empty when created on
+  // the machine's own network).
+  const registrationProxy = proxyUrlToSub2ApiProxy(proxy);
+  if (registrationProxy) account.proxy_key = registrationProxy.proxy_key;
+
   return {
     account,
     data: {
       type: "sub2api-data",
       version: 1,
       exported_at: new Date().toISOString(),
-      proxies: [],
+      proxies: registrationProxy ? [registrationProxy] : [],
       accounts: [account],
     },
   };
@@ -1830,7 +1882,8 @@ async function refreshSub2apiOauthExport({ authBase, sourcePath, targetPath, fal
         client_id: clientId,
         email,
       };
-      if (email) account.name = buildAccountName(email);
+      if (claims.name) account.name = claims.name;
+      else if (email) account.name = buildAccountName(email);
     } catch {
       // Keep the existing account metadata if the provider omits or changes the ID token format.
     }
@@ -2290,6 +2343,36 @@ function normalizeProxyUrl(value) {
     throw new Error("账号代理只支持 http、https、socks5 和 socks5h 协议");
   }
   return parsed.toString();
+}
+
+// Turn the account's registration proxy URL into a Sub2API "sub2api-data" proxy
+// object so the imported account can be linked to the exact IP it signed up with.
+// Returns null when no (valid) proxy was used — i.e. the account was created on
+// the machine's own network.
+function proxyUrlToSub2ApiProxy(value) {
+  let normalized;
+  try {
+    normalized = normalizeProxyUrl(value);
+  } catch {
+    return null;
+  }
+  if (!normalized) return null;
+  let url;
+  try {
+    url = new URL(normalized);
+  } catch {
+    return null;
+  }
+  const protocol = { "http:": "http", "https:": "https", "socks5:": "socks5", "socks5h:": "socks5h" }[url.protocol];
+  const host = url.hostname;
+  const port = Number(url.port);
+  if (!protocol || !host || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+  const username = url.username ? decodeURIComponent(url.username) : "";
+  const password = url.password ? decodeURIComponent(url.password) : "";
+  // Deterministic key from the 5-tuple: identical proxies share one entry, and it
+  // mirrors Sub2API's own dedup key (protocol|host|port|username|password).
+  const proxyKey = `p_${crypto.createHash("sha1").update([protocol, host, port, username, password].join("|")).digest("hex").slice(0, 16)}`;
+  return { proxy_key: proxyKey, name: `${host}:${port}`, protocol, host, port, username, password, status: "active" };
 }
 
 function base64Url(buffer) {

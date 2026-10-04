@@ -62,7 +62,7 @@ def _browser_major(user_agent: str) -> str:
 def navigation_headers(user_agent: str, browser_identity: dict[str, Any] | None = None) -> dict[str, str]:
     identity = browser_identity or {}
     major = _browser_major(user_agent)
-    accept_language = str(identity.get("acceptLanguage") or "zh-CN,zh;q=0.9,en;q=0.8")
+    accept_language = str(identity.get("acceptLanguage") or "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7")
     sec_ch_ua = str(identity.get("secChUa") or (
         f'"Chromium";v="{major}", "Google Chrome";v="{major}", "Not.A/Brand";v="99"'
     ))
@@ -139,7 +139,7 @@ def request_headers(
         if hasattr(supplied, "items") else {}
     )
     headers.setdefault("user-agent", user_agent)
-    headers.setdefault("accept-language", str(identity.get("acceptLanguage") or "zh-CN,zh;q=0.9,en;q=0.8"))
+    headers.setdefault("accept-language", str(identity.get("acceptLanguage") or "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"))
     if identity.get("secChUa"):
         headers.setdefault("sec-ch-ua", str(identity["secChUa"]))
     if identity.get("secChUaMobile"):
@@ -328,7 +328,7 @@ def solve_challenge(
                 frame_headers = {
                     "user-agent": user_agent,
                     "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                    "accept-language": str((browser_identity or {}).get("acceptLanguage") or "zh-CN,zh;q=0.9,en;q=0.8"),
+                    "accept-language": str((browser_identity or {}).get("acceptLanguage") or "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"),
                     "referer": challenge_url,
                     "sec-fetch-dest": "iframe",
                     "sec-fetch-mode": "navigate",
