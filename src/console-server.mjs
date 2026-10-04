@@ -691,44 +691,55 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
-  // Áp dụng việc gán proxy theo domain cho các TÀI KHOẢN ĐÃ CÓ: tài khoản nào
-  // đang dùng proxy nay đã thành độc quyền của MỘT domain khác (email không khớp
-  // domain đó) sẽ được đổi sang proxy phù hợp (proxy riêng của domain nó nếu có,
-  // không thì pool chung đã loại các host độc quyền). Chỉ đổi tài khoản KHÔNG
-  // đang chạy để không làm gián đoạn phiên đăng ký; tài khoản đang chạy được bỏ
-  // qua và báo lại số lượng.
+  // Áp dụng việc gán proxy theo domain cho các TÀI KHOẢN ĐÃ CÓ. Một tài khoản bị
+  // coi là "đặt sai proxy" và cần đổi khi:
+  //   (A) email thuộc domain CÓ proxy riêng, nhưng hiện KHÔNG nằm trên proxy riêng
+  //       đó (vd dataidcc.com đang dùng proxy pool chung) → kéo về proxy riêng; hoặc
+  //   (B) email KHÔNG thuộc domain nào có proxy riêng, nhưng đang dùng proxy nay đã
+  //       thành độc quyền của domain khác → đẩy sang proxy phù hợp.
+  // Proxy thay thế lấy qua allocator (proxy riêng của domain nó nếu còn chỗ, hết thì
+  // mượn pool chung đã loại host độc quyền). Chỉ đổi tài khoản KHÔNG đang chạy để
+  // không làm gián đoạn phiên đăng ký; tài khoản đang chạy được bỏ qua và báo lại.
   if (req.method === "POST" && requestUrl.pathname === "/api/proxies/apply-domains") {
     const body = await readJson(req);
     const config = readProxyAllocConfig(body);
     const limitPerIp = Math.min(999, Math.max(1, Math.trunc(Number(body.limitPerIp)) || 15));
-    // host -> domain mà nó được gán riêng.
+    // Mỗi domain group: tập host của nó; và map host -> domain độc quyền.
     const domainOfHost = new Map();
-    for (const group of config.groups) {
-      for (const item of dedupeProxyUrls(group.proxies)) domainOfHost.set(item.host, group.domain);
-    }
+    const groupHostSets = config.groups.map((group) => {
+      const hosts = new Set(dedupeProxyUrls(group.proxies).map((item) => item.host));
+      for (const host of hosts) domainOfHost.set(host, group.domain);
+      return { domain: group.domain, hosts };
+    });
+    const groupForDomain = (domain) => groupHostSets.find((g) => domain === g.domain || domain.endsWith(`.${g.domain}`)) || null;
     const allocator = makeProxyAllocator(config, limitPerIp);
     let reassigned = 0;
     let skippedRunning = 0;
     let noProxy = 0;
-    const mismatched = [];
+    const misplaced = [];
     for (const job of listUniqueJobs()) {
       if (job.deleted || !job.proxyUrl) continue;
       const parsed = parseProxyUrlForSub2Api(job.proxyUrl);
       if (!parsed) continue;
-      const boundDomain = domainOfHost.get(parsed.host);
-      if (!boundDomain) continue; // proxy hiện tại không bị gán độc quyền → giữ nguyên
-      const emailDomain = emailDomainPart(job.email);
-      if (emailDomain === boundDomain || emailDomain.endsWith(`.${boundDomain}`)) continue; // đúng domain
-      mismatched.push(job); // đang dùng proxy độc quyền của domain khác → cần đổi
+      const domain = emailDomainPart(job.email);
+      const ownGroup = groupForDomain(domain);
+      if (ownGroup) {
+        // (A) domain có proxy riêng → phải nằm trên 1 host của chính nó.
+        if (!ownGroup.hosts.has(parsed.host)) misplaced.push(job);
+      } else if (domainOfHost.has(parsed.host)) {
+        // (B) đang dùng proxy độc quyền của domain khác.
+        misplaced.push(job);
+      }
     }
-    for (const job of mismatched) {
+    for (const job of misplaced) {
       if (occupiesActiveSlot(job)) { skippedRunning += 1; continue; }
       const newProxy = allocator.next(job.email);
       if (!newProxy) { noProxy += 1; continue; }
+      // allocator có thể trả lại đúng proxy job đang dùng (hiếm) → updateJobProxy tự bỏ qua.
       await withEmailJobLock(job.email, () => updateJobProxy(job, newProxy));
       reassigned += 1;
     }
-    sendJson(res, 200, { mismatched: mismatched.length, reassigned, skippedRunning, noProxy });
+    sendJson(res, 200, { misplaced: misplaced.length, reassigned, skippedRunning, noProxy });
     return;
   }
 

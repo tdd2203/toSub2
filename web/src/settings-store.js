@@ -44,21 +44,29 @@ export function setItem(key, value) {
   scheduleFlush();
 }
 
-// Move anything an older version left in localStorage to the server. This runs
-// once per browser, and the local copy wins: it is the configuration that browser
-// was really using, while the server may only hold defaults written by another
-// one. The local copy is dropped only once the server has it.
+// Move settings an older version left in localStorage up to the server, but ONLY
+// for keys the server does not already have — the SERVER WINS for any key it
+// already holds. This prevents a browser whose localStorage is empty/stale (e.g.
+// a fresh preview, or a tab that once failed to load) from clobbering the real
+// server config (a nasty data-loss bug). Stale local copies of keys the server
+// already has are simply dropped so they can never interfere again.
 async function migrateLocalStorage() {
-  const moved = {};
+  const moved = {}; // keys the server lacks → migrate up
+  const stale = []; // keys the server already has → drop the local copy, never push
   try {
     for (let i = 0; i < window.localStorage.length; i += 1) {
       const key = window.localStorage.key(i);
       if (!key || !key.startsWith(KEY_PREFIX)) continue;
       const value = window.localStorage.getItem(key);
-      if (value !== null) moved[key] = value;
+      if (value === null) continue;
+      if (cache.has(key)) stale.push(key); // server already has it → keep server's
+      else moved[key] = value;
     }
   } catch {
     return;
+  }
+  for (const key of stale) {
+    try { window.localStorage.removeItem(key); } catch {}
   }
   if (!Object.keys(moved).length) return;
   for (const [key, value] of Object.entries(moved)) cache.set(key, value);

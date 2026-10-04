@@ -2456,7 +2456,7 @@ function App() {
                     </button>
                   </div>
                   {domainApplyNotice ? <div className="domain-proxy-notice">{ts(domainApplyNotice)}</div> : null}
-                  <div className="domain-proxy-hint">{t("把某代理分配给域名后，它会自动从通用池移除；点“为现有账号更换代理”可把正用着该代理的其它域名账号改到合适代理（运行中的账号会跳过）。")}</div>
+                  <div className="domain-proxy-hint">{t("把某代理分配给域名后它会自动从通用池移除；点“为现有账号更换代理”会把该域名的已有账号移到它的专用代理，并把占用该代理的其它域名账号移走（运行中的账号会跳过）。")}</div>
                 </div>
               </div>
             ) : (

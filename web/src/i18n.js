@@ -353,8 +353,8 @@ const VI = {
   "请填写该域名的代理": "Hãy nhập proxy cho domain này",
   "为现有账号更换代理": "Đổi proxy cho tài khoản hiện có",
   "已为 {0} 个账号更换代理（跳过运行中 {1} · 无可用代理 {2}）": "Đã đổi proxy cho {0} tài khoản (bỏ qua đang chạy {1} · không có proxy phù hợp {2})",
-  "把某代理分配给域名后，它会自动从通用池移除；点“为现有账号更换代理”可把正用着该代理的其它域名账号改到合适代理（运行中的账号会跳过）。":
-    "Sau khi gán proxy cho domain, nó tự gỡ khỏi pool chung; bấm “Đổi proxy cho tài khoản hiện có” để chuyển các tài khoản domain khác đang dùng proxy đó sang proxy phù hợp (tài khoản đang chạy sẽ bỏ qua).",
+  "把某代理分配给域名后它会自动从通用池移除；点“为现有账号更换代理”会把该域名的已有账号移到它的专用代理，并把占用该代理的其它域名账号移走（运行中的账号会跳过）。":
+    "Sau khi gán proxy cho domain nó tự gỡ khỏi pool chung; bấm “Đổi proxy cho tài khoản hiện có” sẽ kéo các tài khoản của domain đó về proxy riêng, và đẩy tài khoản domain khác đang chiếm proxy đó sang proxy phù hợp (tài khoản đang chạy sẽ bỏ qua).",
   "使用中": "Đang sử dụng",
   "未使用": "Chưa sử dụng",
   "已用完": "Đã sử dụng",
