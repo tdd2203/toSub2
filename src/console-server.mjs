@@ -6563,6 +6563,32 @@ async function updateJobCredentials(job, credentials, options = {}) {
   }
 }
 
+// Keep the saved import file (sub2api-import-oauth.json) in sync when an account's
+// proxy is changed AFTER registration. Both the download and the Sub2API upload
+// read the proxy from this file, not from the live job — without this, a reassigned
+// account would still be downloaded/uploaded with the proxy it signed up through.
+async function rewriteResultFileProxy(job) {
+  if (!job.resultSaved || !job.outputPath) return;
+  if (!(await fileExists(job.outputPath))) return;
+  let data;
+  try {
+    data = JSON.parse(await fs.readFile(job.outputPath, "utf8"));
+  } catch {
+    return;
+  }
+  if (data?.type !== "sub2api-data" || !Array.isArray(data.accounts)) return;
+  const proxy = job.proxyUrl ? proxyUrlToCreatableSub2ApiProxy(job.proxyUrl) : null;
+  for (const account of data.accounts) {
+    if (!account || typeof account !== "object") continue;
+    if (proxy) account.proxy_key = proxy.proxy_key;
+    else delete account.proxy_key;
+  }
+  data.proxies = proxy ? [proxy] : [];
+  try {
+    await fs.writeFile(job.outputPath, `${JSON.stringify(data, null, 2)}\n`);
+  } catch {}
+}
+
 async function updateJobProxy(job, proxyUrl) {
   if (job.proxyUrl === proxyUrl) return;
   job.proxyUrl = proxyUrl;
@@ -6571,6 +6597,7 @@ async function updateJobProxy(job, proxyUrl) {
   job.proxyConnectionError = false;
   job.failedProxyLabel = null;
   await saveStoredLoginCredentials(job.email, job);
+  await rewriteResultFileProxy(job);
   recordJobOperation(job, "proxy_update");
   appendJobLog(job, "[proxy] 账号代理配置已更新。\n");
   if (isActive(job.status) && job.status !== "queued" && job.status !== "idle") {
@@ -6644,6 +6671,7 @@ async function changeJobProxy(job, body = {}) {
   job.proxyConnectionError = false;
   job.failedProxyLabel = null;
   await saveStoredLoginCredentials(job.email, job);
+  await rewriteResultFileProxy(job);
   recordProxyUsage(proxyUrl, job.email);
   recordJobOperation(job, "proxy_change");
   appendJobLog(job, `[proxy] 已更换为新的代理线路（${identity.label}，出口 IP ${check.ip || "未知"}）。\n`);

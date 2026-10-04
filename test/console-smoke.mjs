@@ -141,6 +141,7 @@ const child = spawn(process.execPath, [
       "10.0.0.2": "10.0.0.2",
       "10.0.0.3": "10.0.0.3",
       "10.0.0.4": "10.0.0.4",
+      "10.0.0.5": "10.0.0.5",
       "10.0.0.9": "10.0.0.9",
     }),
     SUB2API_AUTO_REPAIR_COOLDOWN_MS: "0",
@@ -347,6 +348,30 @@ try {
   assert.equal(by3.get("10.0.0.4"), 2, "d3.test phân bổ đều: 10.0.0.4 nhận 2");
   assert.ok(!by3.get("10.0.0.9"), "chưa chạm pool chung vì proxy riêng còn chỗ");
   await fetch(`${baseUrl}/api/jobs/delete-batch`, { method: "POST", headers, body: JSON.stringify({ ids: multi.jobs.map((j) => j.id) }) });
+
+  // --- Đổi proxy SAU đăng ký phải cập nhật luôn file import tải xuống (proxy mới,
+  // không còn proxy cũ) — vì cả tải xuống lẫn upload Sub2API đọc proxy từ file này. ---
+  const dlBatch = await fetch(`${baseUrl}/api/jobs/batch`, {
+    method: "POST", headers,
+    body: JSON.stringify({ text: "dl@d9.test", proxyMode: "batch", limitPerIp: 15, proxies: "socks5h://10.0.0.9:1080" }),
+  });
+  const dlJob = JSON.parse(await dlBatch.text()).jobs[0];
+  await waitForJob(headers, dlJob.id, (value) => value.status === "completed");
+  const applyDl = await fetch(`${baseUrl}/api/proxies/apply-domains`, {
+    method: "POST", headers,
+    body: JSON.stringify({
+      limitPerIp: 15,
+      proxies: "socks5h://10.0.0.9:1080",
+      domainProxies: [{ domain: "d9.test", proxies: "socks5h://10.0.0.5:1080" }],
+    }),
+  });
+  const applyDlData = JSON.parse(await applyDl.text());
+  assert.equal(applyDlData.reassigned, 1, "dl@d9.test được đổi sang proxy riêng");
+  const dlFile = JSON.parse(await (await fetch(`${baseUrl}/api/jobs/${dlJob.id}/download`, { headers })).text());
+  assert.equal(dlFile.proxies.length, 1, "file import có đúng 1 proxy sau khi đổi");
+  assert.equal(dlFile.proxies[0].host, "10.0.0.5", "file import mang proxy MỚI (10.0.0.5), không phải proxy cũ");
+  assert.ok(dlFile.accounts[0].proxy_key && dlFile.accounts[0].proxy_key === dlFile.proxies[0].proxy_key, "account liên kết đúng proxy mới");
+  await fetch(`${baseUrl}/api/jobs/delete-batch`, { method: "POST", headers, body: JSON.stringify({ ids: [dlJob.id] }) });
 
   const forbiddenMailHeaderResponse = await fetch(`${baseUrl}/api/mail-request-config`, {
     method: "POST",
