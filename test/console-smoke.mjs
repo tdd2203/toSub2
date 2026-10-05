@@ -14,6 +14,8 @@ const baseUrl = `http://127.0.0.1:${port}`;
 const sub2apiPort = await findAvailablePort();
 const sub2apiUrl = `http://127.0.0.1:${sub2apiPort}`;
 let uploadedAccounts = [];
+let createdProxies = [];
+let proxyIdSeq = 100;
 let remoteErrorAccounts = [];
 const updatedRemoteAccounts = new Map();
 const clearedRemoteAccountIds = new Set();
@@ -37,6 +39,16 @@ const sub2api = http.createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/api/v1/admin/proxies/all") {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify([{ id: 3, name: "测试代理", protocol: "http", host: "proxy.example", port: 8080, ip_address: "203.0.113.10", status: "active" }]));
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/v1/admin/proxies") {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const id = ++proxyIdSeq;
+    createdProxies.push({ id, ...body });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ id }));
     return;
   }
   if (req.method === "POST" && req.url === "/api/v1/admin/accounts/batch") {
@@ -910,6 +922,25 @@ try {
     }),
   });
   assert.equal(invalidFingerprintUploadResponse.status, 400, await invalidFingerprintUploadResponse.text());
+
+  // --- Upload Sub2API TỰ gán proxy theo domain: account-profile@example.com thuộc
+  // domain example.com có proxy riêng 10.0.0.7 → upload phải tạo proxy đó và gán
+  // proxy_id của account vào nó (bất kể account đăng ký bằng proxy nào). ---
+  createdProxies = [];
+  const domainUploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      ids: [profileJob.id],
+      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", groupIds: ["7"] },
+      proxyLink: { mode: "batch", limitPerIp: 15, proxies: "socks5h://10.0.0.9:1080", domainProxies: [{ domain: "example.com", proxies: "socks5h://10.0.0.7:1080" }] },
+    }),
+  });
+  assert.equal(domainUploadResponse.status, 200, await domainUploadResponse.text());
+  const domainProxy = createdProxies.find((p) => p.host === "10.0.0.7");
+  assert.ok(domainProxy, "upload đã tạo proxy riêng của domain (10.0.0.7) trên Sub2API");
+  assert.equal(uploadedAccounts[0].credentials.email, "account-profile@example.com");
+  assert.equal(uploadedAccounts[0].proxy_id, domainProxy.id, "account example.com được gán đúng proxy riêng của domain");
 
   const mailApiUrl = `${baseUrl}/api/bootstrap`;
   const sourceLines = [

@@ -1270,30 +1270,67 @@ async function handleApi(req, res, requestUrl) {
     let proxiesCreated = 0;
     let unassigned = 0;
     let proxyIdForAccount;
-    if (batchMode) {
-      const limitPerIp = Math.max(1, Math.floor(Number(proxyLink.limitPerIp) || 15));
-      const batchObjs = parseProxyList(proxyLink.proxies);
-      if (batchObjs.length === 0) throw httpError(400, "批量代理列表为空或格式不正确");
 
-      // Keep each account's own registration proxy when it is still alive; only
-      // accounts without a (working) proxy draw from the batch list (15/IP).
-      const oldProxyByKey = new Map();
-      for (const p of payload.proxies) if (p?.proxy_key) oldProxyByKey.set(p.proxy_key, p);
-      const liveOldKeys = new Set();
-      for (const [key, p] of oldProxyByKey) {
-        const check = await checkProxyExitIp(proxyObjToUrl(p));
-        if (check.ok) liveOldKeys.add(key);
+    // Bước 0 (ưu tiên cao nhất): nếu email của account thuộc domain có proxy RIÊNG,
+    // gán proxy theo domain (round-robin trong list của domain, theo limit mỗi IP;
+    // domain hết chỗ thì mượn pool chung) — bất kể account đăng ký bằng proxy nào.
+    // Tạo sẵn các proxy domain trên Sub2API và map URL -> proxy_id. Account không
+    // thuộc domain nào có proxy riêng sẽ đi theo luồng cũ bên dưới.
+    const allocConfig = readProxyAllocConfig(proxyLink || {});
+    const limitPerIpUpload = Math.max(1, Math.floor(Number(proxyLink?.limitPerIp) || 15));
+    const domainProxyIdByUrl = new Map();
+    let domainUrlByIndex = [];
+    if (allocConfig.groups.length) {
+      const domainAllocator = makeProxyAllocator(allocConfig, limitPerIpUpload);
+      const emailOf = (acc) => String(acc?.credentials?.email || acc?.extra?.email || "");
+      const groupForDomain = (domain) => allocConfig.groups.find((g) => domain === g.domain || domain.endsWith(`.${g.domain}`));
+      domainUrlByIndex = payload.accounts.map((acc) => {
+        const domain = emailDomainPart(emailOf(acc));
+        if (!domain || !groupForDomain(domain)) return null;
+        return domainAllocator.next(emailOf(acc)) || null;
+      });
+      for (const url of new Set(domainUrlByIndex.filter(Boolean))) {
+        const obj = parseProxyUrlForSub2Api(url);
+        if (!obj) continue;
+        const ids = await createSub2ApiProxyList(config, [obj]);
+        if (ids[0]) { domainProxyIdByUrl.set(url, ids[0]); proxiesCreated += 1; }
       }
+    }
+    const domainProxyIdFor = (index) => {
+      const url = domainUrlByIndex[index];
+      return url ? domainProxyIdByUrl.get(url) : undefined;
+    };
+    // Có account nào KHÔNG được gán proxy domain không → mới cần luồng proxy cũ/chung.
+    const needGeneralProxies = payload.accounts.some((_, index) => !domainUrlByIndex[index]);
+
+    if (batchMode) {
+      const limitPerIp = limitPerIpUpload;
       const oldIdByKey = new Map();
-      for (const key of liveOldKeys) {
-        const ids = await createSub2ApiProxyList(config, [oldProxyByKey.get(key)]);
-        if (ids[0]) { oldIdByKey.set(key, ids[0]); proxiesCreated += 1; }
+      let batchProxyIds = [];
+      if (needGeneralProxies) {
+        const batchObjs = parseProxyList(proxyLink.proxies);
+        if (batchObjs.length === 0) throw httpError(400, "批量代理列表为空或格式不正确");
+        // Keep each account's own registration proxy when it is still alive; only
+        // accounts without a (working) proxy draw from the batch list (15/IP).
+        const oldProxyByKey = new Map();
+        for (const p of payload.proxies) if (p?.proxy_key) oldProxyByKey.set(p.proxy_key, p);
+        const liveOldKeys = new Set();
+        for (const [key, p] of oldProxyByKey) {
+          const check = await checkProxyExitIp(proxyObjToUrl(p));
+          if (check.ok) liveOldKeys.add(key);
+        }
+        for (const key of liveOldKeys) {
+          const ids = await createSub2ApiProxyList(config, [oldProxyByKey.get(key)]);
+          if (ids[0]) { oldIdByKey.set(key, ids[0]); proxiesCreated += 1; }
+        }
+        batchProxyIds = await createSub2ApiProxyList(config, batchObjs);
+        proxiesCreated += batchProxyIds.length;
       }
-      const batchProxyIds = await createSub2ApiProxyList(config, batchObjs);
-      proxiesCreated += batchProxyIds.length;
 
       let fill = 0;
-      proxyIdForAccount = (_index, account) => {
+      proxyIdForAccount = (index, account) => {
+        const domainId = domainProxyIdFor(index);
+        if (domainId) return domainId; // proxy riêng của domain — ưu tiên tuyệt đối
         const key = account.proxy_key;
         if (key && oldIdByKey.has(key)) return oldIdByKey.get(key); // old IP still works → keep it
         const slot = Math.floor(fill / limitPerIp);
@@ -1301,9 +1338,15 @@ async function handleApi(req, res, requestUrl) {
         return slot < batchProxyIds.length ? batchProxyIds[slot] : undefined;
       };
     } else {
-      const { idByKey, created } = await createSub2ApiProxyIds(config, payload.proxies);
-      proxiesCreated = created;
-      proxyIdForAccount = (_index, account) => (account.proxy_key ? idByKey.get(account.proxy_key) : undefined);
+      const { idByKey, created } = needGeneralProxies
+        ? await createSub2ApiProxyIds(config, payload.proxies)
+        : { idByKey: new Map(), created: 0 };
+      proxiesCreated += created;
+      proxyIdForAccount = (index, account) => {
+        const domainId = domainProxyIdFor(index);
+        if (domainId) return domainId;
+        return account.proxy_key ? idByKey.get(account.proxy_key) : undefined;
+      };
     }
 
     // Step 3: batch-create accounts, each carrying its proxy_id and group_ids.
