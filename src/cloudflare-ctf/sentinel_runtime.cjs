@@ -196,6 +196,37 @@ function installEnvironment(win, isFrame) {
   defineValue(win.screen, "height", input.screenHeight || 1080);
   defineValue(win.screen, "availWidth", input.screenWidth || 1920);
   defineValue(win.screen, "availHeight", input.screenHeight || 1080);
+  // navigator.vendor must match the Chrome UA — jsdom defaults it to Safari's
+  // "Apple Computer, Inc.", which contradicts the Chrome user agent on every
+  // account (a uniform inconsistency OpenAI can key on).
+  defineValue(win.navigator, "vendor", input.vendor || "Google Inc.");
+  // Real Chrome exposes window.chrome; its absence is a classic headless tell.
+  if (!win.chrome) {
+    defineValue(win, "chrome", {
+      app: { isInstalled: false },
+      runtime: {},
+      csi: function () {},
+      loadTimes: function () {},
+    });
+  }
+  // Real Chrome ships the built-in PDF viewer (five plugin entries, all pointing
+  // at the internal PDF viewer); jsdom reports an empty list — another headless
+  // tell. Provide the standard modern-Chrome plugin set.
+  try {
+    const mkPlugin = (name, filename, description) => ({ name, filename, description, length: 1 });
+    const pluginList = [
+      mkPlugin("PDF Viewer", "internal-pdf-viewer", "Portable Document Format"),
+      mkPlugin("Chrome PDF Viewer", "internal-pdf-viewer", "Portable Document Format"),
+      mkPlugin("Chromium PDF Viewer", "internal-pdf-viewer", "Portable Document Format"),
+      mkPlugin("Microsoft Edge PDF Viewer", "internal-pdf-viewer", "Portable Document Format"),
+      mkPlugin("WebKit built-in PDF", "internal-pdf-viewer", "Portable Document Format"),
+    ];
+    pluginList.item = (i) => pluginList[i] || null;
+    pluginList.namedItem = (n) => pluginList.find((p) => p.name === n) || null;
+    pluginList.refresh = () => {};
+    defineValue(win.navigator, "plugins", pluginList);
+    defineValue(win.navigator, "mimeTypes", { length: 1, item: () => null, namedItem: () => null });
+  } catch (_) {}
 
   if (!win.crypto.randomUUID) {
     defineValue(win.crypto, "randomUUID", () => nodeCrypto.randomUUID());

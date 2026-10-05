@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import selectors
 import subprocess
@@ -192,13 +193,24 @@ def start_runtime(
         "languages": identity.get("languages") or ["vi-VN", "vi", "en"],
         "cookies": cookies or {},
         "debug": debug,
-        "screenWidth": screen_width,
-        "screenHeight": screen_height,
+        # Per-account device environment (from the JS browser identity, seeded by
+        # oai-did). Falls back to the fixed params / runtime defaults when absent.
+        "screenWidth": identity.get("screenWidth") or screen_width,
+        "screenHeight": identity.get("screenHeight") or screen_height,
+        "hardwareConcurrency": identity.get("hardwareConcurrency") or 8,
+        "deviceMemory": identity.get("deviceMemory") or 8,
+        "jsHeapSizeLimit": identity.get("jsHeapSizeLimit") or 4395630592,
+        "vendor": identity.get("vendor") or "Google Inc.",
+        "canvasSeed": identity.get("canvasSeed") or "",
         **assets,
     }
     input_file = tempfile.NamedTemporaryFile(mode="w", suffix=".json")
     json.dump(runtime_input, input_file)
     input_file.flush()
+    # Pin the child's timezone to the identity's zone (matches the exit IP), so the
+    # Sentinel environment reports Asia/Ho_Chi_Minh instead of leaking the host's.
+    child_env = dict(os.environ)
+    child_env["TZ"] = str(identity.get("timezoneId") or "Asia/Ho_Chi_Minh")
     process = subprocess.Popen(
         [node_command, str(RUNTIME), input_file.name],
         stdin=subprocess.PIPE,
@@ -206,6 +218,7 @@ def start_runtime(
         stderr=None,
         text=True,
         bufsize=1,
+        env=child_env,
     )
     return process, input_file
 

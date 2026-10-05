@@ -59,7 +59,13 @@ const PROXY_POOL_FILENAME = "proxy-pool.json";
 const DEACTIVATED_EMAILS_FILENAME = "deactivated-emails.json";
 const USED_PHONES_FILENAME = "used-phones.json";
 const SUB2API_MONITOR_INTERVAL_MS = readDurationEnv("SUB2API_MONITOR_INTERVAL_MS", 5 * 60_000, 1_000);
-const SUB2API_AUTO_REPAIR_COOLDOWN_MS = readDurationEnv("SUB2API_AUTO_REPAIR_COOLDOWN_MS", 5 * 60_000, 0);
+// Cooldown GIỮA hai lần tự re-login/cập nhật cùng một tài khoản. PHẢI lớn hơn chu
+// kỳ monitor — nếu bằng nhau (trước đây cùng 5') thì một tài khoản còn lỗi sẽ bị
+// re-login lại gần như mỗi vòng, dồn hàng chục lần đăng nhập lên cùng một IP và
+// đẩy nhanh việc bị OpenAI khoá. Có backoff luỹ thừa theo số lần thử (xem
+// isAutoRepairCoolingDown), trần SUB2API_AUTO_REPAIR_COOLDOWN_MAX_MS.
+const SUB2API_AUTO_REPAIR_COOLDOWN_MS = readDurationEnv("SUB2API_AUTO_REPAIR_COOLDOWN_MS", 15 * 60_000, 0);
+const SUB2API_AUTO_REPAIR_COOLDOWN_MAX_MS = 2 * 60 * 60_000;
 const MAIL_POLL_INTERVAL_MS = 2_500;
 const MAIL_POLL_TIMEOUT_MS = 10 * 60_000;
 // The first email code is sometimes never delivered (e.g. the mailbox was created
@@ -73,6 +79,15 @@ const MAIL_AUTO_RESEND_MAX = 2;
 const PROXY_SIGNUP_WINDOW_MS = readDurationEnv("PROXY_SIGNUP_WINDOW_MS", 60_000, 1_000);
 const PROXY_SIGNUP_MAX_PER_WINDOW = Math.max(1, Math.trunc(Number(process.env.PROXY_SIGNUP_MAX_PER_WINDOW)) || 2);
 const MAX_PROXY_SIGNUP_MAX_PER_WINDOW = 100;
+// P4: trần SỐ TÁC VỤ CHẠY ĐỒNG THỜI trên cùng một exit IP (khác với throttle tốc
+// độ ở trên). Nhiều phiên đăng nhập đồng thời từ một IP dân cư là chữ ký bot rõ
+// rệt. 0 = tắt. Áp cho cả đăng ký mới lẫn re-login (mọi job chiếm slot).
+const PROXY_MAX_CONCURRENT_PER_IP = (() => {
+  const raw = process.env.PROXY_MAX_CONCURRENT_PER_IP;
+  if (raw === undefined || raw === "") return 2;
+  const n = Math.trunc(Number(raw));
+  return Number.isFinite(n) && n >= 0 ? n : 2; // honor explicit 0 = disabled
+})();
 const PROXY_LINK_SETTING_DB_KEY = "ui:chatgpt-onboarding.proxy-link-config-v1";
 // Danh sách host (IP cũ) chủ máy đã "Quên" — ẩn khỏi "Danh sách proxy IP". Chỉ ẩn IP cũ
 // (configured:false), vì row IP cũ do LIVE JOBS (account đã đăng ký) tạo ra nên không xoá
@@ -1074,16 +1089,27 @@ async function handleApi(req, res, requestUrl) {
       : null;
 
     // Synchronous pre-pass decides start vs cancel per job so the per-IP counters
-    // stay consistent regardless of async interleaving.
-    const consumed = hasLimit ? proxyConsumedByHost() : null;
+    // stay consistent regardless of async interleaving. This path does NOT go
+    // through makeProxyAllocator, so it must apply the SAME burn/lifetime guard
+    // (P1/P2) itself — otherwise staged batches launch straight onto burned IPs.
+    const consumed = proxyConsumedByHost();
+    const lifetime = usedProxyDao.deactivationHistoryByHost();
+    const forgotten = getForgottenProxyHosts();
+    const hostBurned = (host) => forgotten.has(host) || (lifetime.get(host)?.deactivated || 0) >= PROXY_BURN_THRESHOLD;
     const startedByHost = new Map();
     const decisions = selected.map((job) => {
       if (job.status !== "idle") return { job, action: "skip" };
-      if (!hasLimit) return { job, action: "start" };
       const effectiveProxy = hasProxyUpdate ? proxyUrl : job.proxyUrl;
       const parsed = effectiveProxy ? parseProxyUrlForSub2Api(effectiveProxy) : null;
+      // Hard-block burned / forgotten IPs on EVERY start-batch, independent of the
+      // per-IP limit — this is the whole point of the fix.
+      if (parsed && hostBurned(parsed.host)) return { job, action: "cancel" };
+      if (!hasLimit) return { job, action: "start" };
       if (!parsed) return { job, action: "cancel" };
-      const used = (consumed.get(parsed.host) || 0) + (startedByHost.get(parsed.host) || 0);
+      // Lifetime cap: seed from MAX(live slots, lifetime total) so deleting dead
+      // accounts no longer resets the counter and lets a host be refilled.
+      const base = Math.max(consumed.get(parsed.host) || 0, lifetime.get(parsed.host)?.total || 0);
+      const used = base + (startedByHost.get(parsed.host) || 0);
       if (used >= limitPerIp) return { job, action: "cancel" };
       startedByHost.set(parsed.host, (startedByHost.get(parsed.host) || 0) + 1);
       return { job, action: "start" };
@@ -1809,9 +1835,23 @@ function scheduleQueuedJobs() {
   // Keep one entry more than the limit so a job is never held back by its own earlier start.
   const keepPerKey = maxPerWindow + 1;
   const signupActivity = throttleOn ? proxySignupActivityByKey(keepPerKey) : null;
+  // P4: số tác vụ ĐANG CHẠY theo khoá exit IP, để không vượt trần đồng thời/IP.
+  const activeByExitKey = new Map();
+  if (PROXY_MAX_CONCURRENT_PER_IP > 0) {
+    for (const j of jobs.values()) {
+      if (!occupiesActiveSlot(j)) continue;
+      const k = signupExitKey(j);
+      if (k) activeByExitKey.set(k, (activeByExitKey.get(k) || 0) + 1);
+    }
+  }
   let nextCooldownEndsAt = Infinity;
   for (const job of queuedJobs) {
     const mode = job.queuedMode || "full";
+    // P4: giữ job trong hàng đợi nếu exit IP của nó đã đủ số tác vụ chạy đồng thời.
+    if (PROXY_MAX_CONCURRENT_PER_IP > 0) {
+      const exitKey = signupExitKey(job);
+      if (exitKey && (activeByExitKey.get(exitKey) || 0) >= PROXY_MAX_CONCURRENT_PER_IP) continue;
+    }
     const cooldownKey = signupActivity ? signupCooldownHost(job, mode) : null;
     if (cooldownKey) {
       const now = Date.now();
@@ -1853,6 +1893,12 @@ function scheduleQueuedJobs() {
     job.queuedAt = null;
     touch(job);
     void saveJobMetadata(job).catch(() => {});
+    // P4: ghi nhận job vừa khởi chạy vào bộ đếm đồng thời theo exit IP cho các
+    // vòng lặp sau trong cùng lượt lên lịch.
+    if (PROXY_MAX_CONCURRENT_PER_IP > 0) {
+      const launchedKey = signupExitKey(job);
+      if (launchedKey) activeByExitKey.set(launchedKey, (activeByExitKey.get(launchedKey) || 0) + 1);
+    }
     void prepareAndLaunchJob(job, mode, queueRunId);
     availableSlots -= 1;
     if (availableSlots <= 0) break;
@@ -3901,11 +3947,45 @@ function getPhoneLedgerEntry(number) {
   return usedPhoneLedger.get(normalizePhoneKey(number)) || null;
 }
 
-// A number may be picked only when it is not risk-blocked and still under the
-// reuse cap (phoneMaxUses === 0 disables the cap but never the block-list).
+// P7: OpenAI's "suspicious behavior from phone numbers SIMILAR to yours" is a
+// RANGE burn, not a single-number block — adjacent numbers from the same carrier
+// prefix are already under scrutiny. Temporarily cool down the whole prefix so the
+// acquire loop stops renting the next +84 number from the same burned block.
+const SUSPICIOUS_PHONE_PREFIX_LEN = 6;
+const SUSPICIOUS_PHONE_PREFIX_COOLDOWN_MS = (() => {
+  const raw = process.env.SUSPICIOUS_PHONE_PREFIX_COOLDOWN_MS;
+  if (raw === undefined || raw === "") return 30 * 60_000;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 30 * 60_000; // honor explicit 0 = disabled
+})();
+const suspiciousPhonePrefixUntil = new Map(); // prefix -> expiry ms
+
+function phonePrefixKey(number) {
+  const digits = normalizePhoneKey(number);
+  return digits ? digits.slice(0, SUSPICIOUS_PHONE_PREFIX_LEN) : null;
+}
+function isSuspiciousPrefixCoolingDown(number) {
+  if (SUSPICIOUS_PHONE_PREFIX_COOLDOWN_MS <= 0) return false;
+  const prefix = phonePrefixKey(number);
+  if (!prefix) return false;
+  const until = suspiciousPhonePrefixUntil.get(prefix);
+  if (!until) return false;
+  if (until <= Date.now()) { suspiciousPhonePrefixUntil.delete(prefix); return false; }
+  return true;
+}
+function noteSuspiciousPhonePrefix(number) {
+  if (SUSPICIOUS_PHONE_PREFIX_COOLDOWN_MS <= 0) return;
+  const prefix = phonePrefixKey(number);
+  if (prefix) suspiciousPhonePrefixUntil.set(prefix, Date.now() + SUSPICIOUS_PHONE_PREFIX_COOLDOWN_MS);
+}
+
+// A number may be picked only when it is not risk-blocked, not in a cooling-down
+// suspicious prefix, and still under the reuse cap (phoneMaxUses === 0 disables
+// the cap but never the block-list).
 function isPhoneAvailable(number) {
   const digits = normalizePhoneKey(number);
   if (!digits) return true; // can't key it → don't block the flow
+  if (isSuspiciousPrefixCoolingDown(number)) return false;
   const entry = usedPhoneLedger.get(digits);
   if (!entry) return true;
   if (entry.blocked) return false;
@@ -3914,6 +3994,7 @@ function isPhoneAvailable(number) {
 }
 
 function phoneUnavailableReason(number) {
+  if (isSuspiciousPrefixCoolingDown(number)) return "risk";
   const entry = getPhoneLedgerEntry(number);
   if (!entry) return null;
   if (entry.blocked) return "risk";
@@ -3951,6 +4032,9 @@ function markPhoneBlocked(number, reason, email) {
   if (email && !entry.emails.includes(String(email))) entry.emails.push(String(email));
   usedPhoneLedger.set(digits, entry);
   try { usedPhoneDao.markBlocked(digits, entry.number, entry.blockedReason, email); } catch {}
+  // P7: a "suspicious / similar numbers" rejection burns the whole prefix, not
+  // just this number — cool the range down so we don't re-rent an adjacent one.
+  if (/suspicious behavior|similar to yours|风控|fraud/i.test(String(reason || ""))) noteSuspiciousPhonePrefix(number);
 }
 
 // A phone rejection that should permanently burn the number: risk control,
@@ -4300,15 +4384,35 @@ function makeProxyAllocator(proxyConfig, limitPerIpRaw) {
   // Only registered-or-running (non-deactivated) jobs occupy a slot; queued/idle
   // and pre-SMS failures do not — so freshly staged accounts don't pre-reserve.
   // Một usage map DUY NHẤT theo host cho mọi nhóm: cùng IP không bị tính 2 lần.
-  const usage = proxyConsumedByHost();
+  // SỔ CÁI TRỌN ĐỜI theo host (used_proxy_emails JOIN deactivated_emails): total =
+  // tổng tài khoản TỪNG chạy qua host, deactivated = số đã bị OpenAI vô hiệu hoá.
+  // Giữ qua cả việc xoá job nên không bao giờ reset.
+  const lifetime = usedProxyDao.deactivationHistoryByHost();
+  // Host bị LOẠI HẲN khỏi cấp phát ("chặn cứng"): chủ đã "Quên", HOẶC đã cháy
+  // >= PROXY_BURN_THRESHOLD tài khoản bị vô hiệu. IP đã cháy không bao giờ được
+  // nhồi thêm — buộc đổi sang IP sạch, thay vì tiếp tục đốt cùng một IP.
+  const blockedHosts = new Set(getForgottenProxyHosts());
+  for (const [host, h] of lifetime) {
+    if ((h?.deactivated || 0) >= PROXY_BURN_THRESHOLD) blockedHosts.add(host);
+  }
+  // Trần limitPerIp đếm theo MAX(slot sống, tổng trọn đời) — nên xoá tài khoản đã
+  // chết KHÔNG còn làm tụt bộ đếm về 0 để nhồi tiếp lên cùng IP (lỗi gốc cũ:
+  // jobConsumesProxySlot bỏ qua job đã vô hiệu + job bị xoá → đếm luôn ~0).
+  const liveUsage = proxyConsumedByHost();
+  const usage = new Map();
   const allItems = [...generalList, ...domainLists.flatMap((d) => d.list)];
-  for (const item of allItems) if (!usage.has(item.host)) usage.set(item.host, 0);
+  for (const item of allItems) {
+    const live = liveUsage.get(item.host) || 0;
+    const everTotal = lifetime.get(item.host)?.total || 0;
+    usage.set(item.host, Math.max(live, everTotal));
+  }
   const cursors = new Map(); // key nhóm -> vị trí round-robin
   const pickFrom = (list, key) => {
     if (!list.length) return null;
     const start = cursors.get(key) || 0;
     for (let i = 0; i < list.length; i += 1) {
       const item = list[(start + i) % list.length];
+      if (blockedHosts.has(item.host)) continue; // IP đã cháy / đã "Quên" → không cấp
       if ((usage.get(item.host) || 0) < limitPerIp) {
         cursors.set(key, (start + i + 1) % list.length);
         usage.set(item.host, (usage.get(item.host) || 0) + 1);
@@ -4325,7 +4429,7 @@ function makeProxyAllocator(proxyConfig, limitPerIpRaw) {
   return {
     limitPerIp,
     count: allItems.length,
-    remainingCapacity: () => allItems.reduce((sum, it) => sum + Math.max(0, limitPerIp - (usage.get(it.host) || 0)), 0),
+    remainingCapacity: () => allItems.reduce((sum, it) => sum + (blockedHosts.has(it.host) ? 0 : Math.max(0, limitPerIp - (usage.get(it.host) || 0))), 0),
     next: (email) => {
       const group = groupFor(email);
       // Proxy riêng của domain trước; hết chỗ thì mượn pool chung (fallback).
@@ -4609,6 +4713,7 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
       removed: 0,
       busy: 0,
       cooldown: 0,
+      skippedBurned: 0,
       outsideGroups: 0,
       missingEmail: 0,
     };
@@ -4632,6 +4737,20 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
         if (!grouped.has(email)) grouped.set(email, []);
         grouped.get(email).push(account);
       }
+
+      // Cháy theo IP RA THỰC (exit_ip) và theo proxy host — tính một lần cho cả
+      // vòng để khỏi query lặp theo từng tài khoản.
+      const burnedByExit = usedProxyDao.deactivationHistoryByExitIp();
+      const burnedByHost = usedProxyDao.deactivationHistoryByHost();
+      const forgottenHosts = getForgottenProxyHosts();
+      const isBurnedExit = (job) => {
+        if (!job?.proxyUrl) return false;
+        if (job.exitIp && (burnedByExit.get(job.exitIp)?.deactivated || 0) >= PROXY_BURN_THRESHOLD) return true;
+        const parsed = parseProxyUrlForSub2Api(job.proxyUrl);
+        if (!parsed) return false;
+        if (forgottenHosts.has(parsed.host)) return true;
+        return (burnedByHost.get(parsed.host)?.deactivated || 0) >= PROXY_BURN_THRESHOLD;
+      };
 
       for (const [email, accounts] of grouped) {
         await withEmailJobLock(email, async () => {
@@ -4671,6 +4790,19 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
             // password / email code / 2FA) — keep it out of the schedule instead of
             // letting Sub2API keep dispatching an account the console can't fix.
             summary.disabled += (await disableSub2ApiScheduling(config, accounts, job, eligibility.reason)).disabled;
+            return;
+          }
+
+          if (isBurnedExit(job)) {
+            // Exit IP / proxy host của tài khoản đã cháy → tự re-login chỉ dồn thêm
+            // sự kiện đăng nhập lên đúng IP bẩn và đẩy nhanh việc bị OpenAI khoá
+            // (đây là tác nhân tăng tốc ban: survivors từng có attempt 4–11). Cách
+            // ly thay vì sửa: tắt lịch chạy ở Sub2API rồi bỏ qua. Chủ đổi sang IP
+            // sạch rồi bấm "re-login" tay để thử lại.
+            summary.skippedBurned += accounts.length;
+            summary.disabled += (await disableSub2ApiScheduling(config, accounts, job, "Exit IP đã cháy — tạm dừng tự re-login, cần đổi IP sạch")).disabled;
+            appendJobLog(job, `[monitor] Bỏ qua tự re-login: IP ra đã cháy (>= ${PROXY_BURN_THRESHOLD} tài khoản bị vô hiệu). Hãy đổi sang IP sạch rồi re-login tay.\n`);
+            await saveJobMetadata(job);
             return;
           }
 
@@ -4813,7 +4945,7 @@ async function retryPendingSub2ApiUploads(config, summary) {
         || !job.resultSaved
         || job.status !== "completed"
         || job.autoRepairOperation
-        || isAutoRepairCoolingDown(job)
+        || isAutoRepairCoolingDown(job, false) // upload-only retry: flat cooldown, no login backoff
       ) return;
 
       const accounts = [];
@@ -4996,9 +5128,14 @@ function monitorBackendIdentity(config) {
   return crypto.createHash("sha256").update(String(config?.baseUrl || "")).digest("hex").slice(0, 24);
 }
 
-function isAutoRepairCoolingDown(job) {
+function isAutoRepairCoolingDown(job, backoff = true) {
   if (!job.autoRepairLastAttemptAt || !Number.isFinite(SUB2API_AUTO_REPAIR_COOLDOWN_MS) || SUB2API_AUTO_REPAIR_COOLDOWN_MS <= 0) return false;
-  return Date.now() - new Date(job.autoRepairLastAttemptAt).getTime() < SUB2API_AUTO_REPAIR_COOLDOWN_MS;
+  // Đường RE-LOGIN: backoff luỹ thừa theo số lần thử (gấp đôi mỗi lần, trần
+  // SUB2API_AUTO_REPAIR_COOLDOWN_MAX_MS) để không re-login dồn dập lên IP đã cháy.
+  // Đường RETRY UPLOAD (không login, không traffic OpenAI/proxy): dùng base phẳng.
+  const tries = backoff ? Math.max(0, Math.min(3, (Number(job.attempt) || 1) - 1)) : 0;
+  const cooldown = Math.min(SUB2API_AUTO_REPAIR_COOLDOWN_MS * (2 ** tries), SUB2API_AUTO_REPAIR_COOLDOWN_MAX_MS);
+  return Date.now() - new Date(job.autoRepairLastAttemptAt).getTime() < cooldown;
 }
 
 function getAutoRepairEligibility(job) {

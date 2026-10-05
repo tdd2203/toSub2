@@ -16,7 +16,47 @@ const DEFAULT_SAME_PROXY_RISK_RETRY_DELAY_MS = 1_000;
 const DEFAULT_CLOUDFLARE_SOLVER_TIMEOUT_MS = 70_000;
 const UNCONFIGURED = Symbol("unconfigured");
 
-export function browserIdentityForTlsProfile(profile = DEFAULT_PROFILE) {
+// ---- Per-account device-environment fingerprint ---------------------------
+// Chrome's TLS ClientHello (JA3/JA4) does NOT encode the OS, so the only safe
+// axes to vary per account are the JS-environment signals read inside the
+// Sentinel jsdom runtime (screen, cores, memory, heap). We vary ONLY these and
+// keep the UA / sec-ch-ua / platform tied to the TLS profile, so the identity
+// stays internally consistent. Values are derived DETERMINISTICALLY from a
+// stable per-account seed (the oai-did): the same account gets the same
+// fingerprint across re-logins (a fingerprint that changes every login is itself
+// a bot tell), while different accounts sharing one exit IP no longer also share
+// a byte-identical device fingerprint — the glue OpenAI uses to cluster-ban.
+const MAC_SCREENS = [
+  [1440, 900], [1512, 982], [1680, 1050], [1728, 1117], [1920, 1080], [2560, 1440],
+];
+const HW_CONCURRENCY = [8, 10, 12, 16];
+// navigator.deviceMemory is quantised by Chrome and capped at 8 (never 16); 8 is
+// by far the most common, 4 a realistic minority. Using an impossible value such
+// as 16 would itself be a bot signal.
+const DEVICE_MEMORY = [8, 8, 8, 4];
+const JS_HEAP = [2172649472, 3221225472, 4294705152, 4395630592];
+
+function pickBySeed(hex, offset, list) {
+  const n = parseInt(hex.slice(offset, offset + 4), 16) || 0;
+  return list[n % list.length];
+}
+
+export function deviceFingerprintForSeed(seed) {
+  const key = String(seed || "").trim();
+  if (!key) return null;
+  const hex = createHash("sha256").update(key).digest("hex");
+  const [screenWidth, screenHeight] = pickBySeed(hex, 0, MAC_SCREENS);
+  return {
+    screenWidth,
+    screenHeight,
+    hardwareConcurrency: pickBySeed(hex, 4, HW_CONCURRENCY),
+    deviceMemory: pickBySeed(hex, 8, DEVICE_MEMORY),
+    jsHeapSizeLimit: pickBySeed(hex, 12, JS_HEAP),
+    canvasSeed: hex.slice(0, 16),
+  };
+}
+
+export function browserIdentityForTlsProfile(profile = DEFAULT_PROFILE, options = {}) {
   const normalizedProfile = String(profile || DEFAULT_PROFILE).trim();
   const majorVersion = Number(/^chrome(\d+)/i.exec(normalizedProfile)?.[1] || 146);
   const usesMacOs = majorVersion >= 119;
@@ -24,7 +64,7 @@ export function browserIdentityForTlsProfile(profile = DEFAULT_PROFILE) {
     ? "Macintosh; Intel Mac OS X 10_15_7"
     : "Windows NT 10.0; Win64; x64";
   const platform = usesMacOs ? "macOS" : "Windows";
-  return {
+  const identity = {
     profile: normalizedProfile,
     browser: "chrome",
     browserMajorVersion: majorVersion,
@@ -42,7 +82,17 @@ export function browserIdentityForTlsProfile(profile = DEFAULT_PROFILE) {
     os: usesMacOs ? "macos" : "windows",
     osVersion: usesMacOs ? "15.7.0" : "10.0",
     platform: usesMacOs ? "MacIntel" : "Win32",
+    // vendor must match the Chrome UA above. jsdom defaults navigator.vendor to
+    // Safari's "Apple Computer, Inc.", which contradicts a Chrome UA on every
+    // account — a uniform inconsistency we fix here.
+    vendor: "Google Inc.",
   };
+  // Per-account JS-environment entropy (screen/cores/memory/heap), derived from a
+  // stable seed. Omitted when no seed is given (e.g. HTTP-header-only callers),
+  // so the Sentinel runtime falls back to its own realistic defaults.
+  const fp = options && options.seed ? deviceFingerprintForSeed(options.seed) : null;
+  if (fp) Object.assign(identity, fp);
+  return identity;
 }
 
 export class TlsFingerprintTransport {
@@ -296,7 +346,10 @@ export class TlsFingerprintTransport {
     if (!this.enabled) {
       throw new Error("动态 Sentinel 令牌需要启用 Python TLS 传输层");
     }
-    const identity = browserIdentityForTlsProfile(this.identityProfile || this.profile);
+    // Seed the per-account device fingerprint with the oai-did so the Sentinel
+    // runtime environment (screen/cores/memory/heap) is stable per account and
+    // distinct across accounts sharing an exit IP.
+    const identity = browserIdentityForTlsProfile(this.identityProfile || this.profile, { seed: String(deviceID || "") });
     return this.send({
       operation: "generate_sentinel_tokens",
       flow: String(flow || "default"),
