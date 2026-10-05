@@ -79,15 +79,10 @@ const MAIL_AUTO_RESEND_MAX = 2;
 const PROXY_SIGNUP_WINDOW_MS = readDurationEnv("PROXY_SIGNUP_WINDOW_MS", 60_000, 1_000);
 const PROXY_SIGNUP_MAX_PER_WINDOW = Math.max(1, Math.trunc(Number(process.env.PROXY_SIGNUP_MAX_PER_WINDOW)) || 2);
 const MAX_PROXY_SIGNUP_MAX_PER_WINDOW = 100;
-// P4: trần SỐ TÁC VỤ CHẠY ĐỒNG THỜI trên cùng một exit IP (khác với throttle tốc
-// độ ở trên). Nhiều phiên đăng nhập đồng thời từ một IP dân cư là chữ ký bot rõ
-// rệt. 0 = tắt. Áp cho cả đăng ký mới lẫn re-login (mọi job chiếm slot).
-const PROXY_MAX_CONCURRENT_PER_IP = (() => {
-  const raw = process.env.PROXY_MAX_CONCURRENT_PER_IP;
-  if (raw === undefined || raw === "") return 2;
-  const n = Math.trunc(Number(raw));
-  return Number.isFinite(n) && n >= 0 ? n : 2; // honor explicit 0 = disabled
-})();
+// Giới hạn duy nhất cho đăng ký là THEO TỐC ĐỘ TẠO (PROXY_SIGNUP_MAX_PER_WINDOW,
+// mặc định 2/60s/IP) — khớp với throttle email xác thực của OpenAI (rolling-window
+// theo tốc độ tạo, KHÔNG theo số phiên chạy đồng thời). Không chặn số tác vụ chạy
+// đồng thời: tài khoản đã tạo xong được thao tác (phone/OAuth/re-login) song song.
 const PROXY_LINK_SETTING_DB_KEY = "ui:chatgpt-onboarding.proxy-link-config-v1";
 // Danh sách host (IP cũ) chủ máy đã "Quên" — ẩn khỏi "Danh sách proxy IP". Chỉ ẩn IP cũ
 // (configured:false), vì row IP cũ do LIVE JOBS (account đã đăng ký) tạo ra nên không xoá
@@ -1835,23 +1830,9 @@ function scheduleQueuedJobs() {
   // Keep one entry more than the limit so a job is never held back by its own earlier start.
   const keepPerKey = maxPerWindow + 1;
   const signupActivity = throttleOn ? proxySignupActivityByKey(keepPerKey) : null;
-  // P4: số tác vụ ĐANG CHẠY theo khoá exit IP, để không vượt trần đồng thời/IP.
-  const activeByExitKey = new Map();
-  if (PROXY_MAX_CONCURRENT_PER_IP > 0) {
-    for (const j of jobs.values()) {
-      if (!occupiesActiveSlot(j)) continue;
-      const k = signupExitKey(j);
-      if (k) activeByExitKey.set(k, (activeByExitKey.get(k) || 0) + 1);
-    }
-  }
   let nextCooldownEndsAt = Infinity;
   for (const job of queuedJobs) {
     const mode = job.queuedMode || "full";
-    // P4: giữ job trong hàng đợi nếu exit IP của nó đã đủ số tác vụ chạy đồng thời.
-    if (PROXY_MAX_CONCURRENT_PER_IP > 0) {
-      const exitKey = signupExitKey(job);
-      if (exitKey && (activeByExitKey.get(exitKey) || 0) >= PROXY_MAX_CONCURRENT_PER_IP) continue;
-    }
     const cooldownKey = signupActivity ? signupCooldownHost(job, mode) : null;
     if (cooldownKey) {
       const now = Date.now();
@@ -1893,12 +1874,6 @@ function scheduleQueuedJobs() {
     job.queuedAt = null;
     touch(job);
     void saveJobMetadata(job).catch(() => {});
-    // P4: ghi nhận job vừa khởi chạy vào bộ đếm đồng thời theo exit IP cho các
-    // vòng lặp sau trong cùng lượt lên lịch.
-    if (PROXY_MAX_CONCURRENT_PER_IP > 0) {
-      const launchedKey = signupExitKey(job);
-      if (launchedKey) activeByExitKey.set(launchedKey, (activeByExitKey.get(launchedKey) || 0) + 1);
-    }
     void prepareAndLaunchJob(job, mode, queueRunId);
     availableSlots -= 1;
     if (availableSlots <= 0) break;
