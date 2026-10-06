@@ -108,6 +108,29 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TOOL_ROOT = path.resolve(__dirname, "..");
 const WEB_ROOT = path.join(TOOL_ROOT, "web");
 const PROTOCOL_SCRIPT = path.resolve(process.env.ONBOARDING_PROTOCOL_SCRIPT || path.join(__dirname, "protocol-login.mjs"));
+// signup_backend A/B lane: when a job is tagged signupBackend='browser', launchJob
+// spawns this script instead of PROTOCOL_SCRIPT. The TLS path (default) is
+// untouched. See src/browser-login.mjs for the real-browser worker contract.
+const BROWSER_SCRIPT = path.resolve(process.env.ONBOARDING_BROWSER_SCRIPT || path.join(__dirname, "browser-login.mjs"));
+const DEFAULT_SIGNUP_BACKEND = String(process.env.TOSUB2_SIGNUP_BACKEND || "tls").toLowerCase();
+// Deterministic device-identity UUIDv5 for an email. Shared with the browser
+// lane's src/browser-fingerprint.mjs — keep the namespace in sync there. Same
+// email → same oaiDeviceId → same oai-did cookie → stable across lane switches,
+// restarts, and user-data-dir rebuilds.
+const TOSUB2_OAI_DID_NAMESPACE = "7f1b7a1a-5e40-4a3d-9e5e-9c0d1f1a5b2a";
+function oaiDeviceIdForEmail(email) {
+  const value = String(email || "").trim().toLowerCase();
+  if (!value) return crypto.randomUUID();
+  const nsHex = TOSUB2_OAI_DID_NAMESPACE.replace(/-/g, "");
+  const nsBytes = Buffer.from(nsHex, "hex");
+  const nameBytes = Buffer.from(value, "utf8");
+  const hash = crypto.createHash("sha1").update(nsBytes).update(nameBytes).digest();
+  const out = Buffer.from(hash.subarray(0, 16));
+  out[6] = (out[6] & 0x0f) | 0x50; // v5
+  out[8] = (out[8] & 0x3f) | 0x80; // RFC 4122
+  const hex = out.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
 const WORKSPACE_ROOT = TOOL_ROOT;
 const OUTPUT_ROOT = path.resolve(
   process.env.ONBOARDING_OUTPUT_ROOT || path.join(WORKSPACE_ROOT, "tmp", "chatgpt-onboarding-console"),
@@ -970,7 +993,7 @@ async function handleApi(req, res, requestUrl) {
         assignedProxy = makeProxyAllocator(readProxyAllocConfig(body), body.limitPerIp).next(email);
         if (!assignedProxy) return { poolFull: true };
       }
-      return { job: await startJob(email, credentials, assignedProxy), created: true, updated: false };
+      return { job: await startJob(email, credentials, assignedProxy, { signupBackend: body.signupBackend }), created: true, updated: false };
     });
     if (result.poolFull) {
       sendJson(res, 400, { error: "所有代理 IP 已达上限，请在“代理 IP 列表”中添加新 IP" });
@@ -1001,13 +1024,13 @@ async function handleApi(req, res, requestUrl) {
         const assignedProxy = allocator.next(entry.email);
         if (!assignedProxy) {
           // IP đã đủ giới hạn đăng ký → tạo tác vụ rồi huỷ ngay.
-          const job = await startJob(entry.email, entry, null, { staged: true });
+          const job = await startJob(entry.email, entry, null, { staged: true, signupBackend: body.signupBackend });
           cancelForProxyCapacity(job);
           return { job, updated: false, canceled: true };
         }
-        return { job: await startJob(entry.email, entry, assignedProxy), updated: false };
+        return { job: await startJob(entry.email, entry, assignedProxy, { signupBackend: body.signupBackend }), updated: false };
       }
-      return { job: await startJob(entry.email, entry, proxyUrl), updated: false };
+      return { job: await startJob(entry.email, entry, proxyUrl, { signupBackend: body.signupBackend }), updated: false };
     })));
     sendJson(res, 201, {
       jobs: results.map((item) => publicJob(item.job)),
@@ -1767,6 +1790,12 @@ async function startJob(email, credentials = {}, proxyUrl = null, options = {}) 
     queuedAt: new Date().toISOString(),
     queuedStartPrompt: "正在建立登录会话",
     tlsProfile: NEW_ACCOUNT_TLS_PROFILE,
+    // signup_backend A/B lane: default lives on 'tls'. Operator opts in via UI or
+    // TOSUB2_SIGNUP_BACKEND env. oaiDeviceId is deterministic per email so the
+    // real-browser Chromium's userDataDir keeps the same device identity across
+    // restarts and across a lane switch.
+    signupBackend: String(options.signupBackend || DEFAULT_SIGNUP_BACKEND).toLowerCase() === "browser" ? "browser" : "tls",
+    oaiDeviceId: oaiDeviceIdForEmail(email),
     directTlsFallbackAttempted: false,
     fallbackInProgress: false,
     totpSetupSecret: null,
@@ -1998,9 +2027,13 @@ function launchJob(job, options = {}) {
   job.runId = runId;
   job.runMode = mode;
   job.mailOtpRequestedAt = null;
+  // signup_backend A/B lane: pick which worker binary gets spawned. The browser
+  // lane is opt-in per job (job.signupBackend === 'browser'), falling back to
+  // the TLS lane by default so the main flow is unchanged.
+  const workerScript = job.signupBackend === "browser" ? BROWSER_SCRIPT : PROTOCOL_SCRIPT;
   const args = mode === "refresh"
     ? [
-        PROTOCOL_SCRIPT,
+        workerScript,
         "--refresh-sub2api",
         job.outputPath,
         "--sub2api-out",
@@ -2009,7 +2042,7 @@ function launchJob(job, options = {}) {
       ]
     : mode === "totp_setup"
       ? [
-          PROTOCOL_SCRIPT,
+          workerScript,
           "--email",
           job.email,
           "--setup-totp",
@@ -2020,7 +2053,7 @@ function launchJob(job, options = {}) {
         ]
     : mode === "password_add"
       ? [
-          PROTOCOL_SCRIPT,
+          workerScript,
           "--email",
           job.email,
           "--add-password",
@@ -2030,7 +2063,7 @@ function launchJob(job, options = {}) {
           "--verbose",
         ]
     : [
-        PROTOCOL_SCRIPT,
+        workerScript,
         "--email",
         job.email,
         "--output-mode",
@@ -2056,6 +2089,10 @@ function launchJob(job, options = {}) {
       // their stamped chrome150 (see resolveJobTlsProfile). Always concrete so it
       // overrides any inherited global TOSUB2_TLS_PROFILE from the environment.
       TOSUB2_TLS_PROFILE: String(options.tlsProfile || resolveJobTlsProfile(job)),
+      // signup_backend A/B lane: deterministic per-email device identity. The
+      // browser worker uses this value for its oai-did cookie and user-data-dir
+      // key; the TLS worker ignores it but it is harmless if present.
+      CHATGPT_OAI_DEVICE_ID: String(job.oaiDeviceId || ""),
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -5325,6 +5362,9 @@ function publicJob(job) {
     autoRepairLastError: job.autoRepairLastError || null,
     attempt: job.attempt,
     queuePosition: job.status === "queued" ? getQueuePosition(job) : 0,
+    // signup_backend A/B lane: which worker handled this row ('tls' | 'browser').
+    signupBackend: job.signupBackend || "tls",
+    oaiDeviceId: job.oaiDeviceId || null,
   };
 }
 
@@ -7054,6 +7094,9 @@ async function saveJobMetadata(job) {
         sub2api_uploaded_at: job.sub2apiUploadedAt || null,
         sub2api_uploaded_base_url: job.sub2apiUploadedBaseUrl || null,
         tls_profile: job.tlsProfile || null,
+        // signup_backend A/B lane: which worker ran this job and its stable device identity.
+        signup_backend: job.signupBackend || "tls",
+        oai_device_id: job.oaiDeviceId || null,
         updated_at: new Date().toISOString(),
       };
       const tempPath = `${metadataPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
