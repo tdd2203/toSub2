@@ -750,7 +750,21 @@ async function detectPageKind(page) {
   }
   if (/\/log-in($|[?#])|welcome back|chào mừng trở lại/.test(corpus)) return PAGE_KINDS.LOGIN_EMAIL;
   if (/\/create-account|sign up|đăng ký|tạo tài khoản/.test(corpus)) return PAGE_KINDS.SIGNUP_EMAIL;
-  if (/^https?:\/\/chatgpt\.com\/?(\?|$)/.test(url)) return PAGE_KINDS.LANDING;
+  if (/^https?:\/\/chatgpt\.com\/?(\?|$)/.test(url)) {
+    // chatgpt.com landing — nhưng modal "Log in or sign up" có thể đã mở sẵn
+    // (worker click Login hoặc user click thủ công). Modal content thường
+    // nằm sau side nav trong body.innerText → bị truncate khỏi bodyPrefix.
+    // Check trực tiếp: email input visible → SIGNUP_EMAIL thay vì LANDING.
+    try {
+      const hasEmailInput = await page
+        .locator('input[type="email"]:visible, input[placeholder*="email" i]:visible, input[placeholder="Email address" i]:visible')
+        .first()
+        .isVisible({ timeout: 300 })
+        .catch(() => false);
+      if (hasEmailInput) return PAGE_KINDS.SIGNUP_EMAIL;
+    } catch { /* ignore */ }
+    return PAGE_KINDS.LANDING;
+  }
   return PAGE_KINDS.UNKNOWN;
 }
 
