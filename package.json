@@ -11,7 +11,7 @@
     "daemon:stop": "npx pm2 stop tosub2",
     "daemon:logs": "npx pm2 logs tosub2",
     "check": "node --check src/console-server.mjs && node --check src/protocol-login.mjs && node --check src/tls-transport.mjs && node --check src/mail-otp.mjs && node --check src/luban-sms.mjs && node --check src/smsbower.mjs && node --check src/viotp-sms.mjs && node --check src/smscode-sms.mjs && node --check src/custom-sms.mjs && node --check src/sms-providers.mjs && node --check src/credential-store.mjs && node --check src/browser-login.mjs && node --check src/browser-fingerprint.mjs && node --check src/browser-chrome-version.mjs && node --check src/browser-stdio-matrix.mjs && node test/tls-transport.mjs && node test/credential-store.mjs && node test/sms-providers.mjs && node test/console-job-lock-smoke.mjs && node test/console-mail-auto-resend-smoke.mjs && node test/console-proxy-cooldown-smoke.mjs && node test/console-smoke.mjs && node test/console-restore-shutdown-smoke.mjs && node test/sms-provider-console-smoke.mjs && node test/protocol-smoke.mjs && node test/password-mfa-workspace-smoke.mjs && node test/browser-fingerprint-smoke.mjs",
-    "browser:probe": "node src/browser-login.mjs --probe --probe-url https://httpbin.org/anything/tosub2-probe --sub2api-out tmp/browser-probe-report.json --email probe@tosub2.local --verbose"
+    "browser:probe": "node src/browser-login.mjs --probe --allow-direct-ip --probe-url https://httpbin.org/anything/tosub2-probe --sub2api-out tmp/browser-probe-report.json --email probe@tosub2.local --verbose"
   },
   "keywords": [
     "chatgpt",

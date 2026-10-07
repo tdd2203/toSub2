@@ -59,20 +59,118 @@ const SIGNUP_URL_CANDIDATES = [
 const PAGE_IDLE_TIMEOUT_MS = 60_000;
 const INPUT_TIMEOUT_MS = 300_000;
 
+// auth.openai.com signup selectors.
+//
+// Each entry is an ORDERED fallback list — tried first-to-last by locatorForKey.
+// Keep selectors tag + attribute + text based (never CSS classes — OpenAI's
+// Tailwind-ish classes rotate every ship). First-run calibration is expected:
+// if a step misses, the --inspect-each mode pauses so the operator can read the
+// actual DOM and feed the real selector back into this table.
 const SELECTORS = {
-  // auth.openai.com signup — these are the pattern-based locators we fall back
-  // through. Real selectors on OpenAI pages change over time; keep them tag +
-  // name + autocomplete based rather than CSS-class based.
-  emailInput: 'input[type="email"], input[name="email"], input[autocomplete="email"]',
-  continueButton: 'button[type="submit"], button:has-text("Continue"), button:has-text("Tiếp tục")',
-  emailOtpInput: 'input[name="code"], input[autocomplete="one-time-code"], input[inputmode="numeric"]',
-  passwordInput: 'input[type="password"], input[name="password"], input[autocomplete="new-password"]',
-  nameInput: 'input[name="name"], input[autocomplete="name"], input[placeholder*="Name" i], input[placeholder*="Tên" i]',
-  birthdateInput: 'input[name="birthdate"], input[placeholder*="birthday" i], input[placeholder*="sinh" i]',
-  phoneInput: 'input[type="tel"], input[name="phone_number"], input[autocomplete="tel"]',
-  phoneOtpInput: 'input[name="code"], input[autocomplete="one-time-code"]',
-  continueBirthdateButton: 'button[type="submit"]',
+  emailInput: [
+    'input[type="email"]',
+    'input[name="email"]',
+    'input[autocomplete="email"]',
+    'input[id*="email" i]',
+    'input[placeholder*="email" i]',
+  ],
+  continueButton: [
+    'button[type="submit"]',
+    'button:has-text("Continue")',
+    'button:has-text("Tiếp tục")',
+    'button:has-text("Next")',
+    'button[data-testid*="continue" i]',
+    'button[data-testid*="submit" i]',
+  ],
+  emailOtpInput: [
+    'input[name="code"]',
+    'input[autocomplete="one-time-code"]',
+    'input[inputmode="numeric"]',
+    'input[name="otp"]',
+    'input[id*="otp" i]',
+    'input[aria-label*="verification" i]',
+    'input[aria-label*="code" i]',
+  ],
+  resendEmailOtpButton: [
+    'button:has-text("Resend")',
+    'button:has-text("Gửi lại")',
+    'a:has-text("Resend")',
+    'a:has-text("Gửi lại")',
+  ],
+  passwordInput: [
+    'input[type="password"]',
+    'input[name="password"]',
+    'input[autocomplete="new-password"]',
+    'input[autocomplete="current-password"]',
+  ],
+  nameInput: [
+    'input[name="name"]',
+    'input[name="full_name"]',
+    'input[name="given_name"]',
+    'input[autocomplete="name"]',
+    'input[placeholder*="Name" i]',
+    'input[placeholder*="Tên" i]',
+    'input[aria-label*="name" i]',
+  ],
+  birthdateInput: [
+    'input[name="birthdate"]',
+    'input[name="birthday"]',
+    'input[name="date_of_birth"]',
+    'input[type="date"]',
+    'input[placeholder*="birthday" i]',
+    'input[placeholder*="birth" i]',
+    'input[placeholder*="sinh" i]',
+    'input[aria-label*="birth" i]',
+  ],
+  phoneInput: [
+    'input[type="tel"]',
+    'input[name="phone_number"]',
+    'input[name="phone"]',
+    'input[autocomplete="tel"]',
+    'input[inputmode="tel"]',
+  ],
+  phoneOtpInput: [
+    'input[autocomplete="one-time-code"]',
+    'input[name="code"]',
+    'input[name="otp"]',
+    'input[inputmode="numeric"]',
+    'input[aria-label*="verification" i]',
+  ],
+  // Codex OAuth consent / authorize page may show a "Continue" / "Authorize"
+  // button before the automatic redirect.
+  oauthContinueButton: [
+    'button:has-text("Continue")',
+    'button:has-text("Tiếp tục")',
+    'button:has-text("Authorize")',
+    'button:has-text("Allow")',
+    'button:has-text("Cho phép")',
+    'button[type="submit"]',
+  ],
+  // Workspace / organization chooser (only shows when the account already has
+  // a workspace or when Codex consent lands on choose-an-account).
+  workspaceChoiceRadio: [
+    'input[type="radio"][name*="workspace" i]',
+    'input[type="radio"][name*="account" i]',
+    'button[role="option"]',
+    '[data-testid*="workspace" i]',
+    '[data-testid*="account" i]',
+  ],
+  // The "I am 18+" / terms acceptance checkbox OpenAI occasionally shows for
+  // VN/jurisdictions requiring age attestation.
+  ageConsentCheckbox: [
+    'input[type="checkbox"][name*="age" i]',
+    'input[type="checkbox"][name*="consent" i]',
+    'input[type="checkbox"][aria-label*="18" i]',
+  ],
 };
+
+// Return a single CSS selector string compatible with page.locator(sel).first().
+// Playwright accepts comma-separated selectors, so we flatten the fallback list.
+function selectorFor(key) {
+  const list = SELECTORS[key];
+  if (!list) throw new Error(`Unknown selector key: ${key}`);
+  return Array.isArray(list) ? list.join(", ") : list;
+}
 
 const RUN_MODES = Object.freeze({
   SIGNUP: "signup",
@@ -132,8 +230,20 @@ async function handleProbe(args) {
   // Dry-run: open Chromium, apply fingerprint, hit a probe URL, write a report.
   // No OpenAI traffic. Use this to confirm the stack boots on the host before
   // the first live signup.
-  const session = await openBrowser({ email: args.email || "probe@example.test", proxy: args.proxy || null, verbose: args.verbose });
+  //
+  // Default behaviour is proxy-only: if the probe URL happens to be anything
+  // other than localhost/127.0.0.1 and no proxy is configured, we refuse to
+  // leak the host's own IP. Operator may pass --allow-direct-ip for truly
+  // offline / loopback probes.
+  const proxy = args.proxy || process.env.CHATGPT_PROXY_URL || null;
   const probeUrl = args.probeUrl || "https://httpbin.org/anything/tosub2-browser-probe";
+  const isLoopback = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/i.test(probeUrl);
+  if (!proxy && !args.allowDirectIp && !isLoopback) {
+    throw new Error(
+      "BROWSER_PROXY_REQUIRED: refusing to run --probe against a non-loopback URL without a proxy — would leak the host IP. Pass --proxy or --allow-direct-ip.",
+    );
+  }
+  const session = await openBrowser({ email: args.email || "probe@example.test", proxy, verbose: args.verbose });
   const started = Date.now();
   const context = session.context;
   const page = await context.newPage();
@@ -225,7 +335,18 @@ async function handleSignup(args) {
   if (!sub2apiOut) throw new Error("MISSING_OUTPUT: --sub2api-out is required");
   const checkpointPath = args.checkpoint || null;
 
-  const session = await openBrowser({ email: args.email, proxy: args.proxy || process.env.CHATGPT_PROXY_URL || null, verbose: args.verbose });
+  // Enforce proxy-required for real signup. The host's own IP is the LAST thing
+  // that should talk to OpenAI during registration — one deactivation on your
+  // residential IP burns every account that ever hit it (per the lifetime burn
+  // ledger). Operator can override with --allow-direct-ip for offline tests.
+  const proxyUrl = args.proxy || process.env.CHATGPT_PROXY_URL || null;
+  if (!proxyUrl && !args.allowDirectIp) {
+    throw new Error(
+      "BROWSER_PROXY_REQUIRED: --proxy / CHATGPT_PROXY_URL is required for signup. Pass --allow-direct-ip only for offline tests.",
+    );
+  }
+
+  const session = await openBrowser({ email: args.email, proxy: proxyUrl, verbose: args.verbose });
   try {
     // Pre-flight: assert the proxy actually routes traffic. On a locked-down
     // residential proxy the Chromium can boot but outbound traffic fails
@@ -238,52 +359,62 @@ async function handleSignup(args) {
     await session.page.goto(signupUrl, { timeout: PAGE_IDLE_TIMEOUT_MS, waitUntil: "domcontentloaded" });
     await assertNotCloudflareStuck(session);
 
-    await fillAndSubmit(session.page, SELECTORS.emailInput, args.email, SELECTORS.continueButton);
+    await fillAndSubmit(session.page, selectorFor("emailInput"), args.email, selectorFor("continueButton"));
     emit(WORKER_MARKERS.emailOtpPageReached);
+    await inspectPauseIfRequested(args, session.page, "after-email-submit");
 
     // 2. Email OTP — ask console-server, type into DOM, submit.
     const emailOtp = await promptForInput("emailOtpPrompt");
     emit(WORKER_MARKERS.checkpointSavedEmail);
-    await fillAndSubmit(session.page, SELECTORS.emailOtpInput, emailOtp, SELECTORS.continueButton);
+    await fillAndSubmit(session.page, selectorFor("emailOtpInput"), emailOtp, selectorFor("continueButton"));
     await saveCheckpoint(checkpointPath, { stage: "email_verified", oai_device_id: session.oaiDeviceId });
+    await inspectPauseIfRequested(args, session.page, "after-email-otp");
 
     // 3. Password (OpenAI sometimes asks for a new password at signup).
     const newPassword = process.env.CHATGPT_NEW_PASSWORD || process.env.CHATGPT_LOGIN_PASSWORD || "";
-    if (await session.page.locator(SELECTORS.passwordInput).first().isVisible({ timeout: 15_000 }).catch(() => false)) {
+    if (await session.page.locator(selectorFor("passwordInput")).first().isVisible({ timeout: 15_000 }).catch(() => false)) {
       if (!newPassword) throw new Error("MISSING_PASSWORD: signup page requested a password but none was provided");
-      await fillAndSubmit(session.page, SELECTORS.passwordInput, newPassword, SELECTORS.continueButton);
+      await fillAndSubmit(session.page, selectorFor("passwordInput"), newPassword, selectorFor("continueButton"));
       await saveCheckpoint(checkpointPath, { stage: "password_submitted", oai_device_id: session.oaiDeviceId });
+      await inspectPauseIfRequested(args, session.page, "after-password");
     }
 
     // 4. Account profile — name + birthdate.
     const profile = generateInlineProfile();
     emit(WORKER_MARKERS.sentinelProfilePrepare);
-    const nameLocator = session.page.locator(SELECTORS.nameInput).first();
+    const nameLocator = session.page.locator(selectorFor("nameInput")).first();
     if (await nameLocator.isVisible({ timeout: 30_000 }).catch(() => false)) {
       await nameLocator.fill(profile.name);
     }
-    const birthdateLocator = session.page.locator(SELECTORS.birthdateInput).first();
+    const birthdateLocator = session.page.locator(selectorFor("birthdateInput")).first();
     if (await birthdateLocator.isVisible({ timeout: 10_000 }).catch(() => false)) {
       await birthdateLocator.fill(profile.birthdate);
     }
-    await session.page.locator(SELECTORS.continueBirthdateButton).first().click({ timeout: 10_000 }).catch(() => {});
+    const ageConsent = session.page.locator(selectorFor("ageConsentCheckbox")).first();
+    if (await ageConsent.isVisible({ timeout: 2_000 }).catch(() => false)) {
+      await ageConsent.check({ timeout: 5_000 }).catch(() => {});
+    }
+    await session.page.locator(selectorFor("continueButton")).first().click({ timeout: 10_000 }).catch(() => {});
     emit(WORKER_MARKERS.profileCompleted);
     await saveCheckpoint(checkpointPath, { stage: "profile_submitted", oai_device_id: session.oaiDeviceId });
+    await inspectPauseIfRequested(args, session.page, "after-profile");
 
     // 5. Phone binding — console-server pushes the number, then the OTP.
     const addPhoneUrl = await maybeWaitForPhonePage(session);
     if (addPhoneUrl) {
       process.stdout.write(WORKER_MARKERS.phoneNumberPrompt.marker);
       const phone = await readStdinLine();
-      await session.page.locator(SELECTORS.phoneInput).first().fill(phone);
-      await session.page.locator(SELECTORS.continueButton).first().click({ timeout: 10_000 });
+      await session.page.locator(selectorFor("phoneInput")).first().fill(phone);
+      await session.page.locator(selectorFor("continueButton")).first().click({ timeout: 10_000 });
       await saveCheckpoint(checkpointPath, { stage: "phone_requested", oai_device_id: session.oaiDeviceId });
+      await inspectPauseIfRequested(args, session.page, "after-phone-submit");
       process.stdout.write(WORKER_MARKERS.phoneOtpPrompt.marker);
       const phoneOtp = await readStdinLine();
-      await session.page.locator(SELECTORS.phoneOtpInput).first().fill(phoneOtp);
-      await session.page.locator(SELECTORS.continueButton).first().click({ timeout: 10_000 });
+      await session.page.locator(selectorFor("phoneOtpInput")).first().fill(phoneOtp);
+      await session.page.locator(selectorFor("continueButton")).first().click({ timeout: 10_000 });
       emit(WORKER_MARKERS.phoneOtpValidated);
       await saveCheckpoint(checkpointPath, { stage: "phone_otp_submitted", oai_device_id: session.oaiDeviceId });
+      await inspectPauseIfRequested(args, session.page, "after-phone-otp");
     }
 
     // 6. Codex OAuth. Intercept the callback at the browser layer — no socket
@@ -699,6 +830,52 @@ function readStdinLine() {
   });
 }
 
+// --inspect-each pauses the worker after each DOM transition so the operator
+// can read the real page via the open Chromium window and tell the next run
+// what the actual selectors look like. Writes a per-stage DOM snapshot
+// (visible inputs + buttons + current URL) to tmp/inspect-<stage>.json next to
+// the sub2api output. Enable by passing --inspect-each on the CLI OR by
+// setting env TOSUB2_BROWSER_INSPECT=1.
+async function inspectPauseIfRequested(args, page, stageLabel) {
+  const enabled = Boolean(args?.inspectEach) || process.env.TOSUB2_BROWSER_INSPECT === "1";
+  if (!enabled) return;
+  const snapshot = await captureDomSnapshot(page).catch((e) => ({ error: String(e?.message || e) }));
+  const outDir = args?.sub2apiOut ? path.dirname(args.sub2apiOut) : path.join(process.cwd(), "tmp");
+  await fs.mkdir(outDir, { recursive: true });
+  const outPath = path.join(outDir, `inspect-${stageLabel}.json`);
+  await fs.writeFile(outPath, `${JSON.stringify({ stage: stageLabel, at: new Date().toISOString(), ...snapshot }, null, 2)}\n`, "utf8");
+  console.log(`[inspect] ${stageLabel}: snapshot ${outPath} — press Enter in stdin to continue`);
+  await readStdinLine().catch(() => {});
+}
+
+async function captureDomSnapshot(page) {
+  const url = page.url();
+  const title = await page.title().catch(() => "");
+  const dom = await page.evaluate(() => {
+    const peek = (el) => ({
+      tag: el.tagName?.toLowerCase() || null,
+      type: el.getAttribute?.("type") || null,
+      name: el.getAttribute?.("name") || null,
+      id: el.id || null,
+      autocomplete: el.getAttribute?.("autocomplete") || null,
+      placeholder: el.getAttribute?.("placeholder") || null,
+      ariaLabel: el.getAttribute?.("aria-label") || null,
+      role: el.getAttribute?.("role") || null,
+      testid: el.getAttribute?.("data-testid") || null,
+      text: ((el.innerText || el.value || "") + "").slice(0, 120).trim(),
+      visible: !!(el.offsetParent || el.getClientRects().length),
+    });
+    return {
+      inputs: Array.from(document.querySelectorAll("input, textarea, select")).map(peek),
+      buttons: Array.from(document.querySelectorAll('button, [role="button"]')).map(peek),
+      headings: Array.from(document.querySelectorAll("h1, h2, h3")).map((h) => (h.innerText || "").trim()).filter(Boolean),
+      iframes: Array.from(document.querySelectorAll("iframe")).map((f) => ({ src: f.src, name: f.name, id: f.id })),
+      bodyPrefix: (document.body?.innerText || "").slice(0, 300),
+    };
+  });
+  return { url, title, dom };
+}
+
 async function maybeWaitForPhonePage(session) {
   try {
     await session.page.waitForURL(/add-phone|phone/, { timeout: 15_000 });
@@ -771,6 +948,16 @@ function parseArgs(argv) {
     }
     if (item === "--probe") {
       args.probe = true;
+      continue;
+    }
+    if (item === "--inspect-each") {
+      args.inspectEach = true;
+      continue;
+    }
+    if (item === "--allow-direct-ip") {
+      // Opt-out of the "signup requires a proxy" guard. Only use for probe mode
+      // (--probe) or offline dev — never for real OpenAI signup.
+      args.allowDirectIp = true;
       continue;
     }
     if (item === "--setup-totp") {
