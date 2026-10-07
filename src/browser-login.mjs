@@ -627,22 +627,53 @@ function roleLink(page, name) {
   return page.getByRole("link", { name }).first();
 }
 
-const CONTINUE_NAME = /tiếp tục|continue|next|verify|xác minh|submit|đồng ý/i;
-const AUTHORIZE_NAME = /authorize|allow|cho phép|chấp nhận|accept|đồng ý/i;
+// EXACT regex: tránh "Continue with Google/Apple/Microsoft/phone/email" — chỉ
+// match "Continue" / "Tiếp tục" đơn (nút submit chính của form).
+const CONTINUE_NAME = /^(tiếp tục|continue|next|verify|xác minh|submit|đồng ý)$/i;
+const AUTHORIZE_NAME = /^(authorize|allow|cho phép|chấp nhận|accept|đồng ý)$/i;
+
+// Smart continue click: nếu button với accessible name EXACT = "Tiếp tục"/
+// "Continue" không có, fallback về button[type="submit"] trong FORM đầu tiên
+// (loại khỏi 3 nút OAuth "Continue with X" bên ngoài form).
+async function clickFormSubmit(page) {
+  // Thử exact-text continue button first
+  try {
+    const btn = roleButton(page, CONTINUE_NAME);
+    if (await btn.isVisible({ timeout: 1500 }).catch(() => false)) {
+      await btn.click({ timeout: 5000 });
+      return;
+    }
+  } catch { /* fallthrough */ }
+  // Fallback: form submit (loại các OAuth button ngoài form)
+  const formSubmit = page.locator("form button[type='submit']").first();
+  if (await formSubmit.isVisible({ timeout: 2000 }).catch(() => false)) {
+    await formSubmit.click({ timeout: 5000 });
+    return;
+  }
+  throw new Error("CONTINUE_BUTTON_NOT_FOUND");
+}
 
 const PAGE_HANDLERS = {
   async [PAGE_KINDS.LANDING](session) {
     await dismissCookieBannerIfVisible(session.page);
     // Prefer Sign up for signup flow; both open the same modal.
-    for (const name of [/sign up for free|đăng ký miễn phí/i, /sign up|đăng ký/i, /log in|đăng nhập/i]) {
-      for (const factory of [roleLink, roleButton]) {
+    const texts = ["Sign up for free", "Đăng ký miễn phí", "Sign up", "Đăng ký", "Log in", "Đăng nhập"];
+    for (const text of texts) {
+      // Thử getByText (strict), rồi role button/link, rồi CSS fallback.
+      const tries = [
+        () => session.page.getByText(text, { exact: true }).first(),
+        () => session.page.getByRole("button", { name: new RegExp("^" + text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$", "i") }).first(),
+        () => session.page.getByRole("link", { name: new RegExp("^" + text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$", "i") }).first(),
+        () => session.page.locator(`a:has-text("${text}"), button:has-text("${text}")`).first(),
+      ];
+      for (const build of tries) {
         try {
-          const el = factory(session.page, name);
-          if (await el.isVisible({ timeout: 1500 }).catch(() => false)) {
+          const el = build();
+          if (await el.isVisible({ timeout: 1000 }).catch(() => false)) {
             await el.click({ timeout: 5000 });
             return;
           }
-        } catch { /* try next */ }
+        } catch { /* next */ }
       }
     }
   },
@@ -651,14 +682,14 @@ const PAGE_HANDLERS = {
     const input = session.page.getByLabel(/email|địa chỉ email/i).first();
     await input.waitFor({ state: "visible", timeout: 30_000 });
     await input.fill(args.email);
-    await roleButton(session.page, CONTINUE_NAME).click({ timeout: 10_000 });
+    await clickFormSubmit(session.page);
   },
   async [PAGE_KINDS.SIGNUP_EMAIL](session, args) {
     await dismissCookieBannerIfVisible(session.page);
     const input = session.page.getByLabel(/email|địa chỉ email/i).first();
     await input.waitFor({ state: "visible", timeout: 30_000 });
     await input.fill(args.email);
-    await roleButton(session.page, CONTINUE_NAME).click({ timeout: 10_000 });
+    await clickFormSubmit(session.page);
   },
   async [PAGE_KINDS.EMAIL_OTP](session) {
     emit(WORKER_MARKERS.emailOtpPageReached);
@@ -667,7 +698,7 @@ const PAGE_HANDLERS = {
     const input = session.page.getByLabel(/mã|code|verification|otp/i).first();
     await input.waitFor({ state: "visible", timeout: 30_000 });
     await input.fill(otp);
-    await roleButton(session.page, CONTINUE_NAME).click({ timeout: 10_000 });
+    await clickFormSubmit(session.page);
   },
   async [PAGE_KINDS.PASSWORD](session) {
     const pwd = process.env.CHATGPT_NEW_PASSWORD || process.env.CHATGPT_LOGIN_PASSWORD || "";
@@ -675,7 +706,7 @@ const PAGE_HANDLERS = {
     const input = session.page.getByLabel(/mật khẩu|password/i).first();
     await input.waitFor({ state: "visible", timeout: 30_000 });
     await input.fill(pwd);
-    await roleButton(session.page, CONTINUE_NAME).click({ timeout: 10_000 });
+    await clickFormSubmit(session.page);
   },
   async [PAGE_KINDS.PROFILE](session) {
     emit(WORKER_MARKERS.sentinelProfilePrepare);
@@ -700,7 +731,7 @@ const PAGE_HANDLERS = {
     if (await ageConsent.isVisible({ timeout: 2000 }).catch(() => false)) {
       await ageConsent.check({ timeout: 3000 }).catch(() => {});
     }
-    await roleButton(session.page, CONTINUE_NAME).click({ timeout: 10_000 });
+    await clickFormSubmit(session.page);
     emit(WORKER_MARKERS.profileCompleted);
   },
   async [PAGE_KINDS.PHONE_NUMBER](session) {
@@ -709,7 +740,7 @@ const PAGE_HANDLERS = {
     const input = session.page.getByRole("textbox", { name: /phone|số điện thoại/i }).first();
     await input.waitFor({ state: "visible", timeout: 30_000 });
     await input.fill(phone);
-    await roleButton(session.page, CONTINUE_NAME).click({ timeout: 10_000 });
+    await clickFormSubmit(session.page);
   },
   async [PAGE_KINDS.PHONE_OTP](session) {
     process.stdout.write(WORKER_MARKERS.phoneOtpPrompt.marker);
@@ -717,7 +748,7 @@ const PAGE_HANDLERS = {
     const input = session.page.getByLabel(/mã|code|otp|verification/i).first();
     await input.waitFor({ state: "visible", timeout: 30_000 });
     await input.fill(otp);
-    await roleButton(session.page, CONTINUE_NAME).click({ timeout: 10_000 });
+    await clickFormSubmit(session.page);
     emit(WORKER_MARKERS.phoneOtpValidated);
   },
   async [PAGE_KINDS.OAUTH_CONSENT](session) {
@@ -899,13 +930,18 @@ async function openBrowser({ email, proxy, verbose }) {
   await fs.mkdir(userDataDir, { recursive: true });
   await sweepStaleSingletonLocks(userDataDir);
 
+  // Browser engine chọn qua env CHATGPT_BROWSER_ENGINE:
+  //   "patchright" (default) → Patchright + Google Chrome Stable (TLS fingerprint =
+  //     Chrome 154 host). SOCKS5+auth KHÔNG hỗ trợ.
+  //   "cloak" → CloakBrowser (Chromium fork với 87 C++ patches, Chromium 145 free
+  //     tier). SOCKS5+auth NATIVE. Fingerprint khác hẳn Patchright.
+  const engine = (process.env.CHATGPT_BROWSER_ENGINE || "patchright").toLowerCase();
   const proxyUrl = normalizeProxyUrl(proxy);
-  if (proxyUrl && (proxyUrl.scheme === "socks5" || proxyUrl.scheme === "socks5h")) {
+  if (proxyUrl && (proxyUrl.scheme === "socks5" || proxyUrl.scheme === "socks5h") && engine !== "cloak") {
     emit(WORKER_MARKERS.browserProxySchemeUnsupported);
-    throw new Error("BROWSER_PROXY_SCHEME_UNSUPPORTED: Chromium does not accept SOCKS5 proxy credentials via --proxy-server; use HTTP(S) proxy on the browser lane.");
+    throw new Error("BROWSER_PROXY_SCHEME_UNSUPPORTED: Patchright/Chromium does not accept SOCKS5 proxy credentials via --proxy-server. Switch to CHATGPT_BROWSER_ENGINE=cloak for socks5+auth, or use HTTP(S) proxy.");
   }
 
-  const { chromium } = await import("patchright");
   const launchArgs = [
     "--webrtc-ip-handling-policy=disable_non_proxied_udp",
     "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
@@ -914,7 +950,6 @@ async function openBrowser({ email, proxy, verbose }) {
     "--disk-cache-size=52428800",
   ];
   const launchOptions = {
-    channel: "chrome",
     headless: false,
     args: launchArgs,
     ignoreDefaultArgs: ["--enable-automation"],
@@ -928,15 +963,46 @@ async function openBrowser({ email, proxy, verbose }) {
     };
   }
 
-  if (verbose) console.log(`[browser] launching ${chrome.bin} (major=${chrome.major})`);
-  const context = await chromium.launchPersistentContext(userDataDir, {
-    ...launchOptions,
-    ...buildContextOptions({
-      fingerprint: buildPerAccountFingerprint({ oaiDeviceId }),
-      proxy: launchOptions.proxy,
-    }),
-    executablePath: chrome.bin,
-  });
+  let context;
+  if (engine === "cloak") {
+    // CloakBrowser — proxy string form, humanize=true, geoip=true cho timezone/locale auto.
+    const cb = await import("cloakbrowser");
+    const proxyString = proxyUrl
+      ? (proxyUrl.username
+          ? `${proxyUrl.scheme}://${encodeURIComponent(proxyUrl.username)}:${encodeURIComponent(proxyUrl.password || "")}@${proxyUrl.host}:${proxyUrl.port}`
+          : `${proxyUrl.scheme}://${proxyUrl.host}:${proxyUrl.port}`)
+      : undefined;
+    if (verbose) console.log(`[browser] launching CloakBrowser (version=${cb.CHROMIUM_VERSION}) proxy=${proxyString ? "set" : "none"}`);
+    const cbInfo = cb.binaryInfo();
+    const cbOpts = {
+      userDataDir,
+      headless: false,
+      humanize: true,
+      // geoip:true cần mmdb-lib + .mmdb file (MaxMind GeoLite2). Bật qua
+      // env TOSUB2_CLOAK_GEOIP=1 nếu đã nạp DB. Mặc định false để tránh crash.
+      geoip: process.env.TOSUB2_CLOAK_GEOIP === "1" && Boolean(proxyString),
+      args: launchArgs,
+      ...(proxyString ? { proxy: proxyString } : {}),
+      ...(MANUAL_ASSIST ? { handleSIGINT: false, handleSIGTERM: false, handleSIGHUP: false } : {}),
+    };
+    context = await cb.launchPersistentContext(cbOpts);
+    // Overwrite "chrome" return field for the report so caller sees cloak version.
+    chrome.bin = cbInfo.binaryPath || chrome.bin;
+    chrome.major = Number(String(cb.CHROMIUM_VERSION || "").split(".")[0]) || chrome.major;
+    chrome.version = `CloakBrowser Chromium ${cb.CHROMIUM_VERSION || ""}`;
+  } else {
+    const { chromium } = await import("patchright");
+    if (verbose) console.log(`[browser] launching ${chrome.bin} (major=${chrome.major}) [patchright]`);
+    context = await chromium.launchPersistentContext(userDataDir, {
+      ...launchOptions,
+      channel: "chrome",
+      ...buildContextOptions({
+        fingerprint: buildPerAccountFingerprint({ oaiDeviceId }),
+        proxy: launchOptions.proxy,
+      }),
+      executablePath: chrome.bin,
+    });
+  }
 
   // Measure the host's real-ish values once, then apply the per-account knobs.
   const hostProfile = await detectHostProfile(context).catch(() => ({}));
