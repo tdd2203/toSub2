@@ -863,8 +863,9 @@ const PAGE_HANDLERS = {
       }
     }
     // Fallback: JS scan + simulate real mouse event (React synthetic listener)
+    let jsClickOk = false;
     try {
-      await session.page.evaluate(() => {
+      const res = await session.page.evaluate(() => {
         const re = /^(log in|sign up|sign up for free|đăng nhập|đăng ký|đăng ký miễn phí)$/i;
         const nodes = [...document.querySelectorAll('a, button, [role="button"], div[tabindex], [data-testid*="login" i], [data-testid*="signup" i]')];
         for (const el of nodes) {
@@ -881,12 +882,46 @@ const PAGE_HANDLERS = {
             }
           }
         }
-        return { ok: false, candidates: nodes.slice(0, 10).map(n => ({ tag: n.tagName, text: (n.innerText || "").slice(0, 50) })) };
-      }).then((res) => {
-        if (res?.ok) console.log(`[landing] JS click fired on "${res.text}"`);
-        else if (res?.candidates) console.log(`[landing] JS click MISS — top candidates: ${JSON.stringify(res.candidates)}`);
+        return { ok: false };
       });
+      jsClickOk = res?.ok || false;
+      if (jsClickOk) console.log(`[landing] JS click fired on "${res.text}"`);
     } catch { /* give up */ }
+    if (!jsClickOk) {
+      // DEBUG DUMP: ghi HTML snapshot + visible buttons list để fix selector
+      try {
+        const dumpDir = path.join(process.cwd(), "tmp", "landing-debug");
+        await fs.mkdir(dumpDir, { recursive: true });
+        const stamp = String(Date.now());
+        const htmlPath = path.join(dumpDir, `landing-${stamp}.html`);
+        const metaPath = path.join(dumpDir, `landing-${stamp}.json`);
+        const html = await session.page.content();
+        await fs.writeFile(htmlPath, html, "utf8");
+        const visible = await session.page.evaluate(() => {
+          const peek = (el) => {
+            const rect = el.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) return null;
+            return {
+              tag: el.tagName.toLowerCase(),
+              type: el.getAttribute("type"),
+              id: el.id || null,
+              role: el.getAttribute("role"),
+              testid: el.getAttribute("data-testid"),
+              ariaLabel: el.getAttribute("aria-label"),
+              className: (el.className || "").toString().slice(0, 100),
+              text: (el.innerText || "").trim().slice(0, 80),
+              hasOnClick: !!el.onclick,
+              cursorPointer: window.getComputedStyle(el).cursor === "pointer",
+            };
+          };
+          return [...document.querySelectorAll('a, button, [role="button"], div, span')].map(peek).filter(Boolean).slice(0, 40);
+        });
+        await fs.writeFile(metaPath, `${JSON.stringify({ url: session.page.url(), title: await session.page.title().catch(() => ""), visible }, null, 2)}\n`, "utf8");
+        console.log(`[landing] CLICK MISS — snapshots: ${htmlPath} + ${metaPath}`);
+      } catch (err) {
+        console.log(`[landing] dump failed: ${err?.message || err}`);
+      }
+    }
   },
   async [PAGE_KINDS.LOGIN_EMAIL](session, args) {
     await dismissCookieBannerIfVisible(session.page);
@@ -1143,6 +1178,11 @@ async function handleSignupAdaptive(args) {
     const signupUrl = await findReachableSignupUrl(session);
     await session.page.goto(signupUrl, { timeout: PAGE_IDLE_TIMEOUT_MS, waitUntil: "domcontentloaded" });
     await assertNotCloudflareStuck(session);
+    // Chờ React hydrate xong — ChatGPT nặng, HTML render trước, onClick handlers
+    // attach sau 1-3s. Click Login quá sớm sẽ fire vào button chưa có handler.
+    // Dùng networkidle hoặc timeout làm proxy cho hydration done.
+    await session.page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => {});
+    await session.page.waitForTimeout(1500);
 
     const startedAt = Date.now();
     let lastKind = null;
