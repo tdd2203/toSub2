@@ -160,24 +160,50 @@ const SELECTORS = {
     'input[autocomplete="new-password"]',
     'input[autocomplete="current-password"]',
   ],
+  // Trang /about-you: Material-style floating label. OpenAI thường render label
+  // text như "Full name" / "Họ và tên" làm <label> tách rời input, nên selector
+  // bằng placeholder KHÔNG hit. Playwright hỗ trợ `:below(selector)` + layout
+  // query và `input` liền kề label. Thực dụng nhất: Playwright `getByLabel`
+  // nhưng cú pháp CSS fallback dùng :has(+ input) hoặc input quanh label.
+  // Dưới đây là chuỗi best-guess vị trí; worker ưu tiên exact-id/aria rồi lùi.
   nameInput: [
+    // Playwright-specific: locator by label text (xài Edit sau khi migrate sang
+    // page.getByLabel; CSS này là fallback cho locator.first())
+    'input#name',
     'input[name="name"]',
     'input[name="full_name"]',
+    'input[name="fullName"]',
     'input[name="given_name"]',
+    'input[name="first_name"]',
+    'input[name="firstName"]',
     'input[autocomplete="name"]',
+    'input[autocomplete="given-name"]',
+    'input[aria-label="Họ và tên"]',
+    'input[aria-label="Full name"]',
+    'input[aria-labelledby*="name" i]',
     'input[placeholder*="Name" i]',
-    'input[placeholder*="Tên" i]',
-    'input[aria-label*="name" i]',
+    'input[placeholder*="Họ và tên" i]',
+    // Catch-all: text field đầu tiên không phải password/email trên trang about-you
+    'form input[type="text"]:not([type="password"]):not([type="email"])',
   ],
   birthdateInput: [
+    'input#birthdate',
+    'input#birthday',
+    'input#age',
     'input[name="birthdate"]',
     'input[name="birthday"]',
     'input[name="date_of_birth"]',
+    'input[name="age"]',
     'input[type="date"]',
-    'input[placeholder*="birthday" i]',
-    'input[placeholder*="birth" i]',
-    'input[placeholder*="sinh" i]',
+    'input[type="number"]',
+    'input[inputmode="numeric"]',
+    'input[aria-label="Tuổi"]',
+    'input[aria-label="Age"]',
     'input[aria-label*="birth" i]',
+    'input[placeholder*="Age" i]',
+    'input[placeholder*="Tuổi" i]',
+    'input[placeholder*="birthday" i]',
+    'input[placeholder*="sinh" i]',
   ],
   phoneInput: [
     'input[type="tel"]',
@@ -259,7 +285,15 @@ async function run() {
     await handleProbe(args);
     return;
   }
-  await handleSignup(args);
+  // Flow selection: adaptive state-machine (new, default) vs legacy linear
+  // handleSignup. Opt out of adaptive with env TOSUB2_BROWSER_ADAPTIVE=0 or
+  // --legacy CLI flag.
+  const useAdaptive = !(process.env.TOSUB2_BROWSER_ADAPTIVE === "0" || args.legacy);
+  if (useAdaptive) {
+    await handleSignupAdaptive(args);
+  } else {
+    await handleSignup(args);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -516,6 +550,336 @@ async function handleSignup(args) {
   } finally {
     await session.close();
   }
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive signup — state machine theo URL + accessibility tree
+// ---------------------------------------------------------------------------
+// Thay vì chuỗi fillAndSubmit cứng (xem handleSignup ở trên — brittle khi
+// OpenAI đổi UI), handleSignupAdaptive dò URL + visible headings mỗi tick,
+// map sang 1 trong các "page kind" (login-email, email-otp, password, profile,
+// phone, oauth-consent, done) rồi gọi handler tương ứng. Handlers dùng
+// Playwright accessibility (getByLabel / getByRole) — robust hơn CSS vì bắt
+// theo visible text/role mà user thực sự thấy.
+//
+// Enable: env TOSUB2_BROWSER_ADAPTIVE=1 (default) hoặc --adaptive. Legacy flow
+// vẫn giữ ở handleSignup, bật qua TOSUB2_BROWSER_ADAPTIVE=0 hoặc --legacy.
+
+const PAGE_KINDS = Object.freeze({
+  LANDING: "landing",
+  LOGIN_EMAIL: "login-email",
+  SIGNUP_EMAIL: "signup-email",
+  EMAIL_OTP: "email-otp",
+  PASSWORD: "password",
+  PROFILE: "profile",
+  PHONE_NUMBER: "phone-number",
+  PHONE_OTP: "phone-otp",
+  OAUTH_CONSENT: "oauth-consent",
+  WORKSPACE_SELECT: "workspace-select",
+  DONE: "done",
+  WRONG_OAUTH: "wrong-oauth",
+  UNKNOWN: "unknown",
+});
+
+async function detectPageKind(page) {
+  const url = page.url();
+  if (/^about:blank$/i.test(url)) return PAGE_KINDS.UNKNOWN;
+  if (/^https?:\/\/(localhost|127\.0\.0\.1):1455\/auth\/callback/.test(url)) return PAGE_KINDS.DONE;
+  if (/accounts\.google\.com|appleid\.apple\.com|login\.microsoftonline\.com/.test(url)) return PAGE_KINDS.WRONG_OAUTH;
+
+  // Pull text signals.
+  let title = "";
+  let headings = "";
+  let bodyPrefix = "";
+  try {
+    title = (await page.title()) || "";
+    const data = await page.evaluate(() => ({
+      h: [...document.querySelectorAll("h1, h2, h3")].map((h) => (h.innerText || "").trim()).join(" | "),
+      b: (document.body?.innerText || "").slice(0, 400),
+    }));
+    headings = data.h || "";
+    bodyPrefix = data.b || "";
+  } catch { /* page navigating */ }
+  const corpus = `${url} | ${title} | ${headings} | ${bodyPrefix}`.toLowerCase();
+
+  if (/\/oauth\/authorize|\/consent|\/sign-in-with-chatgpt\/codex/.test(url)) return PAGE_KINDS.OAUTH_CONSENT;
+  if (/\/choose-an-account|\/workspace\/select|choose an account|chọn tài khoản|workspace/.test(corpus)) return PAGE_KINDS.WORKSPACE_SELECT;
+  if (/\/email-verification|verification|kiểm tra hộp thư|verify your email|xác minh/.test(corpus)) return PAGE_KINDS.EMAIL_OTP;
+  if (/\/log-in\/password|password|mật khẩu/.test(corpus) && !/create|đăng ký|sign up/.test(corpus)) return PAGE_KINDS.PASSWORD;
+  if (/\/about-you|bao nhiêu tuổi|about you|họ và tên|full name/.test(corpus)) return PAGE_KINDS.PROFILE;
+  if (/\/add-phone|phone-number|add a phone|số điện thoại|phone verification/.test(corpus)) {
+    if (/code|mã|otp|verify/.test(corpus) && /\d{2,}/.test(bodyPrefix)) return PAGE_KINDS.PHONE_OTP;
+    return PAGE_KINDS.PHONE_NUMBER;
+  }
+  if (/\/log-in($|[?#])|welcome back|chào mừng trở lại/.test(corpus)) return PAGE_KINDS.LOGIN_EMAIL;
+  if (/\/create-account|sign up|đăng ký|tạo tài khoản/.test(corpus)) return PAGE_KINDS.SIGNUP_EMAIL;
+  if (/^https?:\/\/chatgpt\.com\/?(\?|$)/.test(url)) return PAGE_KINDS.LANDING;
+  return PAGE_KINDS.UNKNOWN;
+}
+
+function roleTextbox(page, name) {
+  return page.getByRole("textbox", { name }).first();
+}
+function roleButton(page, name) {
+  return page.getByRole("button", { name }).first();
+}
+function roleLink(page, name) {
+  return page.getByRole("link", { name }).first();
+}
+
+const CONTINUE_NAME = /tiếp tục|continue|next|verify|xác minh|submit|đồng ý/i;
+const AUTHORIZE_NAME = /authorize|allow|cho phép|chấp nhận|accept|đồng ý/i;
+
+const PAGE_HANDLERS = {
+  async [PAGE_KINDS.LANDING](session) {
+    await dismissCookieBannerIfVisible(session.page);
+    // Prefer Sign up for signup flow; both open the same modal.
+    for (const name of [/sign up for free|đăng ký miễn phí/i, /sign up|đăng ký/i, /log in|đăng nhập/i]) {
+      for (const factory of [roleLink, roleButton]) {
+        try {
+          const el = factory(session.page, name);
+          if (await el.isVisible({ timeout: 1500 }).catch(() => false)) {
+            await el.click({ timeout: 5000 });
+            return;
+          }
+        } catch { /* try next */ }
+      }
+    }
+  },
+  async [PAGE_KINDS.LOGIN_EMAIL](session, args) {
+    await dismissCookieBannerIfVisible(session.page);
+    const input = session.page.getByLabel(/email|địa chỉ email/i).first();
+    await input.waitFor({ state: "visible", timeout: 30_000 });
+    await input.fill(args.email);
+    await roleButton(session.page, CONTINUE_NAME).click({ timeout: 10_000 });
+  },
+  async [PAGE_KINDS.SIGNUP_EMAIL](session, args) {
+    await dismissCookieBannerIfVisible(session.page);
+    const input = session.page.getByLabel(/email|địa chỉ email/i).first();
+    await input.waitFor({ state: "visible", timeout: 30_000 });
+    await input.fill(args.email);
+    await roleButton(session.page, CONTINUE_NAME).click({ timeout: 10_000 });
+  },
+  async [PAGE_KINDS.EMAIL_OTP](session) {
+    emit(WORKER_MARKERS.emailOtpPageReached);
+    const otp = await promptForInput("emailOtpPrompt");
+    emit(WORKER_MARKERS.checkpointSavedEmail);
+    const input = session.page.getByLabel(/mã|code|verification|otp/i).first();
+    await input.waitFor({ state: "visible", timeout: 30_000 });
+    await input.fill(otp);
+    await roleButton(session.page, CONTINUE_NAME).click({ timeout: 10_000 });
+  },
+  async [PAGE_KINDS.PASSWORD](session) {
+    const pwd = process.env.CHATGPT_NEW_PASSWORD || process.env.CHATGPT_LOGIN_PASSWORD || "";
+    if (!pwd) throw new Error("MISSING_PASSWORD");
+    const input = session.page.getByLabel(/mật khẩu|password/i).first();
+    await input.waitFor({ state: "visible", timeout: 30_000 });
+    await input.fill(pwd);
+    await roleButton(session.page, CONTINUE_NAME).click({ timeout: 10_000 });
+  },
+  async [PAGE_KINDS.PROFILE](session) {
+    emit(WORKER_MARKERS.sentinelProfilePrepare);
+    const profile = generateInlineProfile();
+    const nameInput = session.page.getByLabel(/họ và tên|full name|name|tên/i).first();
+    if (await nameInput.isVisible({ timeout: 10_000 }).catch(() => false)) {
+      await nameInput.fill(profile.name);
+    }
+    const ageInput = session.page.getByLabel(/tuổi|age|birth|sinh/i).first();
+    if (await ageInput.isVisible({ timeout: 5_000 }).catch(() => false)) {
+      // Field có thể là birthdate (YYYY-MM-DD) hoặc age (number).
+      const inputType = await ageInput.getAttribute("type").catch(() => null);
+      if (inputType === "date") {
+        await ageInput.fill(profile.birthdate);
+      } else {
+        const year = Number(profile.birthdate.slice(0, 4));
+        const age = Math.max(18, 2026 - year);
+        await ageInput.fill(String(age));
+      }
+    }
+    const ageConsent = session.page.getByRole("checkbox", { name: /18|older|age|consent|agree/i }).first();
+    if (await ageConsent.isVisible({ timeout: 2000 }).catch(() => false)) {
+      await ageConsent.check({ timeout: 3000 }).catch(() => {});
+    }
+    await roleButton(session.page, CONTINUE_NAME).click({ timeout: 10_000 });
+    emit(WORKER_MARKERS.profileCompleted);
+  },
+  async [PAGE_KINDS.PHONE_NUMBER](session) {
+    process.stdout.write(WORKER_MARKERS.phoneNumberPrompt.marker);
+    const phone = await readStdinLine();
+    const input = session.page.getByRole("textbox", { name: /phone|số điện thoại/i }).first();
+    await input.waitFor({ state: "visible", timeout: 30_000 });
+    await input.fill(phone);
+    await roleButton(session.page, CONTINUE_NAME).click({ timeout: 10_000 });
+  },
+  async [PAGE_KINDS.PHONE_OTP](session) {
+    process.stdout.write(WORKER_MARKERS.phoneOtpPrompt.marker);
+    const otp = await readStdinLine();
+    const input = session.page.getByLabel(/mã|code|otp|verification/i).first();
+    await input.waitFor({ state: "visible", timeout: 30_000 });
+    await input.fill(otp);
+    await roleButton(session.page, CONTINUE_NAME).click({ timeout: 10_000 });
+    emit(WORKER_MARKERS.phoneOtpValidated);
+  },
+  async [PAGE_KINDS.OAUTH_CONSENT](session) {
+    emit(WORKER_MARKERS.codexOauthStart);
+    // Consent page sometimes has an explicit "Authorize"/"Allow"/"Cho phép"
+    // button; sometimes it auto-redirects. Try to click, ignore if not there.
+    for (const name of [AUTHORIZE_NAME, CONTINUE_NAME]) {
+      try {
+        const btn = roleButton(session.page, name);
+        if (await btn.isVisible({ timeout: 1500 }).catch(() => false)) {
+          await btn.click({ timeout: 5000 });
+          return;
+        }
+      } catch { /* next */ }
+    }
+  },
+  async [PAGE_KINDS.WORKSPACE_SELECT](session) {
+    // Pick the first available workspace/account.
+    const option = session.page.getByRole("radio").first();
+    if (await option.isVisible({ timeout: 3000 }).catch(() => false)) {
+      await option.check({ timeout: 5000 }).catch(() => {});
+    } else {
+      const link = session.page.getByRole("link").first();
+      await link.click({ timeout: 5000 }).catch(() => {});
+    }
+    await roleButton(session.page, CONTINUE_NAME).click({ timeout: 5_000 }).catch(() => {});
+  },
+};
+
+async function handleSignupAdaptive(args) {
+  if (!args.email) throw new Error("MISSING_EMAIL: --email is required for a signup run");
+  const sub2apiOut = args.sub2apiOut || args.out;
+  if (!sub2apiOut) throw new Error("MISSING_OUTPUT: --sub2api-out is required");
+  const checkpointPath = args.checkpoint || null;
+
+  const proxyUrl = args.proxy || process.env.CHATGPT_PROXY_URL || null;
+  if (!proxyUrl && !args.allowDirectIp) {
+    throw new Error("BROWSER_PROXY_REQUIRED: --proxy / CHATGPT_PROXY_URL is required for signup. Pass --allow-direct-ip only for offline tests.");
+  }
+
+  const session = await openBrowser({ email: args.email, proxy: proxyUrl, verbose: args.verbose });
+  // Set up OAuth callback intercept BEFORE any navigation — catches redirect
+  // from any OAuth consent page regardless of which stage drove it.
+  const oauth = await setupCodexOauthInterceptEarly(session, {
+    authBase: args.authBase || DEFAULT_AUTH_BASE,
+    clientId: args.codexClientId || DEFAULT_CODEX_CLIENT_ID,
+    redirectUri: args.codexRedirectUri || DEFAULT_CODEX_REDIRECT_URI,
+    checkpointPath,
+  });
+
+  try {
+    await proxyPreflight(session, args);
+    const signupUrl = await findReachableSignupUrl(session);
+    await session.page.goto(signupUrl, { timeout: PAGE_IDLE_TIMEOUT_MS, waitUntil: "domcontentloaded" });
+    await assertNotCloudflareStuck(session);
+
+    const startedAt = Date.now();
+    let lastKind = null;
+    let sameKindCount = 0;
+    let navigatedToOauth = false;
+    while (Date.now() - startedAt < PAGE_IDLE_TIMEOUT_MS) {
+      if (oauth.capturedUrl) break;
+      const kind = await detectPageKind(session.page);
+      if (kind === PAGE_KINDS.DONE) break;
+      if (kind === PAGE_KINDS.WRONG_OAUTH) throw new Error(`WRONG_OAUTH_DESTINATION: ${session.page.url()}`);
+
+      if (kind === lastKind) {
+        sameKindCount += 1;
+      } else {
+        console.log(`[adaptive] page=${kind} url=${session.page.url()}`);
+        sameKindCount = 0;
+        lastKind = kind;
+      }
+
+      // If no OAuth consent reached after login flow, drive to authorize URL.
+      if (!navigatedToOauth && kind === PAGE_KINDS.UNKNOWN && sameKindCount >= 2) {
+        console.log("[adaptive] no known page detected — navigating to Codex OAuth authorize");
+        await session.page.goto(oauth.authUrl, { timeout: PAGE_IDLE_TIMEOUT_MS, waitUntil: "domcontentloaded" }).catch(() => {});
+        navigatedToOauth = true;
+        await session.page.waitForTimeout(1500);
+        continue;
+      }
+
+      if (kind === PAGE_KINDS.UNKNOWN) {
+        if (sameKindCount >= 20) {
+          throw new Error(`ADAPTIVE_STUCK_UNKNOWN at ${session.page.url()}`);
+        }
+        await session.page.waitForTimeout(2000);
+        continue;
+      }
+
+      const handler = PAGE_HANDLERS[kind];
+      if (!handler) {
+        await session.page.waitForTimeout(2000);
+        continue;
+      }
+      try {
+        await handler(session, args);
+        await saveCheckpoint(checkpointPath, { stage: `adaptive:${kind}`, oai_device_id: session.oaiDeviceId });
+      } catch (err) {
+        console.log(`[adaptive] handler ${kind} threw: ${err?.message || err} — continuing loop (manual drive possible)`);
+      }
+      await session.page.waitForTimeout(1500);
+    }
+
+    if (!oauth.capturedUrl) throw new Error("CODEX_CALLBACK_TIMEOUT: did not observe the Codex redirect within the window");
+
+    const { exchangeOAuthCode } = await import("./protocol-login.mjs");
+    const tokenSet = await exchangeOAuthCode({
+      authBase: args.authBase || DEFAULT_AUTH_BASE,
+      clientId: args.codexClientId || DEFAULT_CODEX_CLIENT_ID,
+      code: new URL(oauth.capturedUrl).searchParams.get("code"),
+      codeVerifier: oauth.codeVerifier,
+      redirectUri: args.codexRedirectUri || DEFAULT_CODEX_REDIRECT_URI,
+      transport: null,
+      cookie: null,
+    });
+    const sub2apiPayload = buildSub2ApiPayload({
+      tokenSet,
+      email: args.email,
+      proxyUrl: session.proxyUrl,
+      clientId: args.codexClientId || DEFAULT_CODEX_CLIENT_ID,
+      accountName: args.sub2apiName || null,
+      concurrency: Number(args.concurrency || 10),
+      priority: Number(args.priority || 1),
+      rateMultiplier: Number(args.rateMultiplier || 1),
+    });
+    await writeJsonAtomic(sub2apiOut, sub2apiPayload);
+    emit(WORKER_MARKERS.savedSub2api, sub2apiOut);
+  } finally {
+    await session.close();
+  }
+}
+
+async function setupCodexOauthInterceptEarly(session, { authBase, clientId, redirectUri, checkpointPath }) {
+  const codeVerifier = base64Url(crypto.randomBytes(48));
+  const codeChallenge = base64Url(crypto.createHash("sha256").update(codeVerifier).digest());
+  const state = base64Url(crypto.randomBytes(24));
+  const authUrl =
+    `${authBase}/oauth/authorize?` +
+    new URLSearchParams({
+      client_id: clientId,
+      code_challenge: codeChallenge,
+      code_challenge_method: "S256",
+      codex_cli_simplified_flow: "true",
+      id_token_add_organizations: "true",
+      redirect_uri: redirectUri,
+      response_type: "code",
+      scope: "openid profile email offline_access",
+      state,
+    }).toString();
+
+  await saveCheckpoint(checkpointPath, { stage: "callback_ready", codeVerifier, state, oai_device_id: session.oaiDeviceId });
+
+  const slot = { capturedUrl: null, codeVerifier, state, authUrl };
+  const intercept = async (route) => {
+    slot.capturedUrl = route.request().url();
+    await route.fulfill({ status: 200, contentType: "text/plain", body: "ok" });
+  };
+  await session.context.route("**://localhost:1455/auth/callback*", intercept);
+  await session.context.route("**://127.0.0.1:1455/auth/callback*", intercept);
+  return slot;
 }
 
 // ---------------------------------------------------------------------------
@@ -1113,6 +1477,16 @@ function parseArgs(argv) {
       // Opt-out of the "signup requires a proxy" guard. Only use for probe mode
       // (--probe) or offline dev — never for real OpenAI signup.
       args.allowDirectIp = true;
+      continue;
+    }
+    if (item === "--legacy") {
+      // Dùng flow linear fillAndSubmit cũ thay vì adaptive state-machine.
+      args.legacy = true;
+      continue;
+    }
+    if (item === "--adaptive") {
+      // Hiển minh adaptive — mặc định đã bật, cờ này chỉ để rõ intent.
+      args.adaptive = true;
       continue;
     }
     if (item === "--setup-totp") {
