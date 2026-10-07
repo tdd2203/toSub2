@@ -604,6 +604,15 @@ async function detectPageKind(page) {
 
   if (/\/oauth\/authorize|\/consent|\/sign-in-with-chatgpt\/codex/.test(url)) return PAGE_KINDS.OAUTH_CONSENT;
   if (/\/choose-an-account|\/workspace\/select|choose an account|chọn tài khoản|workspace/.test(corpus)) return PAGE_KINDS.WORKSPACE_SELECT;
+  // URL-first precedence cho các page có path cụ thể — tránh substring collision
+  // với landing/signup corpus check.
+  if (/\/create-account\/password|\/log-in\/password|\/account\/password/.test(url)) return PAGE_KINDS.PASSWORD;
+  if (/\/email-verification/.test(url)) return PAGE_KINDS.EMAIL_OTP;
+  if (/\/about-you/.test(url)) return PAGE_KINDS.PROFILE;
+  if (/\/add-phone|\/phone-number|\/phone-verification/.test(url)) {
+    if (/code|mã|otp|verification/.test(corpus) && /\d{4,}/.test(bodyPrefix)) return PAGE_KINDS.PHONE_OTP;
+    return PAGE_KINDS.PHONE_NUMBER;
+  }
   if (/\/email-verification|verification|kiểm tra hộp thư|verify your email|xác minh/.test(corpus)) return PAGE_KINDS.EMAIL_OTP;
   if (/\/log-in\/password|password|mật khẩu/.test(corpus) && !/create|đăng ký|sign up/.test(corpus)) return PAGE_KINDS.PASSWORD;
   if (/\/about-you|bao nhiêu tuổi|about you|họ và tên|full name/.test(corpus)) return PAGE_KINDS.PROFILE;
@@ -632,25 +641,52 @@ function roleLink(page, name) {
 const CONTINUE_NAME = /^(tiếp tục|continue|next|verify|xác minh|submit|đồng ý)$/i;
 const AUTHORIZE_NAME = /^(authorize|allow|cho phép|chấp nhận|accept|đồng ý)$/i;
 
-// Smart continue click: nếu button với accessible name EXACT = "Tiếp tục"/
-// "Continue" không có, fallback về button[type="submit"] trong FORM đầu tiên
-// (loại khỏi 3 nút OAuth "Continue with X" bên ngoài form).
+// Smart continue click. Thứ tự thử:
+//   1. Button với accessible name EXACT trong whitelist (tránh "Continue with X")
+//   2. Button KHÔNG chứa "with|google|apple|microsoft|phone|facebook" + có "continue|tiếp tục"
+//   3. form button[type="submit"] (modal có thể wrap trong form)
+//   4. Button cuối cùng (bottom) trong dialog visible — modal thường có submit ở đáy
+//   5. page.keyboard.press("Enter") — nếu input vẫn focused, Enter submit
 async function clickFormSubmit(page) {
-  // Thử exact-text continue button first
+  // 1. Exact name match
+  const exactTexts = ["Continue", "Tiếp tục", "Next", "Verify", "Xác minh", "Submit", "Đồng ý"];
+  for (const t of exactTexts) {
+    try {
+      const btn = page.getByRole("button", { name: t, exact: true }).first();
+      if (await btn.isVisible({ timeout: 800 }).catch(() => false)) {
+        await btn.click({ timeout: 5000 });
+        return;
+      }
+    } catch { /* next */ }
+  }
+  // 2. Button loại OAuth, chứa continue/tiếp tục
   try {
-    const btn = roleButton(page, CONTINUE_NAME);
-    if (await btn.isVisible({ timeout: 1500 }).catch(() => false)) {
+    const btn = page.locator("button:visible", { hasText: /continue|tiếp tục|next/i })
+      .filter({ hasNotText: /with|google|apple|microsoft|phone|facebook|email/i })
+      .first();
+    if (await btn.isVisible({ timeout: 800 }).catch(() => false)) {
       await btn.click({ timeout: 5000 });
       return;
     }
-  } catch { /* fallthrough */ }
-  // Fallback: form submit (loại các OAuth button ngoài form)
-  const formSubmit = page.locator("form button[type='submit']").first();
-  if (await formSubmit.isVisible({ timeout: 2000 }).catch(() => false)) {
-    await formSubmit.click({ timeout: 5000 });
-    return;
-  }
-  throw new Error("CONTINUE_BUTTON_NOT_FOUND");
+  } catch { /* next */ }
+  // 3. form submit
+  try {
+    const formSubmit = page.locator("form button[type='submit']").first();
+    if (await formSubmit.isVisible({ timeout: 800 }).catch(() => false)) {
+      await formSubmit.click({ timeout: 5000 });
+      return;
+    }
+  } catch { /* next */ }
+  // 4. Dialog's last visible button (modal footer)
+  try {
+    const dialogSubmit = page.locator("[role='dialog'] button:visible").last();
+    if (await dialogSubmit.isVisible({ timeout: 800 }).catch(() => false)) {
+      await dialogSubmit.click({ timeout: 5000 });
+      return;
+    }
+  } catch { /* next */ }
+  // 5. Enter fallback — thường submit input đang focused
+  await page.keyboard.press("Enter").catch(() => {});
 }
 
 const PAGE_HANDLERS = {
@@ -710,20 +746,39 @@ const PAGE_HANDLERS = {
   },
   async [PAGE_KINDS.PROFILE](session) {
     emit(WORKER_MARKERS.sentinelProfilePrepare);
-    const profile = generateInlineProfile();
+    const profile = generateInlineProfile(); // {name, birthdate:"YYYY-MM-DD"}
     const nameInput = session.page.getByLabel(/họ và tên|full name|name|tên/i).first();
     if (await nameInput.isVisible({ timeout: 10_000 }).catch(() => false)) {
       await nameInput.fill(profile.name);
     }
-    const ageInput = session.page.getByLabel(/tuổi|age|birth|sinh/i).first();
+    // Birthday / Age field — HAI dạng:
+    //   (a) input[type=date] → fill YYYY-MM-DD
+    //   (b) input[type=text|tel] với mask MM/DD/YYYY (OpenAI dùng ở /about-you)
+    //       → cần type từng ký tự digit (12 chars: MMDDYYYY), browser-side mask
+    //       sẽ chèn / tự.
+    //   (c) input[type=number|tel] cho AGE (số) → fill age
+    const bYear = Number(profile.birthdate.slice(0, 4));
+    const bMonth = Number(profile.birthdate.slice(5, 7));
+    const bDay = Number(profile.birthdate.slice(8, 10));
+    const mmddyyyy = `${String(bMonth).padStart(2, "0")}${String(bDay).padStart(2, "0")}${bYear}`;
+    const ageInput = session.page.getByLabel(/họ sinh|birthday|birthdate|birth|date of birth|ngày sinh|tuổi|age/i).first();
     if (await ageInput.isVisible({ timeout: 5_000 }).catch(() => false)) {
-      // Field có thể là birthdate (YYYY-MM-DD) hoặc age (number).
       const inputType = await ageInput.getAttribute("type").catch(() => null);
+      const label = (await ageInput.getAttribute("aria-label").catch(() => "")) || "";
+      const placeholder = (await ageInput.getAttribute("placeholder").catch(() => "")) || "";
+      const descriptor = (label + " " + placeholder).toLowerCase();
+      const isBirthday = /birth|sinh|birthday|birthdate|mm|dd|yyyy/.test(descriptor) || /\/|-/.test(placeholder);
       if (inputType === "date") {
         await ageInput.fill(profile.birthdate);
+      } else if (isBirthday) {
+        // Type từng digit để browser mask MM/DD/YYYY chèn / tự
+        await ageInput.click({ timeout: 3000 }).catch(() => {});
+        await ageInput.press("End").catch(() => {});
+        await ageInput.press("Backspace").catch(() => {}); // clear residual
+        await session.page.keyboard.type(mmddyyyy, { delay: 40 });
       } else {
-        const year = Number(profile.birthdate.slice(0, 4));
-        const age = Math.max(18, 2026 - year);
+        // Age field (number): fill tuổi hiện tại
+        const age = Math.max(18, 2026 - bYear);
         await ageInput.fill(String(age));
       }
     }
@@ -737,9 +792,36 @@ const PAGE_HANDLERS = {
   async [PAGE_KINDS.PHONE_NUMBER](session) {
     process.stdout.write(WORKER_MARKERS.phoneNumberPrompt.marker);
     const phone = await readStdinLine();
+    // Chuẩn hoá E.164: nếu bắt đầu "+", tách country code để chọn dropdown; else
+    // fill số raw và để country select mặc định.
+    const match = String(phone).trim().match(/^\+(\d{1,3})(\d+)$/);
+    let countryCode = null;
+    let subscriberNumber = String(phone).replace(/^\+/, "");
+    if (match) { countryCode = match[1]; subscriberNumber = match[2]; }
+    // Thử chọn country dropdown theo countryCode nếu có
+    if (countryCode) {
+      const countryName = { "84": "Vietnam", "1": "United States", "66": "Thailand", "60": "Malaysia", "63": "Philippines", "62": "Indonesia", "91": "India", "81": "Japan", "82": "South Korea", "86": "China" }[countryCode];
+      if (countryName) {
+        try {
+          const select = session.page.locator("select, [role='combobox']").first();
+          if (await select.isVisible({ timeout: 2000 }).catch(() => false)) {
+            await select.click({ timeout: 3000 }).catch(() => {});
+            // Option within dropdown panel
+            const opt = session.page.getByText(new RegExp(`${countryName}.*\\+${countryCode}|\\+${countryCode}.*${countryName}`, "i")).first();
+            if (await opt.isVisible({ timeout: 2000 }).catch(() => false)) {
+              await opt.click({ timeout: 3000 }).catch(() => {});
+            }
+          }
+        } catch { /* skip */ }
+      }
+    }
     const input = session.page.getByRole("textbox", { name: /phone|số điện thoại/i }).first();
     await input.waitFor({ state: "visible", timeout: 30_000 });
-    await input.fill(phone);
+    // Clear current (có thể có +1 default)
+    await input.click({ timeout: 2000 }).catch(() => {});
+    await input.press("End").catch(() => {});
+    for (let i = 0; i < 20; i += 1) await input.press("Backspace").catch(() => {});
+    await input.type(subscriberNumber, { delay: 40 });
     await clickFormSubmit(session.page);
   },
   async [PAGE_KINDS.PHONE_OTP](session) {
@@ -765,16 +847,40 @@ const PAGE_HANDLERS = {
       } catch { /* next */ }
     }
   },
-  async [PAGE_KINDS.WORKSPACE_SELECT](session) {
-    // Pick the first available workspace/account.
-    const option = session.page.getByRole("radio").first();
-    if (await option.isVisible({ timeout: 3000 }).catch(() => false)) {
-      await option.check({ timeout: 5000 }).catch(() => {});
-    } else {
-      const link = session.page.getByRole("link").first();
-      await link.click({ timeout: 5000 }).catch(() => {});
-    }
-    await roleButton(session.page, CONTINUE_NAME).click({ timeout: 5_000 }).catch(() => {});
+  async [PAGE_KINDS.WORKSPACE_SELECT](session, args) {
+    // "Welcome back / Choose an account" page — click the account card có email của mình.
+    // Thứ tự thử:
+    //   1. Click ancestor của text email (card chứa email)
+    //   2. getByRole radio first (một số layout dùng radio)
+    //   3. Button có text email
+    try {
+      const emailLocator = session.page.getByText(args.email, { exact: false }).first();
+      if (await emailLocator.isVisible({ timeout: 2000 }).catch(() => false)) {
+        // Click ancestor div với role=button/link nếu có, else click element trực tiếp
+        const clickable = emailLocator.locator('xpath=ancestor-or-self::*[@role="button" or @role="link" or self::button or self::a][1]').first();
+        if (await clickable.isVisible({ timeout: 1000 }).catch(() => false)) {
+          await clickable.click({ timeout: 5000 });
+          return;
+        }
+        await emailLocator.click({ timeout: 5000 }).catch(() => {});
+        return;
+      }
+    } catch { /* fallthrough */ }
+    try {
+      const radio = session.page.getByRole("radio").first();
+      if (await radio.isVisible({ timeout: 1500 }).catch(() => false)) {
+        await radio.check({ timeout: 3000 }).catch(() => {});
+        await clickFormSubmit(session.page);
+        return;
+      }
+    } catch { /* next */ }
+    // Last resort: scan for buttons containing email
+    try {
+      const btn = session.page.locator("button, [role='button'], a", { hasText: args.email }).first();
+      if (await btn.isVisible({ timeout: 1500 }).catch(() => false)) {
+        await btn.click({ timeout: 3000 });
+      }
+    } catch { /* nothing more we can do */ }
   },
 };
 
@@ -856,15 +962,12 @@ async function handleSignupAdaptive(args) {
 
     if (!oauth.capturedUrl) throw new Error("CODEX_CALLBACK_TIMEOUT: did not observe the Codex redirect within the window");
 
-    const { exchangeOAuthCode } = await import("./protocol-login.mjs");
-    const tokenSet = await exchangeOAuthCode({
+    const tokenSet = await exchangeOAuthCodeInline({
       authBase: args.authBase || DEFAULT_AUTH_BASE,
       clientId: args.codexClientId || DEFAULT_CODEX_CLIENT_ID,
       code: new URL(oauth.capturedUrl).searchParams.get("code"),
       codeVerifier: oauth.codeVerifier,
       redirectUri: args.codexRedirectUri || DEFAULT_CODEX_REDIRECT_URI,
-      transport: null,
-      cookie: null,
     });
     const sub2apiPayload = buildSub2ApiPayload({
       tokenSet,
@@ -881,6 +984,38 @@ async function handleSignupAdaptive(args) {
   } finally {
     await session.close();
   }
+}
+
+// Pure-HTTPS OAuth code → token exchange. Inlined ở đây vì protocol-login.mjs
+// là CLI, không export được. Chuẩn OAuth2 PKCE code exchange theo protocol.mjs.
+async function exchangeOAuthCodeInline({ authBase, clientId, code, codeVerifier, redirectUri }) {
+  const res = await fetch(`${authBase}/oauth/token`, {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/x-www-form-urlencoded",
+      "user-agent": "codex-cli/0.1.0",
+    },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      client_id: clientId,
+      code,
+      redirect_uri: redirectUri,
+      code_verifier: codeVerifier,
+    }),
+  });
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); }
+  catch { throw new Error(`Token endpoint returned non-JSON HTTP ${res.status}: ${text.slice(0, 180)}`); }
+  if (!res.ok) {
+    const message = data?.error_description || data?.error || JSON.stringify(data).slice(0, 180);
+    throw new Error(`Token exchange failed with HTTP ${res.status}: ${message}`);
+  }
+  for (const key of ["access_token", "refresh_token", "id_token"]) {
+    if (!data[key]) throw new Error(`Token response missing ${key}.`);
+  }
+  return data;
 }
 
 async function setupCodexOauthInterceptEarly(session, { authBase, clientId, redirectUri, checkpointPath }) {
@@ -1472,7 +1607,15 @@ async function maybeWaitForPhonePage(session) {
 
 async function saveCheckpoint(filePath, data) {
   if (!filePath) return;
-  const payload = { ...data, saved_at: new Date().toISOString() };
+  // Merge với checkpoint cũ (nếu có) để không mất PKCE verifier/state khi stage
+  // update sau. Previous bug: overwrite xóa codeVerifier → không recover được
+  // OAuth exchange.
+  let existing = {};
+  try {
+    const txt = await fs.readFile(filePath, "utf8");
+    existing = JSON.parse(txt);
+  } catch { /* file missing OK */ }
+  const payload = { ...existing, ...data, saved_at: new Date().toISOString() };
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   await writeJsonAtomic(filePath, payload);
 }
