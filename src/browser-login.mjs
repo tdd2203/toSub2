@@ -914,19 +914,38 @@ const PAGE_HANDLERS = {
         try {
           const el = build();
           if (await el.isVisible({ timeout: 800 }).catch(() => false)) {
-            // Scroll + hover + click + verify
+            // Scroll + hover
             await el.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
             await el.hover({ timeout: 2000 }).catch(() => {});
             await session.page.waitForTimeout(200);
+
+            // Strategy A: Raw page.mouse via coordinates (CDP Input dispatchMouseEvent
+            // trực tiếp — bypass Playwright locator abstraction, trigger humanize nếu có)
+            const box = await el.boundingBox().catch(() => null);
+            if (box) {
+              const x = box.x + box.width / 2;
+              const y = box.y + box.height / 2;
+              await session.page.mouse.move(x, y, { steps: 10 }).catch(() => {});
+              await session.page.waitForTimeout(100);
+              await session.page.mouse.down().catch(() => {});
+              await session.page.waitForTimeout(50);
+              await session.page.mouse.up().catch(() => {});
+              await session.page.waitForTimeout(2000);
+              if (await modalOpened()) return;
+            }
+
+            // Strategy B: locator.click force
             await el.click({ timeout: 5000, force: true }).catch(() => {});
             await session.page.waitForTimeout(1500);
             if (await modalOpened()) return;
-            // Click didn't open modal — thử Enter keypress trên focused button
+
+            // Strategy C: focus + Enter
             await el.focus().catch(() => {});
             await session.page.keyboard.press("Enter").catch(() => {});
             await session.page.waitForTimeout(1500);
             if (await modalOpened()) return;
-            // Thử dispatchEvent qua JS (React synthetic bypass)
+
+            // Strategy D: JS dispatchEvent chain
             await el.evaluate((node) => {
               const rect = node.getBoundingClientRect();
               const opts = { bubbles: true, cancelable: true, view: window, button: 0,
@@ -938,7 +957,6 @@ const PAGE_HANDLERS = {
             }).catch(() => {});
             await session.page.waitForTimeout(1500);
             if (await modalOpened()) return;
-            // Vẫn không mở → try next text
           }
         } catch { /* next */ }
       }
