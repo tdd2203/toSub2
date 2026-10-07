@@ -738,7 +738,9 @@ async function detectPageKind(page) {
   if (/\/email-verification/.test(url)) return PAGE_KINDS.EMAIL_OTP;
   if (/\/about-you/.test(url)) return PAGE_KINDS.PROFILE;
   if (/\/add-phone|\/phone-number|\/phone-verification/.test(url)) {
-    if (/code|mã|otp|verification/.test(corpus) && /\d{4,}/.test(bodyPrefix)) return PAGE_KINDS.PHONE_OTP;
+    // /phone-verification URL luôn là OTP step. /add-phone có thể là input hoặc
+    // verify tùy state. Dùng URL path + body keywords để phân biệt.
+    if (/\/phone-verification/.test(url) || /check your phone|kiểm tra điện thoại|verification code|mã xác minh/.test(corpus)) return PAGE_KINDS.PHONE_OTP;
     return PAGE_KINDS.PHONE_NUMBER;
   }
   if (/\/email-verification|verification|kiểm tra hộp thư|verify your email|xác minh/.test(corpus)) return PAGE_KINDS.EMAIL_OTP;
@@ -834,26 +836,48 @@ async function clickFormSubmit(page) {
 const PAGE_HANDLERS = {
   async [PAGE_KINDS.LANDING](session) {
     await dismissCookieBannerIfVisible(session.page);
-    // Prefer Sign up for signup flow; both open the same modal.
+    // Click Login/Signup button với MULTIPLE strategies — chatgpt.com có nhiều
+    // layout, button có thể là <a>, <button>, hoặc <div onClick>.
     const texts = ["Sign up for free", "Đăng ký miễn phí", "Sign up", "Đăng ký", "Log in", "Đăng nhập"];
     for (const text of texts) {
-      // Thử getByText (strict), rồi role button/link, rồi CSS fallback.
       const tries = [
+        // 1. Exact-text visible element
         () => session.page.getByText(text, { exact: true }).first(),
+        // 2. Role=button/link exact name regex
         () => session.page.getByRole("button", { name: new RegExp("^" + text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$", "i") }).first(),
         () => session.page.getByRole("link", { name: new RegExp("^" + text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$", "i") }).first(),
+        // 3. CSS :has-text (looser)
         () => session.page.locator(`a:has-text("${text}"), button:has-text("${text}")`).first(),
+        // 4. Any clickable có text (fallback cuối)
+        () => session.page.locator(`[data-testid*="login" i]:has-text("${text}"), [data-testid*="signup" i]:has-text("${text}")`).first(),
       ];
       for (const build of tries) {
         try {
           const el = build();
-          if (await el.isVisible({ timeout: 1000 }).catch(() => false)) {
-            await el.click({ timeout: 5000 });
+          if (await el.isVisible({ timeout: 800 }).catch(() => false)) {
+            await el.click({ timeout: 5000, force: true });
+            await session.page.waitForTimeout(500);
             return;
           }
         } catch { /* next */ }
       }
     }
+    // Fallback cuối: scan all visible buttons/links trên trang với bất kỳ text
+    // nào match "login/signup". Thử JS click (bypass pointer-event issues).
+    try {
+      await session.page.evaluate(() => {
+        const texts = /^(log in|sign up|sign up for free|đăng nhập|đăng ký|đăng ký miễn phí)$/i;
+        const candidates = [...document.querySelectorAll('a, button, [role="button"]')];
+        for (const el of candidates) {
+          const txt = (el.innerText || el.textContent || "").trim();
+          if (texts.test(txt)) {
+            el.click();
+            return true;
+          }
+        }
+        return false;
+      });
+    } catch { /* give up */ }
   },
   async [PAGE_KINDS.LOGIN_EMAIL](session, args) {
     await dismissCookieBannerIfVisible(session.page);
@@ -1014,34 +1038,62 @@ const PAGE_HANDLERS = {
   },
   async [PAGE_KINDS.OAUTH_CONSENT](session) {
     emit(WORKER_MARKERS.codexOauthStart);
-    // Consent page sometimes has an explicit "Authorize"/"Allow"/"Cho phép"
-    // button; sometimes it auto-redirects. Try to click, ignore if not there.
+    // Consent page: thường là "Continue" button đen. Thử nhiều strategies để
+    // chắc chắn fire.
     for (const name of [AUTHORIZE_NAME, CONTINUE_NAME]) {
       try {
         const btn = roleButton(session.page, name);
-        if (await btn.isVisible({ timeout: 1500 }).catch(() => false)) {
+        if (await btn.isVisible({ timeout: 2000 }).catch(() => false)) {
           await btn.click({ timeout: 5000 });
           return;
         }
       } catch { /* next */ }
     }
+    // Fallback: clickFormSubmit (exact text + form submit + Enter)
+    try { await clickFormSubmit(session.page); return; } catch { /* next */ }
+    // JS click fallback — scan buttons với text continue/authorize/allow
+    try {
+      await session.page.evaluate(() => {
+        const re = /^(continue|tiếp tục|authorize|allow|cho phép|accept|next)$/i;
+        const btns = [...document.querySelectorAll('button, [role="button"], a[role="button"]')];
+        for (const b of btns) {
+          const t = (b.innerText || "").trim();
+          if (re.test(t)) { b.click(); return true; }
+        }
+        return false;
+      });
+    } catch { /* give up */ }
   },
   async [PAGE_KINDS.WORKSPACE_SELECT](session, args) {
-    // "Welcome back / Choose an account" page — click the account card có email của mình.
-    // Thứ tự thử:
-    //   1. Click ancestor của text email (card chứa email)
-    //   2. getByRole radio first (một số layout dùng radio)
-    //   3. Button có text email
+    // "Welcome back / Choose an account" page. Account card thường là <div
+    // onClick> không phải button chuẩn → getByRole miss.
+    // Strategy: JS click element chứa email (dispatch click sẽ bubble lên handler).
     try {
-      const emailLocator = session.page.getByText(args.email, { exact: false }).first();
-      if (await emailLocator.isVisible({ timeout: 2000 }).catch(() => false)) {
-        // Click ancestor div với role=button/link nếu có, else click element trực tiếp
-        const clickable = emailLocator.locator('xpath=ancestor-or-self::*[@role="button" or @role="link" or self::button or self::a][1]').first();
-        if (await clickable.isVisible({ timeout: 1000 }).catch(() => false)) {
-          await clickable.click({ timeout: 5000 });
-          return;
+      const clicked = await session.page.evaluate((email) => {
+        const nodes = [...document.querySelectorAll('div, button, a, [role="button"]')];
+        for (const n of nodes) {
+          const txt = (n.innerText || "").trim();
+          if (txt.includes(email)) {
+            // Walk up to find clickable container (max 5 levels)
+            let el = n;
+            for (let i = 0; i < 5 && el; i += 1) {
+              const style = window.getComputedStyle(el);
+              if (el.onclick || el.getAttribute("role") === "button" || el.tagName === "BUTTON" || el.tagName === "A" || style.cursor === "pointer") {
+                el.click();
+                return true;
+              }
+              el = el.parentElement;
+            }
+            n.click(); // fallback: click the text node parent
+            return true;
+          }
         }
-        await emailLocator.click({ timeout: 5000 }).catch(() => {});
+        return false;
+      }, args.email);
+      if (clicked) {
+        await session.page.waitForTimeout(1000);
+        // Có thể cần click Continue tiếp sau khi select account
+        await clickFormSubmit(session.page).catch(() => {});
         return;
       }
     } catch { /* fallthrough */ }
@@ -1053,13 +1105,6 @@ const PAGE_HANDLERS = {
         return;
       }
     } catch { /* next */ }
-    // Last resort: scan for buttons containing email
-    try {
-      const btn = session.page.locator("button, [role='button'], a", { hasText: args.email }).first();
-      if (await btn.isVisible({ timeout: 1500 }).catch(() => false)) {
-        await btn.click({ timeout: 3000 });
-      }
-    } catch { /* nothing more we can do */ }
   },
 };
 
