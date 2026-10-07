@@ -62,8 +62,15 @@ const SIGNUP_URL_CANDIDATES = [
   "https://auth.openai.com/create-account",
   "https://chatgpt.com/auth/signup",
 ];
-const PAGE_IDLE_TIMEOUT_MS = 60_000;
-const INPUT_TIMEOUT_MS = 300_000;
+// Manual-assist mode (env TOSUB2_BROWSER_MANUAL=1 hoặc CLI --manual-assist):
+//   * Chromium KHÔNG tự đóng khi worker exit (handleSIG* = false)
+//   * Timeout tất cả locator/goto giãn lên 30 phút
+//   * Timeout stdin cũng 30 phút
+//   * Khi error, không teardown context — để user tiếp tục drive tay
+// Default (unset): behaviour cũ (60s page timeout, 5 min stdin, context close on exit).
+const MANUAL_ASSIST = process.env.TOSUB2_BROWSER_MANUAL === "1" || process.argv.includes("--manual-assist");
+const PAGE_IDLE_TIMEOUT_MS = MANUAL_ASSIST ? 1_800_000 : 60_000;
+const INPUT_TIMEOUT_MS = MANUAL_ASSIST ? 1_800_000 : 300_000;
 
 // auth.openai.com signup selectors.
 //
@@ -103,6 +110,34 @@ const SELECTORS = {
   closeModalButton: [
     'button[aria-label*="close" i]',
     'button[aria-label*="đóng" i]',
+  ],
+  // Nút trigger để bật modal — chatgpt.com không auto-show modal, phải click
+  // "Sign up for free" (ưu tiên cho flow signup) hoặc "Log in" (top-right)
+  // trước. Cả 2 đều mở cùng modal thống nhất.
+  openModalButton: [
+    'a:text-is("Sign up for free")',
+    'button:text-is("Sign up for free")',
+    'a:text-is("Sign up")',
+    'button:text-is("Sign up")',
+    'a:text-is("Đăng ký")',
+    'a:text-is("Log in")',
+    'button:text-is("Log in")',
+    'a:text-is("Đăng nhập")',
+    'button:text-is("Đăng nhập")',
+    '[data-testid="login-button"]',
+    '[data-testid="signup-button"]',
+  ],
+  // Cookie banner — Reject non-essential ưu tiên (privacy); Accept all fallback.
+  // Không đóng banner có thể cản modal và interaction phía dưới.
+  cookieRejectButton: [
+    'button:has-text("Reject non-essential")',
+    'button:has-text("Reject all")',
+    'button:has-text("Từ chối")',
+  ],
+  cookieAcceptButton: [
+    'button:has-text("Accept all")',
+    'button:has-text("Chấp nhận")',
+    '[data-testid*="accept" i]',
   ],
   emailOtpInput: [
     'input[name="code"]',
@@ -519,6 +554,8 @@ async function openBrowser({ email, proxy, verbose }) {
     headless: false,
     args: launchArgs,
     ignoreDefaultArgs: ["--enable-automation"],
+    // Manual-assist: giữ Chromium alive khi worker exit (user tiếp tục drive tay).
+    ...(MANUAL_ASSIST ? { handleSIGINT: false, handleSIGTERM: false, handleSIGHUP: false } : {}),
   };
   if (proxyUrl) {
     launchOptions.proxy = {
@@ -579,6 +616,11 @@ async function openBrowser({ email, proxy, verbose }) {
     userDataDir,
     proxyUrl: proxy || "",
     close: async () => {
+      if (MANUAL_ASSIST) {
+        // User muốn drive tay sau khi worker exit — không teardown Chromium.
+        console.log("[manual-assist] Chromium giữ nguyên — đóng tay khi xong.");
+        return;
+      }
       await context.close().catch(() => {});
     },
   };
@@ -904,11 +946,80 @@ async function captureDomSnapshot(page) {
 }
 
 async function waitForModalEmailInput(page) {
-  // Modal appears after a tick on chatgpt.com. The email input is the stable
-  // signal — Cloudflare bot-check also sometimes shows an "Email address" look
-  // alike, but ours is paired with the OAuth buttons and the Continue submit.
+  // chatgpt.com không auto-show modal. Thứ tự thật:
+  //   1. Trang load → có thể có cookie banner cản dưới cùng → đóng.
+  //   2. Click "Sign up for free" hoặc "Log in" ở header → modal bật.
+  //   3. Chờ email input hiện.
+  //
+  // Step 1 + 2 best-effort — nếu banner/button không có, chuyển bước. Step 3 là
+  // hard requirement.
+  await dismissCookieBannerIfVisible(page);
+  await openSignupModalIfNeeded(page);
+
   const emailSelector = SELECTORS.emailInput.join(", ");
-  await page.locator(emailSelector).first().waitFor({ state: "visible", timeout: PAGE_IDLE_TIMEOUT_MS });
+  try {
+    await page.locator(emailSelector).first().waitFor({ state: "visible", timeout: PAGE_IDLE_TIMEOUT_MS });
+  } catch (error) {
+    // On miss, dump an evidence snapshot so operator sees what Chromium actually
+    // got (Cloudflare interstitial? "Just a moment"? wrong URL?). Written to
+    // tmp/ next to the sub2api output.
+    try {
+      const dumpDir = path.join(process.cwd(), "tmp", "browser-login-failures");
+      await fs.mkdir(dumpDir, { recursive: true });
+      const stamp = String(Date.now());
+      const htmlPath = path.join(dumpDir, `modal-miss-${stamp}.html`);
+      const metaPath = path.join(dumpDir, `modal-miss-${stamp}.json`);
+      const pngPath = path.join(dumpDir, `modal-miss-${stamp}.png`);
+      const html = await page.content().catch(() => "<unavailable>");
+      await fs.writeFile(htmlPath, html, "utf8");
+      const url = page.url();
+      const title = await page.title().catch(() => "");
+      await page.screenshot({ path: pngPath, fullPage: true }).catch(() => {});
+      const dom = await captureDomSnapshot(page).catch((e) => ({ error: String(e?.message || e) }));
+      await fs.writeFile(metaPath, `${JSON.stringify({ url, title, dom, originalError: String(error?.message || error) }, null, 2)}\n`, "utf8");
+      console.error(`[error] MODAL_NOT_FOUND url=${url} title=${JSON.stringify(title)} dump=${metaPath}`);
+    } catch (dumpErr) {
+      console.error(`[error] MODAL_NOT_FOUND (dump failed: ${dumpErr?.message || dumpErr})`);
+    }
+    throw error;
+  }
+}
+
+async function dismissCookieBannerIfVisible(page) {
+  // Try reject-first (privacy), fallback accept. Short 3s window — if no banner
+  // in 3s, assume there isn't one and move on.
+  for (const sel of [...SELECTORS.cookieRejectButton, ...SELECTORS.cookieAcceptButton]) {
+    try {
+      const btn = page.locator(sel).first();
+      if (await btn.isVisible({ timeout: 3_000 }).catch(() => false)) {
+        await btn.click({ timeout: 5_000 }).catch(() => {});
+        await page.waitForTimeout(500);
+        return;
+      }
+    } catch {
+      /* keep trying */
+    }
+  }
+}
+
+async function openSignupModalIfNeeded(page) {
+  // Nếu email input đã hiện (modal auto-visible trên một variant A/B nào đó),
+  // không cần click gì. Nếu không, thử click một trong các nút trigger modal.
+  const emailSelector = SELECTORS.emailInput.join(", ");
+  if (await page.locator(emailSelector).first().isVisible({ timeout: 2_000 }).catch(() => false)) {
+    return;
+  }
+  const openSelector = SELECTORS.openModalButton.join(", ");
+  try {
+    const trigger = page.locator(openSelector).first();
+    await trigger.waitFor({ state: "visible", timeout: 15_000 });
+    await trigger.click({ timeout: 5_000 });
+    // Chờ 1 nhịp cho modal animate xong trước khi caller waitFor email input.
+    await page.waitForTimeout(800);
+  } catch {
+    /* nếu không tìm thấy trigger thì để caller tự fail với dump — có thể là CF
+     * interstitial / trang trắng */
+  }
 }
 
 async function assertNotAccidentallyOnOauth(page) {
