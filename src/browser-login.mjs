@@ -255,6 +255,55 @@ function selectorFor(key) {
   return Array.isArray(list) ? list.join(", ") : list;
 }
 
+// Chờ React hydrate xong — ChatGPT SPA cần 1-3s sau goto để onClick attach.
+// Dùng ở đầu mỗi handler khi page vừa redirect.
+async function waitForReactReady(page) {
+  await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+}
+
+// Fill React controlled input chuẩn: Playwright .fill() set .value nhưng React
+// internal state không update (vì React override setter). Giải pháp: dùng native
+// setter của HTMLInputElement.prototype rồi dispatch input event — React catch
+// event, cập nhật state đúng.
+async function reactSafeFill(locator, value) {
+  await locator.waitFor({ state: "visible", timeout: 15_000 });
+  await locator.click({ timeout: 5000, force: true }).catch(() => {});
+  // Clear existing (3 cách: Ctrl+A+Delete, End+Backspace loop, native setter "")
+  await locator.press("Control+a").catch(() => {});
+  await locator.press("Delete").catch(() => {});
+  await locator.press("End").catch(() => {});
+  for (let i = 0; i < 25; i += 1) await locator.press("Backspace").catch(() => {});
+  // Type character by character (triggers input events)
+  await locator.type(String(value), { delay: 25 }).catch(async () => {
+    // Fallback: native value setter + fire input event (React catches)
+    await locator.evaluate((el, v) => {
+      const proto = window.HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+      setter.call(el, v);
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    }, String(value)).catch(() => {});
+  });
+  await locator.evaluate((el) => el.blur()).catch(() => {});
+}
+
+// Click React synthetic listener an toàn: thử Playwright click (CDP native mouse)
+// trước, fallback dispatchEvent MouseEvent sequence.
+async function reactSafeClick(locator) {
+  await locator.waitFor({ state: "visible", timeout: 10_000 }).catch(() => {});
+  try { await locator.click({ timeout: 5000, force: true }); return; } catch { /* fallthrough */ }
+  await locator.evaluate((el) => {
+    const rect = el.getBoundingClientRect();
+    const opts = {
+      bubbles: true, cancelable: true, view: window, button: 0,
+      clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2,
+    };
+    ["mousedown", "mouseup", "click"].forEach((t) => el.dispatchEvent(new MouseEvent(t, opts)));
+    el.click();
+  }).catch(() => {});
+}
+
 const RUN_MODES = Object.freeze({
   SIGNUP: "signup",
   PROBE: "probe",
@@ -938,21 +987,22 @@ const PAGE_HANDLERS = {
     await clickFormSubmit(session.page);
   },
   async [PAGE_KINDS.EMAIL_OTP](session) {
+    await waitForReactReady(session.page);
     emit(WORKER_MARKERS.emailOtpPageReached);
     const otp = await promptForInputOrPageAdvance("emailOtpPrompt", session.page, /\/email-verification/, { timeoutMs: 300_000 });
-    if (!otp) return; // URL đã rời email-verification (user drive thủ công)
+    if (!otp) return;
     emit(WORKER_MARKERS.checkpointSavedEmail);
     const input = session.page.getByLabel(/mã|code|verification|otp/i).first();
     if (!(await input.isVisible({ timeout: 5000 }).catch(() => false))) return;
-    await input.fill(otp).catch(() => {});
+    await reactSafeFill(input, otp);
     await clickFormSubmit(session.page);
   },
   async [PAGE_KINDS.PASSWORD](session) {
+    await waitForReactReady(session.page);
     const pwd = process.env.CHATGPT_NEW_PASSWORD || process.env.CHATGPT_LOGIN_PASSWORD || "";
     if (!pwd) throw new Error("MISSING_PASSWORD");
     const input = session.page.getByLabel(/mật khẩu|password/i).first();
-    await input.waitFor({ state: "visible", timeout: 30_000 });
-    await input.fill(pwd);
+    await reactSafeFill(input, pwd);
     await clickFormSubmit(session.page);
   },
   async [PAGE_KINDS.PROFILE](session) {
@@ -974,7 +1024,7 @@ const PAGE_HANDLERS = {
     };
     const nameInput = await findName();
     if (nameInput) {
-      await nameInput.fill(profile.name).catch(() => {});
+      await reactSafeFill(nameInput, profile.name).catch(() => {});
     }
     // Birthday / Age field — HAI dạng:
     //   (a) input[type=date] → fill YYYY-MM-DD
@@ -1010,15 +1060,12 @@ const PAGE_HANDLERS = {
       const isBirthday = /birth|sinh|birthday|birthdate|mm|dd|yyyy/.test(descriptor) || /\/|-/.test(placeholder);
       try {
         if (inputType === "date") {
-          await ageInput.fill(profile.birthdate);
+          await reactSafeFill(ageInput, profile.birthdate);
         } else if (isBirthday) {
-          await ageInput.click({ timeout: 3000 }).catch(() => {});
-          await ageInput.press("End").catch(() => {});
-          for (let i = 0; i < 15; i += 1) await ageInput.press("Backspace").catch(() => {});
-          await session.page.keyboard.type(mmddyyyy, { delay: 40 });
+          await reactSafeFill(ageInput, mmddyyyy);
         } else {
           const age = Math.max(18, 2026 - bYear);
-          await ageInput.fill(String(age));
+          await reactSafeFill(ageInput, String(age));
         }
       } catch { /* best-effort */ }
     }
@@ -1055,28 +1102,24 @@ const PAGE_HANDLERS = {
         } catch { /* skip */ }
       }
     }
+    await waitForReactReady(session.page);
     // Tìm phone input: role=textbox name phone/số, fallback input[type=tel]
     let input = session.page.getByRole("textbox", { name: /phone|số điện thoại/i }).first();
     if (!(await input.isVisible({ timeout: 2000 }).catch(() => false))) {
       input = session.page.locator('input[type="tel"]:visible, input[inputmode="tel"]:visible').first();
     }
-    await input.waitFor({ state: "visible", timeout: 30_000 });
-    // User's trick: paste FULL E.164 (+84...) vào input — OpenAI auto-detect country
-    // từ prefix. Clear current + type full E.164 (bypass country dropdown dance).
-    await input.click({ timeout: 2000 }).catch(() => {});
-    await input.press("End").catch(() => {});
-    for (let i = 0; i < 25; i += 1) await input.press("Backspace").catch(() => {});
     const fullE164 = String(phone).trim().startsWith("+") ? phone : (countryCode ? `+${countryCode}${subscriberNumber}` : subscriberNumber);
-    await input.type(fullE164, { delay: 40 });
+    await reactSafeFill(input, fullE164);
     await session.page.waitForTimeout(500); // chờ validation
     await clickFormSubmit(session.page);
   },
   async [PAGE_KINDS.PHONE_OTP](session) {
+    await waitForReactReady(session.page);
     const otp = await promptForInputOrPageAdvance("phoneOtpPrompt", session.page, /\/phone-verification/, { timeoutMs: 600_000 });
     if (!otp) return;
     const input = session.page.getByLabel(/mã|code|otp|verification/i).first();
     if (!(await input.isVisible({ timeout: 5000 }).catch(() => false))) return;
-    await input.fill(otp).catch(() => {});
+    await reactSafeFill(input, otp);
     await clickFormSubmit(session.page);
     emit(WORKER_MARKERS.phoneOtpValidated);
   },
