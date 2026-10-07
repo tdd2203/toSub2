@@ -301,20 +301,80 @@ async function run() {
 // ---------------------------------------------------------------------------
 
 async function handleRefreshSub2Api(args) {
-  // The refresh flow is pure HTTPS token exchange — no DOM, no browser needed.
-  // We re-use the existing TLS-path implementation.
-  const { refreshSub2apiOauthExport, DEFAULT_CODEX_CLIENT_ID: FALLBACK_CLIENT_ID } = await import("./protocol-login.mjs");
-  if (!refreshSub2apiOauthExport) {
-    throw new Error("REFRESH_HELPER_MISSING: protocol-login.mjs did not export refreshSub2apiOauthExport");
+  // Pure HTTPS token refresh — không DOM, không browser. Inline implementation
+  // (protocol-login.mjs là CLI, không export).
+  const authBase = args.authBase || DEFAULT_AUTH_BASE;
+  const sourcePath = args.refreshSub2api;
+  const targetPath = args.sub2apiOut || args.refreshSub2api;
+
+  let data;
+  try {
+    data = JSON.parse(await fs.readFile(sourcePath, "utf8"));
+  } catch (error) {
+    throw new Error(`REFRESH_TOKEN_INVALID: không đọc được sub2api file: ${error.message}`);
   }
-  await refreshSub2apiOauthExport({
-    authBase: args.authBase || DEFAULT_AUTH_BASE,
-    sourcePath: args.refreshSub2api,
-    targetPath: args.sub2apiOut || args.refreshSub2api,
-    fallbackClientId: FALLBACK_CLIENT_ID || DEFAULT_CODEX_CLIENT_ID,
-    transport: null,
+  const account = data?.accounts?.[0];
+  const credentials = account?.credentials;
+  const refreshToken = credentials?.refresh_token;
+  const clientId = account?.extra?.client_id || args.codexClientId || DEFAULT_CODEX_CLIENT_ID;
+  if (data?.type !== "sub2api-data" || !account || !refreshToken) {
+    throw new Error("REFRESH_TOKEN_INVALID: file thiếu OAuth account hoặc refresh_token");
+  }
+
+  const tokenSet = await refreshOAuthTokenInline({ authBase, clientId, refreshToken });
+  credentials.access_token = tokenSet.access_token;
+  credentials.refresh_token = tokenSet.refresh_token || refreshToken;
+  if (tokenSet.id_token) credentials.id_token = tokenSet.id_token;
+
+  // Decode id_token để cập nhật email / sid / user_id nếu có
+  if (credentials.id_token) {
+    try {
+      const claims = decodeJwtPayload(credentials.id_token);
+      if (claims?.email) credentials.email = claims.email;
+      if (claims?.sid) credentials.chatgpt_account_id = claims.sid;
+      const authClaims = claims?.["https://api.openai.com/auth"] || {};
+      if (account.extra) {
+        if (claims?.sid) {
+          account.extra.account_id = claims.sid;
+          account.extra.chatgpt_account_id = claims.sid;
+        }
+        if (authClaims.user_id || claims?.sub) {
+          account.extra.chatgpt_user_id = authClaims.user_id || claims.sub;
+        }
+        if (claims?.email) account.extra.email = claims.email;
+      }
+    } catch { /* best-effort */ }
+  }
+
+  data.exported_at = new Date().toISOString();
+  await writeJsonAtomic(targetPath, data);
+  emit(WORKER_MARKERS.savedSub2api, targetPath);
+}
+
+async function refreshOAuthTokenInline({ authBase, clientId, refreshToken }) {
+  const res = await fetch(`${authBase}/oauth/token`, {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/x-www-form-urlencoded",
+      "user-agent": "codex-cli/0.1.0",
+    },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      client_id: clientId,
+      refresh_token: refreshToken,
+    }),
   });
-  emit(WORKER_MARKERS.savedSub2api, args.sub2apiOut || args.refreshSub2api);
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); }
+  catch { throw new Error(`REFRESH_TOKEN_INVALID: token endpoint non-JSON HTTP ${res.status}: ${text.slice(0, 180)}`); }
+  if (!res.ok) {
+    const message = data?.error_description || data?.error || JSON.stringify(data).slice(0, 180);
+    throw new Error(`REFRESH_TOKEN_INVALID: HTTP ${res.status}: ${message}`);
+  }
+  if (!data.access_token) throw new Error("REFRESH_TOKEN_INVALID: response missing access_token");
+  return data;
 }
 
 async function handleProbe(args) {
