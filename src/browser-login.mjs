@@ -857,11 +857,12 @@ const PAGE_HANDLERS = {
   },
   async [PAGE_KINDS.EMAIL_OTP](session) {
     emit(WORKER_MARKERS.emailOtpPageReached);
-    const otp = await promptForInput("emailOtpPrompt");
+    const otp = await promptForInputOrPageAdvance("emailOtpPrompt", session.page, /\/email-verification/, { timeoutMs: 300_000 });
+    if (!otp) return; // URL đã rời email-verification (user drive thủ công)
     emit(WORKER_MARKERS.checkpointSavedEmail);
     const input = session.page.getByLabel(/mã|code|verification|otp/i).first();
-    await input.waitFor({ state: "visible", timeout: 30_000 });
-    await input.fill(otp);
+    if (!(await input.isVisible({ timeout: 5000 }).catch(() => false))) return;
+    await input.fill(otp).catch(() => {});
     await clickFormSubmit(session.page);
   },
   async [PAGE_KINDS.PASSWORD](session) {
@@ -875,9 +876,23 @@ const PAGE_HANDLERS = {
   async [PAGE_KINDS.PROFILE](session) {
     emit(WORKER_MARKERS.sentinelProfilePrepare);
     const profile = generateInlineProfile(); // {name, birthdate:"YYYY-MM-DD"}
-    const nameInput = session.page.getByLabel(/họ và tên|full name|name|tên/i).first();
-    if (await nameInput.isVisible({ timeout: 10_000 }).catch(() => false)) {
-      await nameInput.fill(profile.name);
+    // Thử getByLabel (ưu tiên), fallback getByPlaceholder, fallback input[type=text]:nth
+    const findName = async () => {
+      for (const build of [
+        () => session.page.getByLabel(/họ và tên|full name|name|tên/i).first(),
+        () => session.page.getByPlaceholder(/họ và tên|full name|name|tên/i).first(),
+        () => session.page.locator('input[type="text"]:visible, input:not([type]):visible, input[type="tel"]:visible').first(),
+      ]) {
+        try {
+          const el = build();
+          if (await el.isVisible({ timeout: 2000 }).catch(() => false)) return el;
+        } catch { /* next */ }
+      }
+      return null;
+    };
+    const nameInput = await findName();
+    if (nameInput) {
+      await nameInput.fill(profile.name).catch(() => {});
     }
     // Birthday / Age field — HAI dạng:
     //   (a) input[type=date] → fill YYYY-MM-DD
@@ -889,26 +904,41 @@ const PAGE_HANDLERS = {
     const bMonth = Number(profile.birthdate.slice(5, 7));
     const bDay = Number(profile.birthdate.slice(8, 10));
     const mmddyyyy = `${String(bMonth).padStart(2, "0")}${String(bDay).padStart(2, "0")}${bYear}`;
-    const ageInput = session.page.getByLabel(/họ sinh|birthday|birthdate|birth|date of birth|ngày sinh|tuổi|age/i).first();
-    if (await ageInput.isVisible({ timeout: 5_000 }).catch(() => false)) {
+    // Fallback for age/birthday field — label-less floating label ở OpenAI
+    const findAge = async () => {
+      for (const build of [
+        () => session.page.getByLabel(/họ sinh|birthday|birthdate|birth|date of birth|ngày sinh|tuổi|age/i).first(),
+        () => session.page.getByPlaceholder(/age|tuổi|birth|sinh|mm.?dd.?yyyy|dd.?mm.?yyyy/i).first(),
+        // Nth(1) = input thứ 2 trên trang (Full name là #1, Age/Birthday là #2)
+        () => session.page.locator('input[type="text"]:visible, input[type="number"]:visible, input[type="tel"]:visible, input[type="date"]:visible, input:not([type]):visible').nth(1),
+      ]) {
+        try {
+          const el = build();
+          if (await el.isVisible({ timeout: 2000 }).catch(() => false)) return el;
+        } catch { /* next */ }
+      }
+      return null;
+    };
+    const ageInput = await findAge();
+    if (ageInput) {
       const inputType = await ageInput.getAttribute("type").catch(() => null);
       const label = (await ageInput.getAttribute("aria-label").catch(() => "")) || "";
       const placeholder = (await ageInput.getAttribute("placeholder").catch(() => "")) || "";
       const descriptor = (label + " " + placeholder).toLowerCase();
       const isBirthday = /birth|sinh|birthday|birthdate|mm|dd|yyyy/.test(descriptor) || /\/|-/.test(placeholder);
-      if (inputType === "date") {
-        await ageInput.fill(profile.birthdate);
-      } else if (isBirthday) {
-        // Type từng digit để browser mask MM/DD/YYYY chèn / tự
-        await ageInput.click({ timeout: 3000 }).catch(() => {});
-        await ageInput.press("End").catch(() => {});
-        await ageInput.press("Backspace").catch(() => {}); // clear residual
-        await session.page.keyboard.type(mmddyyyy, { delay: 40 });
-      } else {
-        // Age field (number): fill tuổi hiện tại
-        const age = Math.max(18, 2026 - bYear);
-        await ageInput.fill(String(age));
-      }
+      try {
+        if (inputType === "date") {
+          await ageInput.fill(profile.birthdate);
+        } else if (isBirthday) {
+          await ageInput.click({ timeout: 3000 }).catch(() => {});
+          await ageInput.press("End").catch(() => {});
+          for (let i = 0; i < 15; i += 1) await ageInput.press("Backspace").catch(() => {});
+          await session.page.keyboard.type(mmddyyyy, { delay: 40 });
+        } else {
+          const age = Math.max(18, 2026 - bYear);
+          await ageInput.fill(String(age));
+        }
+      } catch { /* best-effort */ }
     }
     const ageConsent = session.page.getByRole("checkbox", { name: /18|older|age|consent|agree/i }).first();
     if (await ageConsent.isVisible({ timeout: 2000 }).catch(() => false)) {
@@ -918,8 +948,8 @@ const PAGE_HANDLERS = {
     emit(WORKER_MARKERS.profileCompleted);
   },
   async [PAGE_KINDS.PHONE_NUMBER](session) {
-    process.stdout.write(WORKER_MARKERS.phoneNumberPrompt.marker);
-    const phone = await readStdinLine();
+    const phone = await promptForInputOrPageAdvance("phoneNumberPrompt", session.page, /\/add-phone/, { timeoutMs: 600_000 });
+    if (!phone) return;
     // Chuẩn hoá E.164: nếu bắt đầu "+", tách country code để chọn dropdown; else
     // fill số raw và để country select mặc định.
     const match = String(phone).trim().match(/^\+(\d{1,3})(\d+)$/);
@@ -943,21 +973,28 @@ const PAGE_HANDLERS = {
         } catch { /* skip */ }
       }
     }
-    const input = session.page.getByRole("textbox", { name: /phone|số điện thoại/i }).first();
+    // Tìm phone input: role=textbox name phone/số, fallback input[type=tel]
+    let input = session.page.getByRole("textbox", { name: /phone|số điện thoại/i }).first();
+    if (!(await input.isVisible({ timeout: 2000 }).catch(() => false))) {
+      input = session.page.locator('input[type="tel"]:visible, input[inputmode="tel"]:visible').first();
+    }
     await input.waitFor({ state: "visible", timeout: 30_000 });
-    // Clear current (có thể có +1 default)
+    // User's trick: paste FULL E.164 (+84...) vào input — OpenAI auto-detect country
+    // từ prefix. Clear current + type full E.164 (bypass country dropdown dance).
     await input.click({ timeout: 2000 }).catch(() => {});
     await input.press("End").catch(() => {});
-    for (let i = 0; i < 20; i += 1) await input.press("Backspace").catch(() => {});
-    await input.type(subscriberNumber, { delay: 40 });
+    for (let i = 0; i < 25; i += 1) await input.press("Backspace").catch(() => {});
+    const fullE164 = String(phone).trim().startsWith("+") ? phone : (countryCode ? `+${countryCode}${subscriberNumber}` : subscriberNumber);
+    await input.type(fullE164, { delay: 40 });
+    await session.page.waitForTimeout(500); // chờ validation
     await clickFormSubmit(session.page);
   },
   async [PAGE_KINDS.PHONE_OTP](session) {
-    process.stdout.write(WORKER_MARKERS.phoneOtpPrompt.marker);
-    const otp = await readStdinLine();
+    const otp = await promptForInputOrPageAdvance("phoneOtpPrompt", session.page, /\/phone-verification/, { timeoutMs: 600_000 });
+    if (!otp) return;
     const input = session.page.getByLabel(/mã|code|otp|verification/i).first();
-    await input.waitFor({ state: "visible", timeout: 30_000 });
-    await input.fill(otp);
+    if (!(await input.isVisible({ timeout: 5000 }).catch(() => false))) return;
+    await input.fill(otp).catch(() => {});
     await clickFormSubmit(session.page);
     emit(WORKER_MARKERS.phoneOtpValidated);
   },
@@ -1573,19 +1610,20 @@ async function fillAndSubmit(page, inputSelector, value, submitSelector) {
   }
 }
 
-async function promptForInput(markerKey) {
+async function promptForInput(markerKey, options = {}) {
   const marker = WORKER_MARKERS[markerKey];
   process.stdout.write(marker.marker);
-  return readStdinLine();
+  return readStdinLine(options);
 }
 
-function readStdinLine() {
+function readStdinLine(options = {}) {
+  const timeoutMs = Number(options.timeoutMs || INPUT_TIMEOUT_MS);
   return new Promise((resolve, reject) => {
     const rl = readline.createInterface({ input: process.stdin, terminal: false });
     const timer = setTimeout(() => {
       rl.close();
       reject(new Error("STDIN_TIMEOUT"));
-    }, INPUT_TIMEOUT_MS);
+    }, timeoutMs);
     rl.once("line", (line) => {
       clearTimeout(timer);
       rl.close();
@@ -1595,6 +1633,28 @@ function readStdinLine() {
       clearTimeout(timer);
     });
   });
+}
+
+// Chờ stdin HOẶC URL thay đổi (user drive DOM thủ công). Khi URL rời khỏi
+// expectedUrlPattern, race winner là URL change → trả null; nếu stdin resolve
+// trước, trả string input. Giúp loop không bị block vĩnh viễn khi URL moves on.
+async function promptForInputOrPageAdvance(markerKey, page, expectedUrlRegex, options = {}) {
+  const marker = WORKER_MARKERS[markerKey];
+  process.stdout.write(marker.marker);
+  const stdinPromise = readStdinLine({ timeoutMs: options.timeoutMs || 300_000 }).catch(() => null);
+  const urlChangePromise = (async () => {
+    const started = Date.now();
+    const maxMs = Number(options.timeoutMs || 300_000);
+    while (Date.now() - started < maxMs) {
+      const url = page.url();
+      if (!expectedUrlRegex.test(url)) return "URL_ADVANCED";
+      await page.waitForTimeout(1000);
+    }
+    return null;
+  })();
+  const winner = await Promise.race([stdinPromise, urlChangePromise]);
+  if (winner === "URL_ADVANCED") return null;
+  return winner; // stdin value or null if nothing resolved
 }
 
 // --inspect-each pauses the worker after each DOM transition so the operator
