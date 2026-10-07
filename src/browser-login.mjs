@@ -1182,8 +1182,13 @@ async function openBrowser({ email, proxy, verbose }) {
     proxyUrl: proxy || "",
     close: async () => {
       if (MANUAL_ASSIST) {
-        // User muốn drive tay sau khi worker exit — không teardown Chromium.
-        console.log("[manual-assist] Chromium giữ nguyên — đóng tay khi xong.");
+        // User muốn drive tay sau khi worker exit — Chromium survive (SIG* false).
+        // Node process cần exit để server thấy child close + finalize job. Nếu
+        // không exit, CDP WebSocket giữ event loop alive, server treo "finalizing".
+        console.log("[manual-assist] Chromium giữ nguyên — worker exit để server finalize.");
+        // Flush stdout/stderr trước khi exit
+        if (process.stdout.write("")) process.stdout.end?.();
+        setTimeout(() => process.exit(0), 100);
         return;
       }
       await context.close().catch(() => {});
