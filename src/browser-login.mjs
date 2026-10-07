@@ -52,7 +52,13 @@ const DEFAULT_CHATGPT_BASE = "https://chatgpt.com";
 const DEFAULT_AUTH_BASE = "https://auth.openai.com";
 const DEFAULT_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEFAULT_CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback";
+// Thực tế đăng ký ChatGPT (2026-10): mở https://chatgpt.com/ là modal "Log in or
+// sign up" bật lên — có input Email address + nút Continue + các OAuth third-party
+// (Google/Apple/phone). Nhập email → Continue → chuyển sang auth.openai.com cho
+// OTP + password + profile + phone. Giữ 2 URL fallback phòng khi modal không
+// bật (A/B test của OpenAI đôi lúc redirect thẳng).
 const SIGNUP_URL_CANDIDATES = [
+  "https://chatgpt.com/",
   "https://auth.openai.com/create-account",
   "https://chatgpt.com/auth/signup",
 ];
@@ -68,19 +74,35 @@ const INPUT_TIMEOUT_MS = 300_000;
 // actual DOM and feed the real selector back into this table.
 const SELECTORS = {
   emailInput: [
+    'input[placeholder="Email address" i]',
     'input[type="email"]',
     'input[name="email"]',
     'input[autocomplete="email"]',
     'input[id*="email" i]',
     'input[placeholder*="email" i]',
   ],
+  // CẢNH BÁO: modal chatgpt.com có 3 nút "Continue with Google / Apple / phone"
+  // → KHÔNG dùng `button:has-text("Continue")` một mình, nó sẽ match nhầm nút
+  // OAuth. Dùng text-is (exact) hoặc button[type=submit] của FORM email.
   continueButton: [
-    'button[type="submit"]',
-    'button:has-text("Continue")',
-    'button:has-text("Tiếp tục")',
-    'button:has-text("Next")',
-    'button[data-testid*="continue" i]',
-    'button[data-testid*="submit" i]',
+    'form button[type="submit"]',
+    'button[type="submit"]:not(:has-text("Google")):not(:has-text("Apple")):not(:has-text("phone"))',
+    'button:text-is("Continue")',
+    'button:text-is("Tiếp tục")',
+    'button:text-is("Next")',
+    'button[data-testid*="continue" i]:not([data-testid*="google" i]):not([data-testid*="apple" i])',
+  ],
+  // 3 nút OAuth third-party trên modal — KHÔNG click, chỉ liệt kê để test
+  // có thể assert "worker không bấm nhầm".
+  thirdPartyOauthButtons: [
+    'button:has-text("Continue with Google")',
+    'button:has-text("Continue with Apple")',
+    'button:has-text("Continue with phone")',
+  ],
+  // Nút X đóng modal — không được bấm.
+  closeModalButton: [
+    'button[aria-label*="close" i]',
+    'button[aria-label*="đóng" i]',
   ],
   emailOtpInput: [
     'input[name="code"]',
@@ -354,10 +376,15 @@ async function handleSignup(args) {
     // mailbox is not marked deactivated.
     await proxyPreflight(session, args);
 
-    // 1. Signup landing — email entry.
+    // 1. Signup landing — chatgpt.com home shows a modal "Log in or sign up"
+    // with an email input + Continue button + 3 third-party OAuth buttons.
+    // Wait for the modal's email input to be visible before typing.
     const signupUrl = await findReachableSignupUrl(session);
     await session.page.goto(signupUrl, { timeout: PAGE_IDLE_TIMEOUT_MS, waitUntil: "domcontentloaded" });
     await assertNotCloudflareStuck(session);
+    await waitForModalEmailInput(session.page);
+    await assertNotAccidentallyOnOauth(session.page);
+    await inspectPauseIfRequested(args, session.page, "modal-visible");
 
     await fillAndSubmit(session.page, selectorFor("emailInput"), args.email, selectorFor("continueButton"));
     emit(WORKER_MARKERS.emailOtpPageReached);
@@ -874,6 +901,23 @@ async function captureDomSnapshot(page) {
     };
   });
   return { url, title, dom };
+}
+
+async function waitForModalEmailInput(page) {
+  // Modal appears after a tick on chatgpt.com. The email input is the stable
+  // signal — Cloudflare bot-check also sometimes shows an "Email address" look
+  // alike, but ours is paired with the OAuth buttons and the Continue submit.
+  const emailSelector = SELECTORS.emailInput.join(", ");
+  await page.locator(emailSelector).first().waitFor({ state: "visible", timeout: PAGE_IDLE_TIMEOUT_MS });
+}
+
+async function assertNotAccidentallyOnOauth(page) {
+  // Belt-and-braces: if the page's URL is already on google/apple/phone OAuth,
+  // something upstream clicked a wrong button — refuse to proceed.
+  const url = page.url();
+  if (/accounts\.google\.com|appleid\.apple\.com|phone-provider/.test(url)) {
+    throw new Error(`WRONG_OAUTH_DESTINATION: landed on ${url} instead of the chatgpt.com modal`);
+  }
 }
 
 async function maybeWaitForPhonePage(session) {
