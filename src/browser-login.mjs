@@ -301,8 +301,14 @@ async function run() {
 // ---------------------------------------------------------------------------
 
 async function handleRefreshSub2Api(args) {
-  // Pure HTTPS token refresh — không DOM, không browser. Inline implementation
-  // (protocol-login.mjs là CLI, không export).
+  // Refresh qua Chromium thật, mở lại same userDataDir (có cookie session từ
+  // lúc signup) → fetch('/oauth/token') CHẠY TRONG BROWSER context → request
+  // mang TLS Chrome 145, cookie oai-did + cf_bm + session cũ. OpenAI thấy
+  // same device/same session như lúc signup → giảm rủi ro bị cờ.
+  //
+  // Nếu Chromium launch fail (không có engine, binary gone, etc.) → fallback
+  // sang Node fetch (match protocol-login's refreshSub2apiOauthExport behaviour,
+  // chấp nhận TLS mismatch).
   const authBase = args.authBase || DEFAULT_AUTH_BASE;
   const sourcePath = args.refreshSub2api;
   const targetPath = args.sub2apiOut || args.refreshSub2api;
@@ -317,16 +323,38 @@ async function handleRefreshSub2Api(args) {
   const credentials = account?.credentials;
   const refreshToken = credentials?.refresh_token;
   const clientId = account?.extra?.client_id || args.codexClientId || DEFAULT_CODEX_CLIENT_ID;
+  const email = credentials?.email || account?.extra?.email || args.email || "";
   if (data?.type !== "sub2api-data" || !account || !refreshToken) {
     throw new Error("REFRESH_TOKEN_INVALID: file thiếu OAuth account hoặc refresh_token");
   }
 
-  const tokenSet = await refreshOAuthTokenInline({ authBase, clientId, refreshToken });
+  let tokenSet;
+  // Thử refresh qua Chromium same userDataDir (TLS Chrome 145 + cookie session).
+  // Chỉ work nếu có email để derive oai-did → userDataDir path giống signup.
+  if (email) {
+    try {
+      tokenSet = await refreshOAuthTokenViaBrowser({
+        authBase,
+        clientId,
+        refreshToken,
+        email,
+        proxy: args.proxy || process.env.CHATGPT_PROXY_URL || null,
+        verbose: args.verbose,
+      });
+      if (args.verbose) console.log("[refresh] via browser OK");
+    } catch (err) {
+      console.log(`[refresh] browser path failed (${err?.message || err}) — fallback Node fetch`);
+    }
+  }
+  if (!tokenSet) {
+    // Fallback: Node fetch (TLS mismatch but ít nhất refresh được)
+    tokenSet = await refreshOAuthTokenInline({ authBase, clientId, refreshToken });
+  }
+
   credentials.access_token = tokenSet.access_token;
   credentials.refresh_token = tokenSet.refresh_token || refreshToken;
   if (tokenSet.id_token) credentials.id_token = tokenSet.id_token;
 
-  // Decode id_token để cập nhật email / sid / user_id nếu có
   if (credentials.id_token) {
     try {
       const claims = decodeJwtPayload(credentials.id_token);
@@ -349,6 +377,46 @@ async function handleRefreshSub2Api(args) {
   data.exported_at = new Date().toISOString();
   await writeJsonAtomic(targetPath, data);
   emit(WORKER_MARKERS.savedSub2api, targetPath);
+}
+
+async function refreshOAuthTokenViaBrowser({ authBase, clientId, refreshToken, email, proxy, verbose }) {
+  // Mở Chromium same userDataDir (deterministic qua oaiDeviceIdFromEmail(email))
+  // → navigate tới chatgpt.com để cookie session được browser load → page.evaluate
+  // fetch POST /oauth/token. Request đi với TLS/cookie thật của Chrome.
+  const session = await openBrowser({ email, proxy, verbose });
+  try {
+    // Navigate tới origin OpenAI để cookie oai-did + cf_bm + session cũ được bật.
+    // Không cần đợi full load — chỉ cần cookie available cho fetch same-origin.
+    await session.page.goto(`${authBase}/`, { timeout: 30_000, waitUntil: "domcontentloaded" }).catch(() => {});
+    const tokenSet = await session.page.evaluate(async (payload) => {
+      const res = await fetch(payload.authBase + "/oauth/token", {
+        method: "POST",
+        headers: {
+          accept: "application/json",
+          "content-type": "application/x-www-form-urlencoded",
+        },
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          client_id: payload.clientId,
+          refresh_token: payload.refreshToken,
+        }),
+        credentials: "include",
+      });
+      const text = await res.text();
+      let data;
+      try { data = JSON.parse(text); }
+      catch { throw new Error("TOKEN_NON_JSON_HTTP_" + res.status); }
+      if (!res.ok) {
+        const msg = data?.error_description || data?.error || JSON.stringify(data).slice(0, 180);
+        throw new Error("TOKEN_HTTP_" + res.status + ": " + msg);
+      }
+      return data;
+    }, { authBase, clientId, refreshToken });
+    if (!tokenSet?.access_token) throw new Error("TOKEN_MISSING_ACCESS");
+    return tokenSet;
+  } finally {
+    await session.close().catch(() => {});
+  }
 }
 
 async function refreshOAuthTokenInline({ authBase, clientId, refreshToken }) {
