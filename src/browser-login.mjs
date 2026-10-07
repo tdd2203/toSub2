@@ -1082,6 +1082,9 @@ const PAGE_HANDLERS = {
   },
   async [PAGE_KINDS.OAUTH_CONSENT](session) {
     emit(WORKER_MARKERS.codexOauthStart);
+    // Chờ React hydrate
+    await session.page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => {});
+    await session.page.waitForTimeout(1200);
     // Consent page: thường là "Continue" button đen. Thử nhiều strategies để
     // chắc chắn fire.
     for (const name of [AUTHORIZE_NAME, CONTINUE_NAME]) {
@@ -1109,6 +1112,9 @@ const PAGE_HANDLERS = {
     } catch { /* give up */ }
   },
   async [PAGE_KINDS.WORKSPACE_SELECT](session, args) {
+    // Chờ React hydrate (page vừa load từ redirect)
+    await session.page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => {});
+    await session.page.waitForTimeout(1200);
     // "Welcome back / Choose an account" page. Account card thường là <div
     // onClick> không phải button chuẩn → getByRole miss.
     // Strategy: JS click element chứa email (dispatch click sẽ bubble lên handler).
