@@ -862,20 +862,29 @@ const PAGE_HANDLERS = {
         } catch { /* next */ }
       }
     }
-    // Fallback cuối: scan all visible buttons/links trên trang với bất kỳ text
-    // nào match "login/signup". Thử JS click (bypass pointer-event issues).
+    // Fallback: JS scan + simulate real mouse event (React synthetic listener)
     try {
       await session.page.evaluate(() => {
-        const texts = /^(log in|sign up|sign up for free|đăng nhập|đăng ký|đăng ký miễn phí)$/i;
-        const candidates = [...document.querySelectorAll('a, button, [role="button"]')];
-        for (const el of candidates) {
+        const re = /^(log in|sign up|sign up for free|đăng nhập|đăng ký|đăng ký miễn phí)$/i;
+        const nodes = [...document.querySelectorAll('a, button, [role="button"], div[tabindex], [data-testid*="login" i], [data-testid*="signup" i]')];
+        for (const el of nodes) {
           const txt = (el.innerText || el.textContent || "").trim();
-          if (texts.test(txt)) {
-            el.click();
-            return true;
+          if (re.test(txt)) {
+            const rect = el.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0) {
+              const opts = { bubbles: true, cancelable: true, view: window, button: 0, clientX: rect.left + rect.width/2, clientY: rect.top + rect.height/2 };
+              el.dispatchEvent(new MouseEvent('mousedown', opts));
+              el.dispatchEvent(new MouseEvent('mouseup', opts));
+              el.dispatchEvent(new MouseEvent('click', opts));
+              el.click();
+              return { ok: true, text: txt };
+            }
           }
         }
-        return false;
+        return { ok: false, candidates: nodes.slice(0, 10).map(n => ({ tag: n.tagName, text: (n.innerText || "").slice(0, 50) })) };
+      }).then((res) => {
+        if (res?.ok) console.log(`[landing] JS click fired on "${res.text}"`);
+        else if (res?.candidates) console.log(`[landing] JS click MISS — top candidates: ${JSON.stringify(res.candidates)}`);
       });
     } catch { /* give up */ }
   },
