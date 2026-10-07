@@ -885,6 +885,16 @@ async function clickFormSubmit(page) {
 const PAGE_HANDLERS = {
   async [PAGE_KINDS.LANDING](session) {
     await dismissCookieBannerIfVisible(session.page);
+    // Helper: check modal opened (email input visible) sau click
+    const modalOpened = async () => {
+      return await session.page
+        .locator('input[type="email"]:visible, input[placeholder*="email" i]:visible')
+        .first()
+        .isVisible({ timeout: 500 })
+        .catch(() => false);
+    };
+    // Nếu modal đã mở (lần tick trước click rồi) → không cần click thêm
+    if (await modalOpened()) return;
     // Click Login/Signup button với MULTIPLE strategies — chatgpt.com có nhiều
     // layout, button có thể là <a>, <button>, hoặc <div onClick>.
     const texts = ["Sign up for free", "Đăng ký miễn phí", "Sign up", "Đăng ký", "Log in", "Đăng nhập"];
@@ -904,9 +914,31 @@ const PAGE_HANDLERS = {
         try {
           const el = build();
           if (await el.isVisible({ timeout: 800 }).catch(() => false)) {
-            await el.click({ timeout: 5000, force: true });
-            await session.page.waitForTimeout(500);
-            return;
+            // Scroll + hover + click + verify
+            await el.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
+            await el.hover({ timeout: 2000 }).catch(() => {});
+            await session.page.waitForTimeout(200);
+            await el.click({ timeout: 5000, force: true }).catch(() => {});
+            await session.page.waitForTimeout(1500);
+            if (await modalOpened()) return;
+            // Click didn't open modal — thử Enter keypress trên focused button
+            await el.focus().catch(() => {});
+            await session.page.keyboard.press("Enter").catch(() => {});
+            await session.page.waitForTimeout(1500);
+            if (await modalOpened()) return;
+            // Thử dispatchEvent qua JS (React synthetic bypass)
+            await el.evaluate((node) => {
+              const rect = node.getBoundingClientRect();
+              const opts = { bubbles: true, cancelable: true, view: window, button: 0,
+                clientX: rect.left + rect.width/2, clientY: rect.top + rect.height/2 };
+              ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach(t => {
+                try { node.dispatchEvent(new PointerEvent(t, opts)); } catch { node.dispatchEvent(new MouseEvent(t, opts)); }
+              });
+              node.click();
+            }).catch(() => {});
+            await session.page.waitForTimeout(1500);
+            if (await modalOpened()) return;
+            // Vẫn không mở → try next text
           }
         } catch { /* next */ }
       }
