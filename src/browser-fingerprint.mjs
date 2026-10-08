@@ -149,6 +149,66 @@ export function buildInitScript(fingerprint) {
   navForce('hardwareConcurrency', ${Number(hardwareConcurrency)});
   navForce('deviceMemory', ${Number(deviceMemory)});
   navForce('webdriver', false);
+  // Language override: CloakBrowser humanize set navigator.language = "en-US"
+  // bất chấp context locale "vi-VN". Pin về vi-VN để khớp proxy VN + accept-language.
+  navForce('language', 'vi-VN');
+  navForce('languages', Object.freeze(['vi-VN', 'vi', 'en-US', 'en']));
+
+  // userAgentData brand pin: CloakBrowser's binary bakes brand "Chromium"
+  // version 145 trong Sec-CH-UA, nhưng UA string mình force 146. creepjs/pixelscan
+  // cross-check userAgentData.brands vs userAgent major → mismatch = red flag.
+  // Override cả brands + getHighEntropyValues để trả về cùng major UA.
+  try {
+    const uaMajor = (navigator.userAgent.match(/Chrome\\/(\\d+)/) || [])[1] || '146';
+    const brandsFaked = Object.freeze([
+      Object.freeze({ brand: 'Chromium', version: uaMajor }),
+      Object.freeze({ brand: 'Google Chrome', version: uaMajor }),
+      Object.freeze({ brand: 'Not=A?Brand', version: '24' }),
+    ]);
+    const uaDataFaked = {
+      brands: brandsFaked,
+      mobile: false,
+      platform: 'macOS',
+      getHighEntropyValues: (hints) => Promise.resolve({
+        brands: brandsFaked,
+        mobile: false,
+        platform: 'macOS',
+        platformVersion: '15.2.0',
+        architecture: 'arm',
+        bitness: '64',
+        model: '',
+        uaFullVersion: uaMajor + '.0.0.0',
+        fullVersionList: brandsFaked.map((b) => ({ brand: b.brand, version: b.version + '.0.0.0' })),
+      }),
+      toJSON: () => ({ brands: brandsFaked, mobile: false, platform: 'macOS' }),
+    };
+    Object.defineProperty(Navigator.prototype, 'userAgentData', { get: () => uaDataFaked, configurable: true });
+  } catch {}
+
+  // Timezone + locale override: CloakBrowser Chromium ship ICU cũ, trả
+  // "Asia/Saigon" (IANA alias deprecated 2010) thay vì "Asia/Ho_Chi_Minh", và
+  // Intl.* default locale = "en-US" bất chấp navigator.language = "vi-VN".
+  // Pixelscan cross-check lang vs Intl.locale → mismatch = "Masking detected".
+  // Patch resolvedOptions() cho CẢ DateTimeFormat/NumberFormat/Collator/
+  // RelativeTimeFormat/ListFormat/PluralRules để trả về vi-VN + canonical TZ.
+  try {
+    const canonicalTZ = (tz) => tz === 'Asia/Saigon' ? 'Asia/Ho_Chi_Minh' : tz;
+    const spoofResolve = (origResolve) => function patched() {
+      const opts = origResolve.call(this);
+      if (opts) {
+        if (opts.timeZone) opts.timeZone = canonicalTZ(opts.timeZone);
+        if (opts.locale === 'en-US') opts.locale = 'vi-VN';
+      }
+      return opts;
+    };
+    for (const Ctor of [Intl.DateTimeFormat, Intl.NumberFormat, Intl.Collator, Intl.RelativeTimeFormat, Intl.ListFormat, Intl.PluralRules]) {
+      try {
+        if (Ctor && Ctor.prototype && Ctor.prototype.resolvedOptions) {
+          Ctor.prototype.resolvedOptions = spoofResolve(Ctor.prototype.resolvedOptions);
+        }
+      } catch {}
+    }
+  } catch {}
 
   // Canvas noise: 1-bit flip on <0.1% of bytes in getImageData output and the
   // final PNG from toDataURL. Keyed by seedBytes so the same account always
@@ -209,6 +269,98 @@ export function buildInitScript(fingerprint) {
       } catch {}
       return origFnToString.apply(this, arguments);
     };
+  } catch {}
+
+  // WebGL vendor/renderer: CloakBrowser Chromium đôi khi trả về
+  // "WebKit"/"WebKit WebGL" (giá trị kiểu Safari) ở gl.getParameter(VENDOR/RENDERER)
+  // → mismatch với UA Chrome → pixelscan flag "Masking detected".
+  // Override cả 4 params (VENDOR, RENDERER, UNMASKED_VENDOR_WEBGL,
+  // UNMASKED_RENDERER_WEBGL) để trả giá trị kiểu Chrome real trên macOS.
+  // Giá trị dưới là Chrome 145+/macOS Apple Silicon chuẩn.
+  try {
+    const WEBGL_VENDOR = 0x1F00;
+    const WEBGL_RENDERER = 0x1F01;
+    const UNMASKED_VENDOR_WEBGL = 0x9245;
+    const UNMASKED_RENDERER_WEBGL = 0x9246;
+    const chromeVendor = "Google Inc. (Apple)";
+    const chromeRenderer = "ANGLE (Apple, ANGLE Metal Renderer: Apple M1 Pro, Unspecified Version)";
+    const spoofParam = (orig) => function patched(param) {
+      if (param === WEBGL_VENDOR || param === UNMASKED_VENDOR_WEBGL) return chromeVendor;
+      if (param === WEBGL_RENDERER || param === UNMASKED_RENDERER_WEBGL) return chromeRenderer;
+      return orig.call(this, param);
+    };
+    if (typeof WebGLRenderingContext !== 'undefined') {
+      const orig = WebGLRenderingContext.prototype.getParameter;
+      WebGLRenderingContext.prototype.getParameter = spoofParam(orig);
+    }
+    if (typeof WebGL2RenderingContext !== 'undefined') {
+      const orig = WebGL2RenderingContext.prototype.getParameter;
+      WebGL2RenderingContext.prototype.getParameter = spoofParam(orig);
+    }
+  } catch {}
+
+  // Worker context inject: addInitScript chỉ chạy ở main window + iframes,
+  // không chạy trong Web Workers. Creepjs cross-check main vs worker và sees
+  // worker có lang=en-US + timezone=Asia/Saigon + UA Chrome/145 + GPU M3 Max
+  // trong khi main đã patch → "lies detected". Hook Worker constructor để
+  // inject lại init script source qua blob URL trước khi worker script chạy.
+  try {
+    const INIT_SRC = \`
+      try { Object.defineProperty(Navigator.prototype, 'language', { get: () => 'vi-VN', configurable: true }); } catch(e){}
+      try { Object.defineProperty(Navigator.prototype, 'languages', { get: () => Object.freeze(['vi-VN','vi','en-US','en']), configurable: true }); } catch(e){}
+      try { Object.defineProperty(Navigator.prototype, 'hardwareConcurrency', { get: () => ${Number(hardwareConcurrency)}, configurable: true }); } catch(e){}
+      try { Object.defineProperty(Navigator.prototype, 'deviceMemory', { get: () => ${Number(deviceMemory)}, configurable: true }); } catch(e){}
+      try { Object.defineProperty(Navigator.prototype, 'webdriver', { get: () => false, configurable: true }); } catch(e){}
+      try {
+        const canonicalTZ = (tz) => tz === 'Asia/Saigon' ? 'Asia/Ho_Chi_Minh' : tz;
+        const spoof = (orig) => function patched() {
+          const o = orig.call(this);
+          if (o) {
+            if (o.timeZone) o.timeZone = canonicalTZ(o.timeZone);
+            if (o.locale === 'en-US') o.locale = 'vi-VN';
+          }
+          return o;
+        };
+        for (const Ctor of [Intl.DateTimeFormat, Intl.NumberFormat, Intl.Collator, Intl.RelativeTimeFormat, Intl.ListFormat, Intl.PluralRules]) {
+          try { if (Ctor && Ctor.prototype && Ctor.prototype.resolvedOptions) Ctor.prototype.resolvedOptions = spoof(Ctor.prototype.resolvedOptions); } catch(e){}
+        }
+      } catch(e){}
+      try {
+        const WEBGL_VENDOR = 0x1F00, WEBGL_RENDERER = 0x1F01, UNMASKED_VENDOR_WEBGL = 0x9245, UNMASKED_RENDERER_WEBGL = 0x9246;
+        const v = 'Google Inc. (Apple)', r = 'ANGLE (Apple, ANGLE Metal Renderer: Apple M1 Pro, Unspecified Version)';
+        const spoofP = (orig) => function patched(p) {
+          if (p === WEBGL_VENDOR || p === UNMASKED_VENDOR_WEBGL) return v;
+          if (p === WEBGL_RENDERER || p === UNMASKED_RENDERER_WEBGL) return r;
+          return orig.call(this, p);
+        };
+        if (typeof WebGLRenderingContext !== 'undefined') WebGLRenderingContext.prototype.getParameter = spoofP(WebGLRenderingContext.prototype.getParameter);
+        if (typeof WebGL2RenderingContext !== 'undefined') WebGL2RenderingContext.prototype.getParameter = spoofP(WebGL2RenderingContext.prototype.getParameter);
+      } catch(e){}
+    \`;
+    const OrigWorker = window.Worker;
+    if (OrigWorker) {
+      const wrapScript = (urlOrScript) => {
+        try {
+          // Fetch worker script source, prepend INIT_SRC, serve via Blob URL.
+          // Giữ nguyên type (classic/module) + semantics; nếu fetch fail
+          // fall-through dùng URL gốc để không break worker.
+          const stringScript = typeof urlOrScript === 'string' ? urlOrScript : (urlOrScript && urlOrScript.href);
+          if (!stringScript) return urlOrScript;
+          const xhr = new XMLHttpRequest();
+          xhr.open('GET', stringScript, false); // sync để chạy trước Worker ctor
+          xhr.send();
+          if (xhr.status === 200 || xhr.status === 0) {
+            const blob = new Blob([INIT_SRC + '\\n' + xhr.responseText], { type: 'application/javascript' });
+            return URL.createObjectURL(blob);
+          }
+        } catch(e){}
+        return urlOrScript;
+      };
+      window.Worker = function WrappedWorker(scriptURL, opts) {
+        return new OrigWorker(wrapScript(scriptURL), opts);
+      };
+      window.Worker.prototype = OrigWorker.prototype;
+    }
   } catch {}
 })();
 `;

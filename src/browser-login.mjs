@@ -589,6 +589,17 @@ async function handleProbe(args) {
     await fs.writeFile(outPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
     console.log(`[ok] Browser probe report: ${outPath}`);
     emit(WORKER_MARKERS.savedSub2api, outPath); // reuse marker so console-server marks job.resultSaved=true
+    // Giữ Chromium alive khi MANUAL_ASSIST=1 hoặc --hold-open để operator inspect
+    // thủ công (bot.sannysoft.com, creepjs, pixelscan…). Worker treo chờ stdin
+    // close hoặc SIGINT, Chromium chết cùng signal.
+    if (MANUAL_ASSIST || args.holdOpen) {
+      console.log("[hold] Chromium đang giữ nguyên — press Ctrl+C ở terminal này để đóng.");
+      await new Promise((resolve) => {
+        process.stdin.on("end", resolve);
+        process.on("SIGINT", resolve);
+        process.on("SIGTERM", resolve);
+      });
+    }
   } finally {
     await page.close().catch(() => {});
     await session.close();
@@ -753,6 +764,7 @@ const PAGE_KINDS = Object.freeze({
   PHONE_OTP: "phone-otp",
   OAUTH_CONSENT: "oauth-consent",
   WORKSPACE_SELECT: "workspace-select",
+  SESSION_EXPIRED: "session-expired",
   DONE: "done",
   WRONG_OAUTH: "wrong-oauth",
   UNKNOWN: "unknown",
@@ -780,6 +792,38 @@ async function detectPageKind(page) {
   const corpus = `${url} | ${title} | ${headings} | ${bodyPrefix}`.toLowerCase();
 
   if (/\/oauth\/authorize|\/consent|\/sign-in-with-chatgpt\/codex/.test(url)) return PAGE_KINDS.OAUTH_CONSENT;
+  // Session expired page tại /create-account: OpenAI invalidate session cookie
+  // sau khi worker trước đó bị abort. Page chỉ hiển thị "Your session has
+  // ended" + nút "Log in", KHÔNG có email input → SIGNUP_EMAIL handler loop
+  // 30s timeout. Issue traced job 90884d3f. Route riêng → handler click Log in
+  // để tiếp tục flow bình thường.
+  if (/\/create-account/.test(url) && /session has ended|session expired|phiên.*hết hạn|phiên đã kết thúc/i.test(corpus)) return PAGE_KINDS.SESSION_EXPIRED;
+  // chatgpt.com/onboarding: multi-step survey ("What kind of work do you do?",
+  // "Tell us about you", …). SPA pre-renders future steps including an "about
+  // you" fragment → corpus matches /about you/ at line 816 and classifier
+  // misroute to PROFILE in a loop (handler re-runs forever on same URL).
+  // Short-circuit here as UNKNOWN; adaptive loop sameKindCount>=2 then navigates
+  // to Codex OAuth URL to bypass onboarding entirely. Issue traced job 90884d3f.
+  if (/^https?:\/\/chatgpt\.com\/onboarding/.test(url)) return PAGE_KINDS.UNKNOWN;
+  // chatgpt.com root MUST short-circuit BEFORE any text/keyword checks: the
+  // landing SPA pre-renders a hidden modal with headings "Welcome back" and
+  // "Log in or sign up" + a hidden <input id=mobile-auth-email name=login_hint>.
+  // That corpus matches /welcome back/ (LOGIN_EMAIL) hoặc /sign up/ (SIGNUP_EMAIL),
+  // routing to the wrong handler and never clicking the actual "Log in" button.
+  // Issue traced in job 367ce5ef — handler timeout 30s on hidden mobile input.
+  if (/^https?:\/\/chatgpt\.com\/?(\?|$)/.test(url)) {
+    // Modal có thể đã mở (worker click lần trước, hoặc user drive thủ công) →
+    // email input visible → SIGNUP_EMAIL. Ngược lại → LANDING để click Log in.
+    try {
+      const hasEmailInput = await page
+        .locator('input[type="email"]:visible, input[placeholder*="email" i]:visible, input[placeholder="Email address" i]:visible')
+        .first()
+        .isVisible({ timeout: 300 })
+        .catch(() => false);
+      if (hasEmailInput) return PAGE_KINDS.SIGNUP_EMAIL;
+    } catch { /* ignore */ }
+    return PAGE_KINDS.LANDING;
+  }
   if (/\/choose-an-account|\/workspace\/select|choose an account|chọn tài khoản|workspace/.test(corpus)) return PAGE_KINDS.WORKSPACE_SELECT;
   // URL-first precedence cho các page có path cụ thể — tránh substring collision
   // với landing/signup corpus check.
@@ -801,21 +845,6 @@ async function detectPageKind(page) {
   }
   if (/\/log-in($|[?#])|welcome back|chào mừng trở lại/.test(corpus)) return PAGE_KINDS.LOGIN_EMAIL;
   if (/\/create-account|sign up|đăng ký|tạo tài khoản/.test(corpus)) return PAGE_KINDS.SIGNUP_EMAIL;
-  if (/^https?:\/\/chatgpt\.com\/?(\?|$)/.test(url)) {
-    // chatgpt.com landing — nhưng modal "Log in or sign up" có thể đã mở sẵn
-    // (worker click Login hoặc user click thủ công). Modal content thường
-    // nằm sau side nav trong body.innerText → bị truncate khỏi bodyPrefix.
-    // Check trực tiếp: email input visible → SIGNUP_EMAIL thay vì LANDING.
-    try {
-      const hasEmailInput = await page
-        .locator('input[type="email"]:visible, input[placeholder*="email" i]:visible, input[placeholder="Email address" i]:visible')
-        .first()
-        .isVisible({ timeout: 300 })
-        .catch(() => false);
-      if (hasEmailInput) return PAGE_KINDS.SIGNUP_EMAIL;
-    } catch { /* ignore */ }
-    return PAGE_KINDS.LANDING;
-  }
   return PAGE_KINDS.UNKNOWN;
 }
 
@@ -1029,6 +1058,31 @@ const PAGE_HANDLERS = {
     await input.fill(args.email);
     await clickFormSubmit(session.page);
   },
+  async [PAGE_KINDS.SESSION_EXPIRED](session) {
+    // Page: /create-account với "Your session has ended" + nút "Log in" single.
+    // Click Log in để OpenAI điều hướng về /log-in (clean session), classifier
+    // tick kế sẽ route LOGIN_EMAIL fill email.
+    await session.page.waitForLoadState("networkidle", { timeout: 8_000 }).catch(() => {});
+    await session.page.waitForTimeout(600);
+    const btn = session.page.getByRole("button", { name: /^(log in|đăng nhập|sign in)$/i }).first();
+    try {
+      if (await btn.isVisible({ timeout: 3000 }).catch(() => false)) {
+        await btn.click({ timeout: 5000 });
+        await session.page.waitForTimeout(1500);
+        return;
+      }
+    } catch { /* fallthrough */ }
+    // Fallback: anchor link có text "Log in"
+    try {
+      const link = session.page.getByRole("link", { name: /^(log in|đăng nhập|sign in)$/i }).first();
+      if (await link.isVisible({ timeout: 2000 }).catch(() => false)) {
+        await link.click({ timeout: 5000 });
+        return;
+      }
+    } catch { /* next */ }
+    // Fallback cuối: navigate thẳng tới /log-in
+    await session.page.goto("https://auth.openai.com/log-in", { timeout: 30_000, waitUntil: "domcontentloaded" }).catch(() => {});
+  },
   async [PAGE_KINDS.SIGNUP_EMAIL](session, args) {
     await dismissCookieBannerIfVisible(session.page);
     const input = session.page.getByLabel(/email|địa chỉ email/i).first();
@@ -1041,6 +1095,18 @@ const PAGE_HANDLERS = {
     emit(WORKER_MARKERS.emailOtpPageReached);
     const otp = await promptForInputOrPageAdvance("emailOtpPrompt", session.page, /\/email-verification/, { timeoutMs: 300_000 });
     if (!otp) return;
+    // "r" từ console-server = resend_email. Click Resend button rồi return,
+    // next tick sẽ re-prompt stdin cho OTP mới.
+    if (String(otp).trim().toLowerCase() === "r") {
+      const sel = selectorFor("resendEmailOtpButton");
+      try {
+        const btn = session.page.locator(sel).first();
+        if (await btn.isVisible({ timeout: 3000 }).catch(() => false)) {
+          await btn.click({ timeout: 5000 });
+        }
+      } catch { /* best-effort */ }
+      return;
+    }
     emit(WORKER_MARKERS.checkpointSavedEmail);
     const input = session.page.getByLabel(/mã|code|verification|otp/i).first();
     if (!(await input.isVisible({ timeout: 5000 }).catch(() => false))) return;
@@ -1167,6 +1233,57 @@ const PAGE_HANDLERS = {
     await waitForReactReady(session.page);
     const otp = await promptForInputOrPageAdvance("phoneOtpPrompt", session.page, /\/phone-verification/, { timeoutMs: 600_000 });
     if (!otp) return;
+    // "r" từ console-server = resend_phone. Click "Resend text message" rồi
+    // return, next tick re-prompt stdin cho OTP mới.
+    const act = String(otp).trim().toLowerCase();
+    if (act === "r") {
+      try {
+        const candidates = [
+          () => session.page.getByRole("button", { name: /resend text message|resend|gửi lại/i }).first(),
+          () => session.page.getByRole("link", { name: /resend text message|resend|gửi lại/i }).first(),
+          () => session.page.locator('button:has-text("Resend"), a:has-text("Resend"), [role="button"]:has-text("Resend")').first(),
+        ];
+        for (const build of candidates) {
+          const btn = build();
+          if (await btn.isVisible({ timeout: 2000 }).catch(() => false)) {
+            await btn.click({ timeout: 5000 }).catch(() => {});
+            break;
+          }
+        }
+      } catch { /* best-effort */ }
+      return;
+    }
+    // "p" từ console-server = change_phone. Phải quay lại /add-phone để nhập
+    // số khác. Thử: click "Change phone"/"Back" link trong trang, fallback
+    // page.goBack() browser history, fallback navigate trực tiếp /add-phone.
+    if (act === "p") {
+      try {
+        const candidates = [
+          () => session.page.getByRole("link", { name: /change phone|change number|đổi số|back|quay lại/i }).first(),
+          () => session.page.getByRole("button", { name: /change phone|change number|đổi số|back|quay lại/i }).first(),
+          () => session.page.locator('a:has-text("Change"), button:has-text("Change"), a:has-text("Back"), button:has-text("Back")').first(),
+        ];
+        let clicked = false;
+        for (const build of candidates) {
+          const btn = build();
+          if (await btn.isVisible({ timeout: 2000 }).catch(() => false)) {
+            await btn.click({ timeout: 5000 }).catch(() => {});
+            clicked = true;
+            break;
+          }
+        }
+        if (!clicked) {
+          // Fallback 1: browser history back
+          await session.page.goBack({ timeout: 10_000, waitUntil: "domcontentloaded" }).catch(() => {});
+          await session.page.waitForTimeout(800);
+          // Fallback 2: nếu URL vẫn ở phone-verification, nav thẳng /add-phone
+          if (/\/phone-verification/.test(session.page.url())) {
+            await session.page.goto("https://auth.openai.com/add-phone", { timeout: 15_000, waitUntil: "domcontentloaded" }).catch(() => {});
+          }
+        }
+      } catch { /* best-effort */ }
+      return;
+    }
     const input = session.page.getByLabel(/mã|code|otp|verification/i).first();
     if (!(await input.isVisible({ timeout: 5000 }).catch(() => false))) return;
     await reactSafeFill(input, otp);
@@ -1208,46 +1325,203 @@ const PAGE_HANDLERS = {
     // Chờ React hydrate (page vừa load từ redirect)
     await session.page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => {});
     await session.page.waitForTimeout(1200);
-    // "Welcome back / Choose an account" page. Account card thường là <div
-    // onClick> không phải button chuẩn → getByRole miss.
-    // Strategy: JS click element chứa email (dispatch click sẽ bubble lên handler).
+
+    // Dump DOM ngay vào entry (one-time per handler tick) để debug — luôn biết
+    // page đang hiện gì, kể cả khi strategy "thành công" nhưng click sai element.
     try {
-      const clicked = await session.page.evaluate((email) => {
-        const nodes = [...document.querySelectorAll('div, button, a, [role="button"]')];
-        for (const n of nodes) {
-          const txt = (n.innerText || "").trim();
-          if (txt.includes(email)) {
-            // Walk up to find clickable container (max 5 levels)
-            let el = n;
-            for (let i = 0; i < 5 && el; i += 1) {
-              const style = window.getComputedStyle(el);
-              if (el.onclick || el.getAttribute("role") === "button" || el.tagName === "BUTTON" || el.tagName === "A" || style.cursor === "pointer") {
-                el.click();
-                return true;
-              }
-              el = el.parentElement;
-            }
-            n.click(); // fallback: click the text node parent
-            return true;
-          }
+      const dumpDir = path.join(process.cwd(), "tmp", "workspace-debug");
+      await fs.mkdir(dumpDir, { recursive: true });
+      const stamp = String(Date.now());
+      const htmlPath = path.join(dumpDir, `workspace-entry-${stamp}.html`);
+      const metaPath = path.join(dumpDir, `workspace-entry-${stamp}.json`);
+      const html = await session.page.content();
+      await fs.writeFile(htmlPath, html, "utf8");
+      const visible = await session.page.evaluate(() => {
+        const peek = (el) => {
+          const rect = el.getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) return null;
+          return {
+            tag: el.tagName.toLowerCase(),
+            type: el.getAttribute("type"),
+            id: el.id || null,
+            role: el.getAttribute("role"),
+            testid: el.getAttribute("data-testid"),
+            tabindex: el.getAttribute("tabindex"),
+            ariaLabel: el.getAttribute("aria-label"),
+            className: (el.className || "").toString().slice(0, 100),
+            text: (el.innerText || "").trim().slice(0, 120),
+            hasOnClick: !!el.onclick,
+            cursorPointer: window.getComputedStyle(el).cursor === "pointer",
+          };
+        };
+        return [...document.querySelectorAll('button, [role="button"], a, div[tabindex], h1, h2, h3')].map(peek).filter(Boolean).slice(0, 50);
+      });
+      await fs.writeFile(metaPath, `${JSON.stringify({ url: session.page.url(), title: await session.page.title().catch(() => ""), visible }, null, 2)}\n`, "utf8");
+      console.log(`[workspace-select] entry snapshot — ${metaPath}`);
+    } catch (err) {
+      console.log(`[workspace-select] entry dump failed: ${err?.message || err}`);
+    }
+
+    // "Welcome back / Choose an account" page. Giống LANDING: React synthetic
+    // listener gắn chậm, native .click() có thể bị skip. Dùng escalation 4
+    // chiến lược giống LANDING + verify URL advance.
+
+    const startUrl = session.page.url();
+    const urlAdvanced = async () => {
+      const u = session.page.url();
+      return u !== startUrl && !/\/choose-an-account|\/workspace\/select/.test(u);
+    };
+
+    // Build locator cho card chứa email. Walk up tới ancestor clickable qua XPath.
+    // Nhiều biến thể: button/role=button/a/div[tabindex]/div[onclick].
+    const cardCandidates = [
+      () => session.page.locator(`button:has-text("${args.email}")`).first(),
+      () => session.page.locator(`[role="button"]:has-text("${args.email}")`).first(),
+      () => session.page.locator(`a:has-text("${args.email}")`).first(),
+      () => session.page.locator(`div[tabindex]:has-text("${args.email}")`).first(),
+      // Fallback: text node → first ancestor có cursor:pointer / clickable role
+      () => session.page.getByText(args.email, { exact: false }).first()
+        .locator('xpath=ancestor-or-self::*[self::button or self::a or @role="button" or @tabindex][1]').first(),
+    ];
+
+    for (const build of cardCandidates) {
+      let card;
+      try { card = build(); } catch { continue; }
+      if (!await card.isVisible({ timeout: 1500 }).catch(() => false)) continue;
+
+      await card.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
+      await card.hover({ timeout: 2000 }).catch(() => {});
+      await session.page.waitForTimeout(200);
+
+      // Strategy A: raw page.mouse (CDP native) — bypass locator abstraction
+      const box = await card.boundingBox().catch(() => null);
+      if (box) {
+        const x = box.x + box.width / 2;
+        const y = box.y + box.height / 2;
+        await session.page.mouse.move(x, y, { steps: 10 }).catch(() => {});
+        await session.page.waitForTimeout(100);
+        await session.page.mouse.down().catch(() => {});
+        await session.page.waitForTimeout(50);
+        await session.page.mouse.up().catch(() => {});
+        await session.page.waitForTimeout(1800);
+        if (await urlAdvanced()) {
+          await clickFormSubmit(session.page).catch(() => {});
+          return;
         }
-        return false;
-      }, args.email);
-      if (clicked) {
-        await session.page.waitForTimeout(1000);
-        // Có thể cần click Continue tiếp sau khi select account
+      }
+
+      // Strategy B: locator.click force
+      await card.click({ timeout: 5000, force: true }).catch(() => {});
+      await session.page.waitForTimeout(1500);
+      if (await urlAdvanced()) {
         await clickFormSubmit(session.page).catch(() => {});
         return;
       }
-    } catch { /* fallthrough */ }
+
+      // Strategy C: focus + Enter
+      await card.focus().catch(() => {});
+      await session.page.keyboard.press("Enter").catch(() => {});
+      await session.page.waitForTimeout(1500);
+      if (await urlAdvanced()) {
+        await clickFormSubmit(session.page).catch(() => {});
+        return;
+      }
+
+      // Strategy D: JS dispatchEvent chain (PointerEvent + MouseEvent + .click())
+      await card.evaluate((node) => {
+        const rect = node.getBoundingClientRect();
+        const opts = { bubbles: true, cancelable: true, view: window, button: 0,
+          clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2 };
+        ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach((t) => {
+          try { node.dispatchEvent(new PointerEvent(t, opts)); } catch { node.dispatchEvent(new MouseEvent(t, opts)); }
+        });
+        node.click();
+      }).catch(() => {});
+      await session.page.waitForTimeout(1500);
+      if (await urlAdvanced()) {
+        await clickFormSubmit(session.page).catch(() => {});
+        return;
+      }
+    }
+
+    // Fallback 1: radio input (nếu OpenAI dùng radio pattern)
     try {
       const radio = session.page.getByRole("radio").first();
       if (await radio.isVisible({ timeout: 1500 }).catch(() => false)) {
         await radio.check({ timeout: 3000 }).catch(() => {});
         await clickFormSubmit(session.page);
-        return;
+        if (await urlAdvanced()) return;
       }
     } catch { /* next */ }
+
+    // Fallback 2: JS scan + synthetic click chain trên bất kỳ element chứa email
+    try {
+      const ok = await session.page.evaluate((email) => {
+        const nodes = [...document.querySelectorAll('button, [role="button"], a, div[tabindex], div')];
+        for (const n of nodes) {
+          const txt = (n.innerText || "").trim();
+          if (!txt.includes(email)) continue;
+          // Walk up tìm clickable ancestor
+          let el = n;
+          for (let i = 0; i < 6 && el; i += 1) {
+            const style = window.getComputedStyle(el);
+            if (el.onclick || el.getAttribute("role") === "button" || el.tagName === "BUTTON" || el.tagName === "A" || el.getAttribute("tabindex") !== null || style.cursor === "pointer") {
+              const rect = el.getBoundingClientRect();
+              const opts = { bubbles: true, cancelable: true, view: window, button: 0, clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2 };
+              ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach((t) => {
+                try { el.dispatchEvent(new PointerEvent(t, opts)); } catch { el.dispatchEvent(new MouseEvent(t, opts)); }
+              });
+              el.click();
+              return true;
+            }
+            el = el.parentElement;
+          }
+          n.click();
+          return true;
+        }
+        return false;
+      }, args.email);
+      if (ok) {
+        await session.page.waitForTimeout(1500);
+        await clickFormSubmit(session.page).catch(() => {});
+        if (await urlAdvanced()) return;
+      }
+    } catch { /* give up */ }
+
+    // CLICK MISS: dump DOM snapshot + visible buttons để fix selector tiếp
+    try {
+      const dumpDir = path.join(process.cwd(), "tmp", "workspace-debug");
+      await fs.mkdir(dumpDir, { recursive: true });
+      const stamp = String(Date.now());
+      const htmlPath = path.join(dumpDir, `workspace-${stamp}.html`);
+      const metaPath = path.join(dumpDir, `workspace-${stamp}.json`);
+      const html = await session.page.content();
+      await fs.writeFile(htmlPath, html, "utf8");
+      const visible = await session.page.evaluate(() => {
+        const peek = (el) => {
+          const rect = el.getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) return null;
+          return {
+            tag: el.tagName.toLowerCase(),
+            type: el.getAttribute("type"),
+            id: el.id || null,
+            role: el.getAttribute("role"),
+            testid: el.getAttribute("data-testid"),
+            tabindex: el.getAttribute("tabindex"),
+            ariaLabel: el.getAttribute("aria-label"),
+            className: (el.className || "").toString().slice(0, 100),
+            text: (el.innerText || "").trim().slice(0, 120),
+            hasOnClick: !!el.onclick,
+            cursorPointer: window.getComputedStyle(el).cursor === "pointer",
+          };
+        };
+        return [...document.querySelectorAll('button, [role="button"], a, div[tabindex], div')].map(peek).filter(Boolean).slice(0, 60);
+      });
+      await fs.writeFile(metaPath, `${JSON.stringify({ url: session.page.url(), title: await session.page.title().catch(() => ""), visible }, null, 2)}\n`, "utf8");
+      console.log(`[workspace-select] CLICK MISS — snapshots: ${htmlPath} + ${metaPath}`);
+    } catch (err) {
+      console.log(`[workspace-select] dump failed: ${err?.message || err}`);
+    }
   },
 };
 
@@ -1481,6 +1755,14 @@ async function openBrowser({ email, proxy, verbose }) {
       : undefined;
     if (verbose) console.log(`[browser] launching CloakBrowser (version=${cb.CHROMIUM_VERSION}) proxy=${proxyString ? "set" : "none"}`);
     const cbInfo = cb.binaryInfo();
+    // UA phải khớp Chromium runtime THẬT của CloakBrowser (vd runtime 146 mà
+    // CloakBrowser humanize UA pool có khi lagging 145 → pixelscan flag
+    // "Masking detected" vì Sec-CH-UA sẽ gửi major thật, mismatch với UA).
+    const cloakMajor = Number(String(cb.CHROMIUM_VERSION || "").split(".")[0]) || chrome.major;
+    const matchedUserAgent = `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${cloakMajor}.0.0.0 Safari/537.36`;
+    // Fingerprint viewport đã compute per-account trong fingerprint object; apply
+    // vào CloakBrowser launch (chuẩn hoá size, tránh default 1280×720).
+    const _fp = buildPerAccountFingerprint({ oaiDeviceId });
     const cbOpts = {
       userDataDir,
       headless: false,
@@ -1489,13 +1771,20 @@ async function openBrowser({ email, proxy, verbose }) {
       // env TOSUB2_CLOAK_GEOIP=1 nếu đã nạp DB. Mặc định false để tránh crash.
       geoip: process.env.TOSUB2_CLOAK_GEOIP === "1" && Boolean(proxyString),
       args: launchArgs,
+      // Chuẩn hoá UA + locale + timezone để fingerprint consistent (fix
+      // pixelscan "Masking detected" do Chrome UA mismatch Chromium runtime major
+      // và "Asia/Saigon" IANA alias cũ thay vì "Asia/Ho_Chi_Minh").
+      userAgent: matchedUserAgent,
+      locale: "vi-VN",
+      timezoneId: "Asia/Ho_Chi_Minh",
+      viewport: { width: _fp.viewport.width, height: _fp.viewport.height },
       ...(proxyString ? { proxy: proxyString } : {}),
       ...(MANUAL_ASSIST ? { handleSIGINT: false, handleSIGTERM: false, handleSIGHUP: false } : {}),
     };
     context = await cb.launchPersistentContext(cbOpts);
     // Overwrite "chrome" return field for the report so caller sees cloak version.
     chrome.bin = cbInfo.binaryPath || chrome.bin;
-    chrome.major = Number(String(cb.CHROMIUM_VERSION || "").split(".")[0]) || chrome.major;
+    chrome.major = cloakMajor;
     chrome.version = `CloakBrowser Chromium ${cb.CHROMIUM_VERSION || ""}`;
   } else {
     const { chromium } = await import("patchright");
@@ -1515,6 +1804,24 @@ async function openBrowser({ email, proxy, verbose }) {
   const hostProfile = await detectHostProfile(context).catch(() => ({}));
   const fingerprint = buildPerAccountFingerprint({ oaiDeviceId, hostProfile });
   await context.addInitScript({ content: buildInitScript(fingerprint) });
+  // Accept-Language header + Sec-CH-UA: CloakBrowser humanize ghi đè bất chấp
+  // buildContextOptions. Force sau khi context ready để match navigator.languages
+  // = vi-VN. Pixelscan + creepjs cross-check HTTP Accept-Language vs JS
+  // navigator.language → mismatch = red flag.
+  //
+  // Sec-CH-UA brand pin: CloakBrowser's Chromium 146 ship Sec-CH-UA brands
+  // "145.0.7632.109" baked trong binary. UA mình set Chrome 146 → mismatch
+  // Sec-CH-UA 145. Override 3 headers Client Hints để match UA major.
+  const _cloakMajorForHeaders = (engine === "cloak") ? Number(chrome.major) || 146 : null;
+  const _chUAHeaders = _cloakMajorForHeaders ? {
+    "sec-ch-ua": `"Chromium";v="${_cloakMajorForHeaders}", "Google Chrome";v="${_cloakMajorForHeaders}", "Not=A?Brand";v="24"`,
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"macOS"',
+  } : {};
+  await context.setExtraHTTPHeaders({
+    "accept-language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+    ..._chUAHeaders,
+  }).catch(() => {});
 
   // Pre-set oai-did on both OpenAI domains BEFORE first navigation, so
   // chatgpt.com's middleware does not mint its own device identifier.
@@ -2030,8 +2337,12 @@ async function writeJsonAtomic(filePath, data) {
 function generateInlineProfile() {
   const pool = ["Nguyễn An", "Trần Linh", "Lê Minh", "Phạm Thảo", "Hoàng Quân", "Vũ Hà", "Đặng Nhi", "Bùi Tâm"];
   const name = pool[crypto.randomInt(pool.length)];
-  // Birthdate: 1980-01-01 through 2003-12-31 (ensures 21+ as of 2026).
-  const year = 1980 + crypto.randomInt(24);
+  // Birthdate: age 20-30 random as of 2026 (user policy) → year 1996-2006.
+  // Also keeps numeric-age form fields consistent (same `profile.birthdate` is
+  // used by both the MM/DD/YYYY birthday mask AND the 2026-bYear age fallback
+  // at the PROFILE handler).
+  const age = 20 + crypto.randomInt(11); // 20..30 inclusive
+  const year = 2026 - age;
   const month = 1 + crypto.randomInt(12);
   const day = 1 + crypto.randomInt(28);
   const birthdate = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
@@ -2086,6 +2397,12 @@ function parseArgs(argv) {
       // Opt-out of the "signup requires a proxy" guard. Only use for probe mode
       // (--probe) or offline dev — never for real OpenAI signup.
       args.allowDirectIp = true;
+      continue;
+    }
+    if (item === "--hold-open") {
+      // Probe mode only: giữ Chromium alive sau khi dump report xong để
+      // operator inspect fingerprint thủ công. Tương đương TOSUB2_BROWSER_MANUAL=1.
+      args.holdOpen = true;
       continue;
     }
     if (item === "--legacy") {
