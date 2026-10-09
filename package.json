@@ -1,7 +1,7 @@
 {
   "name": "tosub2",
   "version": "0.0.0",
-  "description": "通过协议登录 ChatGPT、完成 Codex 授权并生成 sub2api 导入文件",
+  "description": "Local console that creates ChatGPT accounts, completes Codex OAuth and delivers them to a Sub2API pool",
   "type": "module",
   "scripts": {
     "dev": "node src/console-server.mjs",
@@ -19,16 +19,16 @@
     "oauth",
     "sub2api"
   ],
-  "author": "poxiao33",
+  "author": "tdd2203",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/poxiao33/toSub2.git"
+    "url": "git+https://github.com/tdd2203/toSub2.git"
   },
   "bugs": {
-    "url": "https://github.com/poxiao33/toSub2/issues"
+    "url": "https://github.com/tdd2203/toSub2/issues"
   },
-  "homepage": "https://github.com/poxiao33/toSub2#readme",
+  "homepage": "https://github.com/tdd2203/toSub2#readme",
   "dependencies": {
     "@vitejs/plugin-react": "^5.1.1",
     "better-sqlite3": "^13.0.3",
