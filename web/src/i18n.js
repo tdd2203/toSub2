@@ -339,6 +339,9 @@ const VI = {
   "已注册邮箱": "Email đã đăng ký",
   "剩余额度": "Còn lại",
   "出口 {0}": "IP ra {0}",
+  "出口 IP": "IP ra",
+  "未知出口": "Chưa rõ IP ra",
+  "代理异常": "Proxy lỗi",
   "粘贴后自动识别 HTTP / SOCKS5（每个 IP 只添加一次）": "Dán vào để tự nhận diện HTTP / SOCKS5 (mỗi IP chỉ thêm 1 lần)",
   "已配置 {0} 个代理 IP。代理请在“代理 IP 列表”中添加与管理。": "Đã cấu hình {0} proxy IP. Thêm và quản lý proxy trong “Danh sách proxy IP”.",
   "通用代理池：已配置 {0} 个代理 IP（用于所有域名）。": "Pool chung: đã cấu hình {0} proxy IP (dùng cho mọi domain).",
@@ -362,6 +365,11 @@ const VI = {
   "需换 IP": "Cần đổi IP",
   "被封号": "Bị vô hiệu",
   "已换 IP": "Đã đổi IP",
+  "未换 IP": "Chưa đổi IP",
+  "未知": "Chưa rõ",
+  "新 IP": "IP mới",
+  "合计": "Tổng",
+  "当前出口 IP 封 {0}/{1}": "IP ra hiện tại: {0}/{1} bị vô hiệu hoá",
   "当前 IP {0} 封": "IP hiện tại: {0} cháy",
   "当前 IP 暂无数据": "IP hiện tại: chưa có dữ liệu",
   "当前出口 IP 已有 {0} 个账号被封，需更换": "IP ra hiện tại đã có {0} tài khoản bị vô hiệu hoá — cần đổi IP",
@@ -399,6 +407,7 @@ const VI = {
   "导出原始信息": "Xuất thông tin gốc",
   "批量重新授权": "Ủy quyền lại hàng loạt",
   "批量重新登录并授权": "Đăng nhập & ủy quyền lại hàng loạt",
+  "批量强制浏览器验证": "Buộc xác minh qua trình duyệt hàng loạt",
   "批量设置 2FA": "Đặt 2FA hàng loạt",
   "批量添加密码": "Thêm mật khẩu hàng loạt",
   "批量删除": "Xóa hàng loạt",
@@ -516,6 +525,7 @@ const VI = {
   "未创建": "Chưa tạo",
   "已创建": "Đã tạo",
   "已停用": "Đã vô hiệu hóa",
+  "{0} 秒后从列表移除": "Xóa khỏi danh sách sau {0} giây",
   "按邮箱搜索任务": "Tìm tác vụ theo email",
   "搜索邮箱": "Tìm kiếm email",
   "搜索": "Tìm kiếm",
@@ -618,6 +628,11 @@ const VI = {
   "跳过刷新令牌和旧检查点，完整重新登录后自动授权":
     "Bỏ qua refresh token và checkpoint cũ, đăng nhập lại đầy đủ rồi tự ủy quyền",
   "重新登录并授权": "Đăng nhập lại & ủy quyền",
+  "强制浏览器验证": "Buộc xác minh qua trình duyệt",
+  "跳过策略（含 {0} 天刷新规则），强制启动浏览器完整验证流程":
+    "Bỏ qua policy (gồm quy tắc refresh {0} ngày), ép mở trình duyệt chạy xác minh đầy đủ",
+  "跳过策略（含 60 天刷新规则），强制启动浏览器完整验证流程":
+    "Bỏ qua policy (gồm quy tắc refresh 60 ngày), ép mở trình duyệt chạy xác minh đầy đủ",
   "设置 2FA": "Đặt 2FA",
   "添加密码": "Thêm mật khẩu",
   "手动重试": "Thử lại thủ công",
@@ -644,6 +659,21 @@ const VI = {
     "Cho {0} tài khoản đã chọn bỏ qua refresh token, đăng nhập lại và ủy quyền?",
   "另有 {0} 个进行中账号将自动跳过。": "Còn {0} tài khoản đang chạy sẽ tự bỏ qua.",
   "已开始重新登录并授权 {0} 个账号": "Đã bắt đầu đăng nhập lại và ủy quyền {0} tài khoản",
+  "确定对选中的 {0} 个账号强制浏览器验证吗？将忽略刷新令牌策略（含年龄 60 天规则）。":
+    "Buộc xác minh qua trình duyệt {0} tài khoản đã chọn? Sẽ bỏ qua policy refresh (gồm quy tắc tuổi 60 ngày).",
+  "已开始强制浏览器验证 {0} 个账号": "Đã bắt đầu xác minh qua trình duyệt {0} tài khoản",
+  "已标记强制浏览器验证，下一次刷新/再授权会打开浏览器":
+    "Đã đánh dấu buộc xác minh qua trình duyệt — lần refresh/ủy quyền tới sẽ mở trình duyệt",
+  "账号来自外部导入，始终走浏览器验证":
+    "Tài khoản nhập từ ngoài — luôn xác minh qua trình duyệt",
+  "账号年龄 {0}/{1} 天 — 下一次刷新仍使用浏览器全量验证":
+    "Tuổi tài khoản {0}/{1} ngày — lần refresh tới vẫn dùng trình duyệt xác minh đầy đủ",
+  "账号年龄 {0} 天 ≥ {1} 天 — 下一次刷新使用 TLS 刷新令牌":
+    "Tuổi tài khoản {0} ngày ≥ {1} ngày — lần refresh tới dùng TLS refresh token",
+  "强制浏览器": "Buộc trình duyệt",
+  "外部导入 · 浏览器": "Nhập ngoài · trình duyệt",
+  "浏览器 ({0}/{1}d)": "Trình duyệt ({0}/{1}d)",
+  "TLS 刷新": "TLS refresh",
   "确定删除选中的 {0} 条任务吗？对应的本地授权文件也会被删除。":
     "Xóa {0} tác vụ đã chọn? File ủy quyền cục bộ tương ứng cũng bị xóa.",
   "确定停止全部 {0} 条进行中和排队任务吗？": "Dừng toàn bộ {0} tác vụ đang chạy và đang chờ?",

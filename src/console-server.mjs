@@ -30,13 +30,15 @@ const DEFAULT_PORT = 4399;
 const MAX_ACTIVE_JOBS = 20;
 const DEFAULT_TLS_PROFILE = "chrome146";
 // Per-account curl_cffi profile: existing ("old") accounts keep chrome146, while
-// newly created accounts are stamped with the new-account profile — chrome150 by
-// default, still overridable through the env knobs the chrome150 trial used. The
-// profile is resolved once at creation and persisted per job (see resolveJobTlsProfile),
-// so a job never changes fingerprint across reruns or server restarts.
+// newly created accounts are stamped with the new-account profile — chrome142 by
+// default, still overridable through the env knobs (TOSUB2_NEW_ACCOUNT_TLS_PROFILE
+// / TOSUB2_TLS_PROFILE). The profile is resolved once at creation and persisted
+// per job (see resolveJobTlsProfile), so a job never changes fingerprint across
+// reruns or server restarts. Old accounts stay on their original chrome146 so
+// their fingerprint does not drift between sessions.
 const NEW_ACCOUNT_TLS_PROFILE = normalizeTlsProfile(
   process.env.TOSUB2_NEW_ACCOUNT_TLS_PROFILE || process.env.TOSUB2_TLS_PROFILE,
-  "chrome150",
+  "chrome142",
 );
 const MAX_BATCH_JOBS = 500;
 const MAX_PROXY_RISK_RETRIES = 10;
@@ -45,6 +47,23 @@ const MAX_PROXY_CONNECTION_FAILURES = 20;
 // (account bị OpenAI ban/xoá/đình chỉ → autoRepairBlocked), IP đó coi như đã "cháy"
 // và nên đổi sang IP mới trên proxy. Số nhỏ hơn vẫn hiện cảnh báo (vàng) trên danh sách.
 const PROXY_BURN_THRESHOLD = Math.max(1, Math.trunc(Number(process.env.PROXY_BURN_THRESHOLD)) || 5);
+// Chặn theo TỈ LỆ cháy, không chỉ theo số tuyệt đối. Ngưỡng >=5 tuyệt đối bỏ lọt
+// endpoint cháy nặng nhưng mẫu nhỏ (vd pw152.datte.org 3/3=100% vẫn được cấp phát →
+// giết acc). Một endpoint đủ mẫu (>= MIN_SAMPLE tài khoản từng chạy) mà >= RATIO trong
+// số đó bị vô hiệu hoá thì coi như cháy. 1/1 (mẫu=1) KHÔNG bị chặn (1 lần chết có thể
+// là nhiễu) — hạ PROXY_BURN_MIN_SAMPLE=1 nếu muốn gắt hơn.
+const PROXY_BURN_RATIO = Math.min(1, Math.max(0, Number(process.env.PROXY_BURN_RATIO) || 0.5));
+const PROXY_BURN_MIN_SAMPLE = Math.max(1, Math.trunc(Number(process.env.PROXY_BURN_MIN_SAMPLE)) || 2);
+// Một endpoint (host hoặc exit IP) "cháy" khi: số acc bị vô hiệu >= ngưỡng tuyệt đối,
+// HOẶC đủ mẫu và tỉ lệ cháy >= PROXY_BURN_RATIO. Nhận {total, deactivated} từ
+// usedProxyDao.deactivationHistoryByHost()/ByExitIp().
+function isBurnedHistory(h) {
+  const dead = h?.deactivated || 0;
+  const total = h?.total || 0;
+  if (dead >= PROXY_BURN_THRESHOLD) return true;
+  if (total >= PROXY_BURN_MIN_SAMPLE && dead / total >= PROXY_BURN_RATIO) return true;
+  return false;
+}
 const PROXY_CONNECTION_RETRY_BASE_MS = Math.max(1, Number(process.env.PROXY_CONNECTION_RETRY_BASE_MS || 1_000));
 const PROXY_CONNECTION_RETRY_MAX_MS = 15_000;
 const PAGE_SIZE = 20;
@@ -84,6 +103,10 @@ const MAX_PROXY_SIGNUP_MAX_PER_WINDOW = 100;
 // theo tốc độ tạo, KHÔNG theo số phiên chạy đồng thời). Không chặn số tác vụ chạy
 // đồng thời: tài khoản đã tạo xong được thao tác (phone/OAuth/re-login) song song.
 const PROXY_LINK_SETTING_DB_KEY = "ui:chatgpt-onboarding.proxy-link-config-v1";
+// #PROXY_ALLOC_CONFIG_STATE: alloc config in-memory, hoisted-up để startup load
+// (loadCurrentProxyAllocConfigFromSettings) + updateCurrentProxyAllocConfig (ở
+// chỗ xa dưới) đều set được. Trước TDZ gây [warn] "Cannot access before init".
+let currentProxyAllocConfig = null;
 // Danh sách host (IP cũ) chủ máy đã "Quên" — ẩn khỏi "Danh sách proxy IP". Chỉ ẩn IP cũ
 // (configured:false), vì row IP cũ do LIVE JOBS (account đã đăng ký) tạo ra nên không xoá
 // được bằng cách sửa cấu hình; thêm lại IP vào cấu hình sẽ hiện lại (configured:true).
@@ -112,7 +135,18 @@ const PROTOCOL_SCRIPT = path.resolve(process.env.ONBOARDING_PROTOCOL_SCRIPT || p
 // spawns this script instead of PROTOCOL_SCRIPT. The TLS path (default) is
 // untouched. See src/browser-login.mjs for the real-browser worker contract.
 const BROWSER_SCRIPT = path.resolve(process.env.ONBOARDING_BROWSER_SCRIPT || path.join(__dirname, "browser-login.mjs"));
-const DEFAULT_SIGNUP_BACKEND = String(process.env.TOSUB2_SIGNUP_BACKEND || "tls").toLowerCase();
+// Mặc định "browser" (CloakBrowser full-auto). User policy: tất cả account mới
+// phải dùng browser lane. Env TOSUB2_SIGNUP_BACKEND có thể override thành "tls"
+// cho dev/test. Trước đây default "tls" khiến job UI tạo không kịp fix frontend
+// bị fallback về tls — nay force browser luôn.
+const DEFAULT_SIGNUP_BACKEND = String(process.env.TOSUB2_SIGNUP_BACKEND || "browser").toLowerCase();
+// Operator policy: signup luôn chạy browser lane. Env TOSUB2_ALLOW_TLS_SIGNUP=1
+// chỉ dùng cho dev smoke-test lane TLS; mặc định ignore client ép signupBackend='tls'.
+const ALLOW_TLS_SIGNUP = String(process.env.TOSUB2_ALLOW_TLS_SIGNUP || "0") === "1";
+function resolveSignupBackend(requested) {
+  if (!ALLOW_TLS_SIGNUP) return "browser";
+  return String(requested || DEFAULT_SIGNUP_BACKEND).toLowerCase() === "browser" ? "browser" : "tls";
+}
 // Deterministic device-identity UUIDv5 for an email. Shared with the browser
 // lane's src/browser-fingerprint.mjs — keep the namespace in sync there. Same
 // email → same oaiDeviceId → same oai-did cookie → stable across lane switches,
@@ -393,6 +427,7 @@ await loadUsedPhoneLedger();
 await syncCompletedOutputs(true);
 backfillUsedProxiesFromJobs();
 await backfillDeactivatedFromJobs();
+loadCurrentProxyAllocConfigFromSettings();
 scheduleQueuedJobs();
 scheduleSub2ApiMonitor();
 
@@ -492,6 +527,9 @@ async function handleApi(req, res, requestUrl) {
         totpSetup: true,
         passwordAdd: true,
         forceRelogin: true,
+        // Lane routing — xem chooseRefreshLane + docs/lane-routing.md
+        forceBrowserVerify: true,
+        refreshLaneAgeDays: REFRESH_LANE_AGE_DAYS,
       },
     });
     return;
@@ -621,6 +659,9 @@ async function handleApi(req, res, requestUrl) {
     //   — dùng để "checking" xem IP đang dùng đã sạch hay vẫn cháy.
     const deactivationByHost = usedProxyDao.deactivationHistoryByHost();
     const deactivationByExitIp = usedProxyDao.deactivationHistoryByExitIp();
+    // Per-host exit-IP map: lets us say "đã đổi IP" when the current exit IP is
+    // different from the burned ones this host went out through before.
+    const exitIpsByHost = usedProxyDao.exitIpsByHost();
     for (const job of listUniqueJobs()) {
       if (job.deleted || !job.proxyUrl) continue;
       const parsed = parseProxyUrlForSub2Api(job.proxyUrl);
@@ -670,21 +711,45 @@ async function handleApi(req, res, requestUrl) {
       const disabledCount = history.deactivated;
       const disabledTotal = history.total;
       // (2) CHECKING — IP RA THỰC đang ra (check.ip) đã sạch chưa:
-      //   unknown = proxy chết, không probe được IP hiện tại.
-      //   nodata  = probe được IP nhưng CHƯA có account mới nào trên IP này (toàn
-      //             account cũ NULL) → KHÔNG kết luận sạch, chỉ là chưa có dữ liệu.
-      //   clean   = có account mới trên IP này và chưa cháy → "Đã đổi IP ✓".
+      //   error   = probe fail (proxy chết / timeout / DNS). Khác "unknown" ở chỗ
+      //             TA ĐÃ THỬ, biết là lỗi — hiển thị trạng thái lỗi riêng.
+      //   unknown = chưa probe (hiếm) hoặc không trả về IP dù ok.
+      //   nodata  = probe được IP nhưng host này CHƯA có dữ liệu lịch sử nào —
+      //             đổi IP thật hay chưa thì chưa biết.
+      //   clean   = (a) có account mới trên IP hiện tại và chưa cháy, HOẶC
+      //             (b) host từng cháy trên IP KHÁC trước đây và IP hiện tại khác
+      //                 các IP đó → chủ đã đổi IP, IP mới coi như sạch.
       //   burning = IP hiện tại đã có account cháy nhưng dưới ngưỡng.
       //   burned  = IP hiện tại cháy >= ngưỡng → đỏ "Cần đổi IP".
       const curBucket = (check.ok && check.ip) ? deactivationByExitIp.get(check.ip) : undefined;
       const curExitDisabled = curBucket ? curBucket.deactivated : 0;
       const curExitTotal = curBucket ? curBucket.total : 0;
+      // Có IP cũ (khác IP hiện tại) từng dính account cháy trên chính host này
+      // không? Hai tín hiệu bổ trợ:
+      //  (A) STRICT: có bản ghi exit_ip ≠ IP hiện tại và đã cháy → chắc chắn rotate.
+      //  (B) LOOSE: host có lịch sử cháy (disabledCount > 0) từ thời chưa track
+      //      exit_ip (toàn NULL), nhưng IP ra hiện tại chưa cháy account nào →
+      //      gần như chắc chắn chủ đã đổi IP, nên coi là "đã đổi" để đỡ cản tiến độ.
+      let rotatedFromBurnedIp = false;
+      if (check.ok && check.ip) {
+        const perIp = exitIpsByHost.get(target.host);
+        if (perIp) {
+          for (const [ip, stats] of perIp) {
+            if (ip && ip !== check.ip && stats.deactivated > 0) { rotatedFromBurnedIp = true; break; }
+          }
+        }
+        if (!rotatedFromBurnedIp && disabledCount > 0 && curExitDisabled === 0) {
+          rotatedFromBurnedIp = true;
+        }
+      }
       let curExitStatus;
-      if (!check.ok || !check.ip) curExitStatus = "unknown";
-      else if (!curBucket) curExitStatus = "nodata";
+      if (!check.ok) curExitStatus = "error";
+      else if (!check.ip) curExitStatus = "unknown";
       else if (curExitDisabled >= PROXY_BURN_THRESHOLD) curExitStatus = "burned";
       else if (curExitDisabled > 0) curExitStatus = "burning";
-      else curExitStatus = "clean";
+      else if (curBucket) curExitStatus = "clean";
+      else if (rotatedFromBurnedIp) curExitStatus = "clean";
+      else curExitStatus = "nodata";
       return {
         host: parsed?.host || target.host,
         port: parsed?.port || 0,
@@ -745,6 +810,11 @@ async function handleApi(req, res, requestUrl) {
       return { domain: group.domain, hosts };
     });
     const groupForDomain = (domain) => groupHostSets.find((g) => domain === g.domain || domain.endsWith(`.${g.domain}`)) || null;
+    // Tập host CÒN trong cấu hình hiện tại = pool chung + mọi proxy riêng của domain.
+    // Host không nằm trong tập này là IP cũ (đã gỡ khỏi cấu hình) → cần kéo tài khoản
+    // ra khỏi nó dù domain tài khoản không có proxy riêng.
+    const configuredHosts = new Set(domainOfHost.keys());
+    for (const item of dedupeProxyUrls(config.general)) configuredHosts.add(item.host);
     const allocator = makeProxyAllocator(config, limitPerIp);
     let reassigned = 0;
     let skippedRunning = 0;
@@ -761,6 +831,10 @@ async function handleApi(req, res, requestUrl) {
         if (!ownGroup.hosts.has(parsed.host)) misplaced.push(job);
       } else if (domainOfHost.has(parsed.host)) {
         // (B) đang dùng proxy độc quyền của domain khác.
+        misplaced.push(job);
+      } else if (!configuredHosts.has(parsed.host)) {
+        // (C) domain không có proxy riêng nhưng đang kẹt trên IP cũ (đã gỡ khỏi
+        //     cấu hình) → kéo về proxy hiện hành (pool chung còn chỗ).
         misplaced.push(job);
       }
     }
@@ -801,7 +875,17 @@ async function handleApi(req, res, requestUrl) {
     }
     const payload = { count };
     if (body.domain) payload.domain = String(body.domain);
-    if (body.tag) payload.tag = String(body.tag);
+    // UI "Danh sách email" filter: chỉ hiện mailbox có tag match /chatgpt/i.
+    // Nếu client không set tag, auto-set "chatgpt-<yyyymmdd>" để email mới
+    // vẫn hiện trong list. Backward-compatible: pass empty string để bypass.
+    const requestedTag = body.tag !== undefined ? String(body.tag) : null;
+    if (requestedTag !== null && requestedTag !== "") {
+      payload.tag = requestedTag;
+    } else if (requestedTag === null) {
+      const d = new Date();
+      const stamp = `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, "0")}${String(d.getUTCDate()).padStart(2, "0")}`;
+      payload.tag = `chatgpt-${stamp}`;
+    }
     const r = await mailApi("/mailboxes/batch", { method: "POST", body: payload });
     if (!r.ok) {
       sendJson(res, r.status, { error: (r.json && r.json.detail) || `HTTP ${r.status}` });
@@ -834,11 +918,23 @@ async function handleApi(req, res, requestUrl) {
       // (a login checkpoint was saved) and only later steps such as SMS verification
       // are still pending — those must NOT be shown as "uncreated".
       const job = findJobByEmail(email);
-      const accountCreated = Boolean(job) && (
+      // accountCreated: memory job match, HOẶC jobDao disk persistence match
+      // (job cũ bị evict khỏi memory sau pm2 restart vẫn phải treat as "đã tạo"
+      // để UI không gộp chung "chưa dùng" rồi deactivate oan).
+      let accountCreated = Boolean(job) && (
         job.status === "completed"
         || Boolean(job.loginCheckpointAvailable)
         || ["phone", "phone_otp"].includes(job.status) // account exists, SMS verification pending
       );
+      if (!accountCreated) {
+        try {
+          const rows = jobDao.getByEmail(email);
+          if (rows.some((row) => row.login_checkpoint_available
+            || ["phone", "phone_otp", "completed", "resume_available", "reauth_required"].includes(row.status))) {
+            accountCreated = true;
+          }
+        } catch { /* best-effort */ }
+      }
       // A deactivated account's task is removed, so the mailbox's deactivated
       // state lives only in the registry — surface it here for the email list.
       const deactivation = deactivatedEmails.get(String(email).toLowerCase()) || null;
@@ -950,16 +1046,44 @@ async function handleApi(req, res, requestUrl) {
       sendJson(res, r.status, { error: (r.json && r.json.detail) || `HTTP ${r.status}` });
       return;
     }
+    // Guard: fetch sub2api live accounts để KHÔNG deactivate email đang có
+    // account hoạt động. Nếu config monitor chưa setup → fallback jobDao disk.
+    const liveSub2ApiEmails = new Set();
+    if (sub2ApiMonitorConfig?.baseUrl && sub2ApiMonitorConfig?.adminApiKey) {
+      try {
+        const liveAccounts = await listAllSub2ApiAccounts(sub2ApiMonitorConfig);
+        for (const acc of liveAccounts) {
+          const em = String(acc?.credentials?.email || acc?.extra?.email || acc?.name || "").toLowerCase();
+          if (em) liveSub2ApiEmails.add(em);
+        }
+      } catch (err) {
+        console.warn(`[deactivate-orphans] fetch sub2api accounts failed: ${String(err?.message || err).slice(0, 180)}`);
+      }
+    }
     let deactivated = 0;
     let skipped = 0;
     const details = [];
     for (const mb of (r.json.mailboxes || [])) {
       const email = mb.email;
+      const emailLower = String(email || "").toLowerCase();
       const tag = mb.tag || "";
       if (!/chatgpt/i.test(tag)) { continue; } // not ChatGPT Team tagged
       const job = findJobByEmail(email);
       if (job) { skipped++; continue; } // has a task in step 4
-      if (deactivatedEmails.has(String(email).toLowerCase())) { skipped++; continue; } // already deactivated
+      if (deactivatedEmails.has(emailLower)) { skipped++; continue; } // already deactivated
+      // Guard 1: live trên sub2api → account còn active, KHÔNG deactivate.
+      if (liveSub2ApiEmails.has(emailLower)) { skipped++; continue; }
+      // Guard 2: từng tới bước 4 (sqlite persistence) → chỉ cho phép deactivate
+      // sau khi account bị xoá/vô hiệu hoá ở sub2api (user policy: không được
+      // xoá email đã dùng signup khi account vẫn trên sub2api).
+      try {
+        const rows = jobDao.getByEmail(email);
+        if (rows.some((row) => row.login_checkpoint_available
+          || ["phone", "phone_otp", "completed", "resume_available", "reauth_required"].includes(row.status))) {
+          skipped++;
+          continue;
+        }
+      } catch { /* best-effort */ }
       markEmailDeactivated(email, reason);
       deactivated++;
       details.push(email);
@@ -990,10 +1114,21 @@ async function handleApi(req, res, requestUrl) {
       }
       let assignedProxy = proxyUrl;
       if (batchMode) {
+        // Cập nhật global config MỚI NHẤT cho mọi job proxy_waiting trước khi
+        // allocate — khi user thêm proxy vào UI "Cấu hình proxy", POST tiếp theo
+        // tự áp cho mọi job đang chờ.
+        updateCurrentProxyAllocConfig({ ...readProxyAllocConfig(body), limitPerIp: body.limitPerIp });
         assignedProxy = makeProxyAllocator(readProxyAllocConfig(body), body.limitPerIp).next(email);
-        if (!assignedProxy) return { poolFull: true };
+        if (!assignedProxy) {
+          const job = await startJob(email, credentials, null, { staged: true, signupBackend: body.signupBackend });
+          job.proxyAllocConfig = currentProxyAllocConfig;
+          queueForProxyCapacity(job);
+          return { job, created: true, updated: false, queued: true };
+        }
       }
-      return { job: await startJob(email, credentials, assignedProxy, { signupBackend: body.signupBackend }), created: true, updated: false };
+      const job = await startJob(email, credentials, assignedProxy, { signupBackend: body.signupBackend });
+      if (batchMode) job.proxyAllocConfig = currentProxyAllocConfig;
+      return { job, created: true, updated: false };
     });
     if (result.poolFull) {
       sendJson(res, 400, { error: "所有代理 IP 已达上限，请在“代理 IP 列表”中添加新 IP" });
@@ -1007,6 +1142,9 @@ async function handleApi(req, res, requestUrl) {
     const body = await readJson(req);
     const entries = parseBatchEntries(body.text, mailRequestConfig);
     const batchMode = body.proxyMode === "batch";
+    // Update global config MỚI NHẤT trước khi allocate, cũng apply cho mọi
+    // proxy_waiting job (next retry loop sẽ dùng config này thay vì cached cũ).
+    if (batchMode) updateCurrentProxyAllocConfig({ ...readProxyAllocConfig(body), limitPerIp: body.limitPerIp });
     const allocator = batchMode ? makeProxyAllocator(readProxyAllocConfig(body), body.limitPerIp) : null;
     const proxyUrl = normalizeProxyUrl(body.proxyUrl);
     // Ở chế độ nhiều IP: chạy đủ số chỗ còn lại của các IP; tài khoản dư (không
@@ -1023,12 +1161,14 @@ async function handleApi(req, res, requestUrl) {
       if (allocator) {
         const assignedProxy = allocator.next(entry.email);
         if (!assignedProxy) {
-          // IP đã đủ giới hạn đăng ký → tạo tác vụ rồi huỷ ngay.
           const job = await startJob(entry.email, entry, null, { staged: true, signupBackend: body.signupBackend });
-          cancelForProxyCapacity(job);
+          job.proxyAllocConfig = currentProxyAllocConfig;
+          queueForProxyCapacity(job);
           return { job, updated: false, canceled: true };
         }
-        return { job: await startJob(entry.email, entry, assignedProxy, { signupBackend: body.signupBackend }), updated: false };
+        const job = await startJob(entry.email, entry, assignedProxy, { signupBackend: body.signupBackend });
+        job.proxyAllocConfig = currentProxyAllocConfig;
+        return { job, updated: false };
       }
       return { job: await startJob(entry.email, entry, proxyUrl, { signupBackend: body.signupBackend }), updated: false };
     })));
@@ -1052,8 +1192,10 @@ async function handleApi(req, res, requestUrl) {
     // Staged jobs are idle and do NOT consume a slot, so stage everything and
     // just distribute them round-robin across the configured IPs. The per-IP
     // registration limit is enforced later, when the jobs are actually started.
-    // Khớp proxy theo domain của email (có proxy riêng thì dùng, hết thì mượn
-    // pool chung); round-robin thuần, không xét giới hạn/usage ở bước staging.
+    // STRICT binding: email thuộc domain đã khai báo CHỈ dùng proxy riêng của
+    // domain; không fallback về pool chung ngay cả khi list domain rỗng (staged
+    // job nào không có proxy riêng sẽ nhận null → start-batch sau này sẽ queue
+    // proxy_waiting). Round-robin thuần, không xét giới hạn/usage ở bước staging.
     const stageConfig = batchMode ? readProxyAllocConfig(body) : { general: "", groups: [] };
     const stageDomains = stageConfig.groups.map((g) => ({ domain: g.domain, list: dedupeProxyUrls(g.proxies) }));
     const stageDomainHosts = new Set(stageDomains.flatMap((d) => d.list.map((it) => it.host)));
@@ -1072,10 +1214,8 @@ async function handleApi(req, res, requestUrl) {
     const nextStageProxy = (email) => {
       const domain = emailDomainPart(email);
       const group = domain ? stageDomainLists.find((g) => domain === g.domain || domain.endsWith(`.${g.domain}`)) : null;
-      if (group) {
-        const url = pickStage(group.urls, `domain:${group.domain}`);
-        if (url) return url;
-      }
+      // STRICT: email có domain riêng → chỉ dùng pool domain, không fallback.
+      if (group) return pickStage(group.urls, `domain:${group.domain}`);
       return pickStage(stageGeneral, "__general__");
     };
     const results = await Promise.all(entries.map((entry) => withEmailJobLock(entry.email, async () => {
@@ -1113,7 +1253,7 @@ async function handleApi(req, res, requestUrl) {
     const consumed = proxyConsumedByHost();
     const lifetime = usedProxyDao.deactivationHistoryByHost();
     const forgotten = getForgottenProxyHosts();
-    const hostBurned = (host) => forgotten.has(host) || (lifetime.get(host)?.deactivated || 0) >= PROXY_BURN_THRESHOLD;
+    const hostBurned = (host) => forgotten.has(host) || isBurnedHistory(lifetime.get(host));
     const startedByHost = new Map();
     const decisions = selected.map((job) => {
       if (job.status !== "idle") return { job, action: "skip" };
@@ -1201,6 +1341,24 @@ async function handleApi(req, res, requestUrl) {
     })));
     const eligible = started.filter(Boolean);
     if (!eligible.length) throw httpError(409, "选中的账号当前都不能重新登录");
+    sendJson(res, 200, {
+      jobs: eligible.map(publicJob),
+      started: eligible.length,
+      skipped: selected.length - eligible.length,
+    });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/jobs/force-browser-verify-batch") {
+    const body = await readJson(req);
+    const selected = resolveSelectedJobs(body.ids);
+    const started = await Promise.all(selected.map((job) => withEmailJobLock(job.email, async () => {
+      if (!canForceRelogin(job)) return null;
+      await forceBrowserVerifyJob(job, body);
+      return job;
+    })));
+    const eligible = started.filter(Boolean);
+    if (!eligible.length) throw httpError(409, "选中的账号当前都不能强制浏览器验证");
     sendJson(res, 200, {
       jobs: eligible.map(publicJob),
       started: eligible.length,
@@ -1316,8 +1474,11 @@ async function handleApi(req, res, requestUrl) {
     let proxyIdForAccount;
 
     // Bước 0 (ưu tiên cao nhất): nếu email của account thuộc domain có proxy RIÊNG,
-    // gán proxy theo domain (round-robin trong list của domain, theo limit mỗi IP;
-    // domain hết chỗ thì mượn pool chung) — bất kể account đăng ký bằng proxy nào.
+    // gán proxy theo domain (round-robin trong list của domain, theo limit mỗi IP).
+    // STRICT: allocator đã bỏ fallback về pool chung — domain hết chỗ/toàn IP cháy
+    // → `domainAllocator.next` trả null, account rơi vào nhánh "cần proxy chung"
+    // bên dưới. Trong Sub2API upload giữ fallback này (operator có thể dùng pool
+    // batch upload riêng), còn registration/relogin thì KHÔNG fallback.
     // Tạo sẵn các proxy domain trên Sub2API và map URL -> proxy_id. Account không
     // thuộc domain nào có proxy riêng sẽ đi theo luồng cũ bên dưới.
     const allocConfig = readProxyAllocConfig(proxyLink || {});
@@ -1427,23 +1588,44 @@ async function handleApi(req, res, requestUrl) {
       body: JSON.stringify({ accounts }),
     });
 
-    // Tag every uploaded account so the console can tell at a glance which
-    // accounts have already been pushed to a Sub2API backend.
+    // Per-account status: map sub2new's response (data.results[]) → job.email
+    // để UI hiển thị email nào thành công, email nào lỗi + lý do. sub2new chỉ
+    // trả `name` field (= job.name sinh ngẫu nhiên khi upload), nên match bằng
+    // index trong batch (accounts[] cùng thứ tự với downloadable[]).
+    const sub2Results = Array.isArray(result?.data?.results) ? result.data.results : [];
     const uploadedAt = new Date().toISOString();
-    for (const job of downloadable) {
-      job.sub2apiUploadedAt = uploadedAt;
-      job.sub2apiUploadedBaseUrl = config.baseUrl;
-      touch(job);
-      await saveJobMetadata(job);
-    }
+    const accountStatuses = downloadable.map((job, idx) => {
+      const r = sub2Results[idx] || {};
+      const ok = r.success !== false && Boolean(r.id || r.success === true);
+      // Chỉ mark uploaded trên account THÀNH CÔNG (tránh false positive khi
+      // sub2new reject per-account nhưng server-side trước đây mark tất cả).
+      if (ok) {
+        job.sub2apiUploadedAt = uploadedAt;
+        job.sub2apiUploadedBaseUrl = config.baseUrl;
+        touch(job);
+        void saveJobMetadata(job);
+      }
+      return {
+        email: job.email,
+        name: r.name || null,
+        sub2apiId: r.id || null,
+        success: ok,
+        error: ok ? null : (r.error || r.message || "upload failed"),
+      };
+    });
+
+    const okCount = accountStatuses.filter((s) => s.success).length;
+    const failCount = accountStatuses.length - okCount;
 
     sendJson(res, 200, {
       selected: selected.length,
-      uploaded: downloadable.length,
+      uploaded: okCount,
+      failed: failCount,
       skipped: selected.length - downloadable.length,
       groupIds,
       proxiesCreated,
       unassigned,
+      accountStatuses,
       result,
     });
     return;
@@ -1538,6 +1720,13 @@ async function handleApi(req, res, requestUrl) {
     if (req.method === "PUT") {
       const body = await readJson(req);
       writeUiSettings(body.settings);
+      // Nếu UI vừa save proxy-link-config → sync currentProxyAllocConfig in-memory
+      // ngay, để relogin re-align + ensureJobProxyForBrowserLane dùng config mới
+      // mà không cần user tạo batch job trước.
+      const proxySettingKey = PROXY_LINK_SETTING_DB_KEY.slice(UI_SETTING_PREFIX.length);
+      if (body?.settings && Object.hasOwn(body.settings, proxySettingKey)) {
+        loadCurrentProxyAllocConfigFromSettings();
+      }
       // A looser proxy per-IP limit may release registrations that are waiting in the queue.
       scheduleQueuedJobs();
       sendJson(res, 200, { ok: true });
@@ -1630,6 +1819,12 @@ async function handleApi(req, res, requestUrl) {
     sendJson(res, 200, { job: publicJob(job) });
     return;
   }
+  if (req.method === "POST" && action === "force-browser-verify") {
+    const body = await readJson(req);
+    await withEmailJobLock(job.email, () => forceBrowserVerifyJob(job, body));
+    sendJson(res, 200, { job: publicJob(job) });
+    return;
+  }
   if (req.method === "POST" && action === "setup-2fa") {
     const body = await readJson(req);
     await withEmailJobLock(job.email, () => startTotpSetup(job, body));
@@ -1695,6 +1890,7 @@ async function sendJobsPage(res, requestedPage, emailFilter = null, search = "")
   sendJson(res, 200, {
     jobs: visibleJobs.slice(start, start + pageSize).map(publicJob),
     selection: visibleJobs.map(publicSelectionJob),
+    recentDeactivations: recentDeactivationList(),
     pagination: { page, pageSize, total, totalPages, totalAll: allJobs.length },
     filter: {
       active: Boolean(emailSet) || Boolean(term),
@@ -1775,6 +1971,7 @@ async function startJob(email, credentials = {}, proxyUrl = null, options = {}) 
     mailRequestBody,
     mailSeenCandidateKeys: new Set(),
     mailCandidateCounts: new Map(),
+    mailSubmittedCodes: new Set(),
     mailStatus: mailApiUrl ? "baseline" : "manual",
     mailApiError: null,
     mailPollRunning: false,
@@ -1790,11 +1987,15 @@ async function startJob(email, credentials = {}, proxyUrl = null, options = {}) 
     queuedAt: new Date().toISOString(),
     queuedStartPrompt: "正在建立登录会话",
     tlsProfile: NEW_ACCOUNT_TLS_PROFILE,
-    // signup_backend A/B lane: default lives on 'tls'. Operator opts in via UI or
-    // TOSUB2_SIGNUP_BACKEND env. oaiDeviceId is deterministic per email so the
-    // real-browser Chromium's userDataDir keeps the same device identity across
-    // restarts and across a lane switch.
-    signupBackend: String(options.signupBackend || DEFAULT_SIGNUP_BACKEND).toLowerCase() === "browser" ? "browser" : "tls",
+    // signup_backend lane: mặc định "browser" (CloakBrowser full-auto). Chỉ
+    // dùng "tls" khi client explicit set + env override. oaiDeviceId deterministic
+    // per email → userDataDir giữ cùng device identity qua restart + lane switch.
+    signupBackend: resolveSignupBackend(options.signupBackend),
+    // Lane routing — xem chooseRefreshLane. Mọi acc do console tự signup đều
+    // là source='system'; signup_completed_at null tới khi handleChildClose mark.
+    source: options.source === "external" ? "external" : "system",
+    signupCompletedAt: null,
+    forceBrowserVerifyRequested: false,
     oaiDeviceId: oaiDeviceIdForEmail(email),
     directTlsFallbackAttempted: false,
     fallbackInProgress: false,
@@ -2014,6 +2215,30 @@ function enqueueJob(job, mode, startPrompt) {
   scheduleQueuedJobs();
 }
 
+// Lane routing policy — xem docs/lane-routing.md
+//   • signup       → luôn browser (xem resolveSignupBackend)
+//   • refresh      → chooseRefreshLane dưới đây
+// Cutoff tuổi acc trước khi được dùng TLS refresh; override qua env.
+const REFRESH_LANE_AGE_DAYS = Math.max(0, Number(process.env.TOSUB2_REFRESH_BROWSER_AGE_DAYS || 60));
+const REFRESH_LANE_AGE_MS = REFRESH_LANE_AGE_DAYS * 86_400_000;
+
+function chooseRefreshLane(job) {
+  if (job.forceBrowserVerifyRequested) {
+    return { backend: "browser", mode: "full", reason: "operator 要求浏览器全量验证" };
+  }
+  if (job.source === "external") {
+    return { backend: "browser", mode: "full", reason: "外部导入账号强制浏览器验证" };
+  }
+  if (!job.signupCompletedAt) {
+    return { backend: "browser", mode: "full", reason: "尚未完成首次登录（无刷新令牌可用）" };
+  }
+  const ageMs = Date.now() - Date.parse(job.signupCompletedAt);
+  if (!Number.isFinite(ageMs) || ageMs < REFRESH_LANE_AGE_MS) {
+    return { backend: "browser", mode: "full", reason: `账号年龄 < ${REFRESH_LANE_AGE_DAYS} 天，使用浏览器全量验证` };
+  }
+  return { backend: "tls", mode: "refresh", reason: "使用 TLS 刷新令牌" };
+}
+
 function launchJob(job, options = {}) {
   const mode = options.mode || "full";
   if (mode === "full" && !job.authAutomationAttempt) {
@@ -2027,10 +2252,16 @@ function launchJob(job, options = {}) {
   job.runId = runId;
   job.runMode = mode;
   job.mailOtpRequestedAt = null;
-  // signup_backend A/B lane: pick which worker binary gets spawned. The browser
-  // lane is opt-in per job (job.signupBackend === 'browser'), falling back to
-  // the TLS lane by default so the main flow is unchanged.
-  const workerScript = job.signupBackend === "browser" ? BROWSER_SCRIPT : PROTOCOL_SCRIPT;
+  job.mailSubmittedCodes = new Set();
+  // signup_backend A/B lane: pick worker binary. Default to browser-login khi
+  // job.signupBackend === 'browser'. EXCEPT: --setup-totp và --add-password
+  // chưa được hỗ trợ trong browser worker (xem src/browser-login.mjs:30-32),
+  // nên hai mode này luôn chạy protocol-login (TLS lane) bất kể signupBackend.
+  // Refresh mode an toàn trên cả hai (browser-login tự xử lý qua HTTPS, không
+  // mở trình duyệt), có thể dùng signupBackend bình thường.
+  const workerScript = (mode === "totp_setup" || mode === "password_add")
+    ? PROTOCOL_SCRIPT
+    : job.signupBackend === "browser" ? BROWSER_SCRIPT : PROTOCOL_SCRIPT;
   const args = mode === "refresh"
     ? [
         workerScript,
@@ -2134,21 +2365,39 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
     scheduleQueuedJobs();
     return;
   }
-  if (["canceled", "reauth_required"].includes(job.status)) {
-    await finishSub2ApiAutoRepairFailure(job);
-    scheduleQueuedJobs();
-    return;
-  }
-  if (code === 0 && job.resultSaved && (await fileExists(job.outputPath))) {
+  // File sub2api đã lưu → account thành công, bất kể child exit code/signal
+  // VÀ bất kể status hiện tại (canceled/reauth_required/finalizing). Trước đây
+  // yêu cầu code === 0, nhưng CloakBrowser humanize + chain proxy socket đôi
+  // khi giữ process alive sau session.close() → watchdog force process.exit(0)
+  // (OK), hoặc user cancel (SIGTERM) sau khi file đã save → không hit code === 0
+  // → job treo. Nếu file + resultSaved đã có thì tất cả bước đã xong, mark
+  // completed TRƯỚC khi check cancel/reauth branches.
+  // NGOẠI LỆ: lần chạy này đã bị đánh dấu failed (vd tài khoản bị vô hiệu hoá khi
+  // re-login) và worker thoát lỗi → file trên đĩa là của lần chạy TRƯỚC, không
+  // được coi là thành công.
+  const failedThisRun = job.status === "failed" && code !== 0;
+  if (!failedThisRun && job.resultSaved && (await fileExists(job.outputPath))) {
     if (mode === "full") completeAuthorizationAutomationAttempt(job);
     markRegistrationSucceeded(job);
     job.loginCheckpointAvailable = false;
     job.status = "completed";
     job.prompt = "授权完成，可以下载导入文件";
     job.completedAt = new Date().toISOString();
+    // Lane routing: dấu mốc "signup đã hoàn tất lần đầu" chỉ set 1 lần (các lần
+    // refresh/relogin sau không ghi đè). Clear force-verify flag — one-shot
+    // override đã hoàn thành nhiệm vụ, lần refresh kế tiếp áp lại policy chuẩn.
+    if (mode === "full" && !job.signupCompletedAt) {
+      job.signupCompletedAt = job.completedAt;
+    }
+    job.forceBrowserVerifyRequested = false;
     touch(job);
     await saveJobMetadata(job);
     await finishSub2ApiAutoRepairSuccess(job);
+    scheduleQueuedJobs();
+    return;
+  }
+  if (["canceled", "reauth_required"].includes(job.status)) {
+    await finishSub2ApiAutoRepairFailure(job);
     scheduleQueuedJobs();
     return;
   }
@@ -2192,10 +2441,26 @@ async function retryJob(job, options = {}) {
   if (!["failed", "canceled", "reauth_required", "resume_available"].includes(job.status)) {
     throw httpError(409, "当前任务不需要重新授权");
   }
+  // Auto-migrate TLS jobs sang BROWSER lane khi retry — user policy forced browser.
+  // Trong dev (TOSUB2_ALLOW_TLS_SIGNUP=1) giữ nguyên lane để smoke tests TLS chạy được.
+  if (!ALLOW_TLS_SIGNUP && job.signupBackend !== "browser") {
+    job.signupBackend = "browser";
+    appendJobLog(job, "[lane] 已切换到 browser 账号自动化模式。\n");
+  }
   const retryingSecurityCheck = Boolean(job.securityCheckRequired);
   if (Object.hasOwn(options, "proxyUrl")) {
     job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
     const persisted = await saveStoredLoginCredentials(job.email, job);
+  }
+  // Browser lane bắt buộc có proxy (guard BROWSER_PROXY_REQUIRED trong worker).
+  // Nếu job chưa có → auto-allocate từ global config MỚI NHẤT. Hết slot → queue.
+  if (!ensureJobProxyForBrowserLane(job)) {
+    job.status = "proxy_waiting";
+    job.prompt = "等待代理 IP 释放名额（后台自动重试）";
+    touch(job);
+    void saveJobMetadata(job).catch(() => {});
+    scheduleQueuedJobs();
+    return;
   }
   const resumingCheckpoint = job.status === "resume_available"
     || (retryingSecurityCheck && await fileExists(job.checkpointPath));
@@ -2242,9 +2507,23 @@ async function regenerateJob(job, options = {}) {
   if (job.status !== "completed" || !job.resultSaved) {
     throw httpError(409, "只能为已经完成的任务重新生成授权");
   }
+  const lane = chooseRefreshLane(job);
+  if (lane.backend === "browser" && job.signupBackend !== "browser") {
+    job.signupBackend = "browser";
+    appendJobLog(job, `[lane] 已切换到 browser 账号自动化模式（${lane.reason}）。\n`);
+  }
   if (Object.hasOwn(options, "proxyUrl")) {
     job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
     await saveStoredLoginCredentials(job.email, job);
+  }
+  // Browser lane bắt buộc có proxy → auto-allocate + queue nếu đang hết slot.
+  if (lane.mode === "full" && !ensureJobProxyForBrowserLane(job)) {
+    job.status = "proxy_waiting";
+    job.prompt = "等待代理 IP 释放名额（后台自动重试）";
+    touch(job);
+    void saveJobMetadata(job).catch(() => {});
+    scheduleQueuedJobs();
+    return;
   }
   job.lastError = null;
   job.parserTail = "";
@@ -2261,8 +2540,11 @@ async function regenerateJob(job, options = {}) {
   job.proxySessionAttemptIds.clear();
   job.proxyAttemptParserTail = "";
   recordJobOperation(job, "reauthorize");
-  appendJobLog(job, `\n[refresh] 第 ${job.attempt} 次生成：优先使用已有刷新令牌。\n`);
-  enqueueJob(job, "refresh", "正在使用已有刷新令牌直接生成新授权");
+  const prompt = lane.mode === "refresh"
+    ? "正在使用已有刷新令牌直接生成新授权"
+    : `${lane.reason}，正在打开浏览器重新授权`;
+  appendJobLog(job, `\n[refresh] 第 ${job.attempt} 次生成：${lane.reason}。\n`);
+  enqueueJob(job, lane.mode, prompt);
 }
 
 async function forceReloginJob(job, options = {}, context = {}) {
@@ -2273,9 +2555,31 @@ async function forceReloginJob(job, options = {}, context = {}) {
   if (!canForceRelogin(job)) {
     throw httpError(409, "当前任务正在进行中，不能重新登录");
   }
+  // Auto-migrate TLS → BROWSER lane khi forceRelogin.
+  // Trong dev (TOSUB2_ALLOW_TLS_SIGNUP=1) giữ nguyên lane để smoke tests TLS chạy được.
+  if (!ALLOW_TLS_SIGNUP && job.signupBackend !== "browser") {
+    job.signupBackend = "browser";
+    appendJobLog(job, "[lane] 已切换到 browser 账号自动化模式。\n");
+  }
   if (Object.hasOwn(options, "proxyUrl")) {
     job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
     await saveStoredLoginCredentials(job.email, job);
+  } else {
+    // STRICT domain binding: nếu email thuộc domain group và current proxy
+    // KHÔNG phải proxy riêng của domain → thử re-allocate về pool domain
+    // (strict, không fallback). Giữ nguyên nếu pool rỗng/toàn IP cháy để
+    // relogin vẫn chạy được, kèm log cảnh báo để operator biết phải thêm
+    // proxy sạch cho domain.
+    await maybeRealignJobProxyToDomain(job);
+  }
+  // Guard BROWSER_PROXY_REQUIRED: auto-allocate nếu job thiếu proxy.
+  if (!ensureJobProxyForBrowserLane(job)) {
+    job.status = "proxy_waiting";
+    job.prompt = "等待代理 IP 释放名额（后台自动重试）";
+    touch(job);
+    void saveJobMetadata(job).catch(() => {});
+    scheduleQueuedJobs();
+    return;
   }
   stopMailPolling(job);
   releaseSmsNumber(job, "idle");
@@ -2325,6 +2629,18 @@ async function forceReloginJob(job, options = {}, context = {}) {
     appendJobLog(job, "[mfa] 本地未能读取已记录的 2FA 密钥，遇到 2FA 时需要手动输入验证码。\n");
   }
   enqueueJob(job, "full", "正在强制重新登录并完成授权");
+}
+
+// Operator override: bỏ qua policy chooseRefreshLane (tuổi acc, source), chạy
+// browser full-verify một lần. Flag forceBrowserVerifyRequested persist trong
+// metadata để sau reboot vẫn giữ, clear tự động sau khi job completed.
+async function forceBrowserVerifyJob(job, options = {}) {
+  if (!canForceRelogin(job)) {
+    throw httpError(409, "当前任务正在进行中，不能强制浏览器验证");
+  }
+  job.forceBrowserVerifyRequested = true;
+  appendJobLog(job, "[lane] 收到人工“强制浏览器验证”请求，忽略刷新策略。\n");
+  await forceReloginJob(job, options, { manualForceBrowserVerify: true });
 }
 
 async function reloadMissingJobCredentials(job) {
@@ -2645,8 +2961,16 @@ async function fallbackFromRefresh(job) {
   job.parserTail = "";
   job.currentPhone = null;
   job.phoneError = null;
+  // Curl REVOKED → ép browser lane cho attempt này. Flag là one-shot, sẽ bị
+  // clear trong handleChildClose khi job completed → lần refresh tiếp theo áp
+  // policy chuẩn (chooseRefreshLane) chứ không mắc kẹt ở browser.
+  job.forceBrowserVerifyRequested = true;
+  if (job.signupBackend !== "browser") {
+    job.signupBackend = "browser";
+    appendJobLog(job, "[lane] 已切换到 browser 账号自动化模式（刷新令牌失效自动升级）。\n");
+  }
   beginAuthorizationAutomationAttempt(job, "refresh_fallback");
-  appendJobLog(job, "[refresh] 刷新令牌已失效，自动回退到邮箱验证码登录。\n");
+  appendJobLog(job, "[refresh] 刷新令牌已失效，自动回退到浏览器全量登录。\n");
   job.fallbackInProgress = false;
   if (job.status !== "canceled") {
     enqueueJob(job, "full", "刷新令牌已失效，正在重新登录并授权");
@@ -2911,6 +3235,26 @@ function consumeOutput(job, rawText) {
   if (scan.includes("[ok] Account password added and saved securely")) {
     setStage(job, "finalizing", "密码已添加，正在安全保存新密码");
   }
+  // Browser worker auto-generated password (email-OTP acc fallback at /log-in/password,
+  // or /create-account/password, or /reset-password/new-password). Save to credential
+  // store so future relogin auto-fills from env instead of hitting MISSING_PASSWORD.
+  // Marker format: "[account] auto-generated password=<pwd>" — see WORKER_MARKERS.accountPasswordAutoset.
+  const autoPassMatch = scan.match(/\[account\] auto-generated password=([^\r\n]+)/);
+  if (autoPassMatch && autoPassMatch[1]) {
+    const newPwd = autoPassMatch[1].trim();
+    if (newPwd && newPwd !== job.password) {
+      job.password = newPwd;
+      job.hasPasswordCredential = true;
+      void saveStoredLoginCredentials(job.email, {
+        password: newPwd,
+        mailApiUrl: job.mailApiUrl,
+        mailRequestBody: job.mailRequestBody,
+        totpSecret: job.totpSecret,
+        proxyUrl: job.proxyUrl,
+      }).catch((err) => appendJobLog(job, `[account] failed to persist auto-generated password: ${String(err?.message || err).slice(0, 160)}\n`));
+      appendJobLog(job, "[account] auto-generated password persisted to credential store (future relogin will auto-fill).\n");
+    }
+  }
   const errorMatches = [...scan.matchAll(/\[error\]\s*([^\r\n]+)/g)];
   if (errorMatches.length) {
     const errorMessage = extractResponseMessage(errorMatches.at(-1)[1]);
@@ -2918,6 +3262,11 @@ function consumeOutput(job, rawText) {
       job.totpSetupError = errorMessage;
     } else if (job.runMode === "password_add") {
       job.passwordAddError = errorMessage;
+    } else if (isPermanentAccountFailure(errorMessage)) {
+      // Account deactivated/deleted/suspended: fail-fast + markEmailDeactivated
+      // ngay giữa flow, không chờ worker close. User policy "tài khoản bị vô
+      // hiệu hoá rồi" → không retry.
+      failAccountClosedDuringLogin(job, errorMessage);
     } else {
       failJob(job, errorMessage);
     }
@@ -3138,7 +3487,11 @@ function failAccountClosedAtPhoneOtp(job, validationMessage) {
 // pool scan skips it, instead of offering a pointless resume.
 function failAccountClosedDuringLogin(job, rawMessage) {
   if (isTerminalStatus(job.status)) return;
-  failJob(job, `账号已被 OpenAI 删除或停用：${extractResponseMessage(rawMessage)}`);
+  const friendly = extractResponseMessage(rawMessage);
+  failJob(job, `账号已被 OpenAI 删除或停用：${friendly}`);
+  // Mark email deactivated — account không thể recovery, UI nên hiển deactivated
+  // + không spawn retry worker tự động (saved vào deactivatedEmails map + DAO).
+  if (job.email) markEmailDeactivated(job.email, `OpenAI 账号已被删除或停用：${friendly}`);
   job.child?.kill("SIGTERM");
   job.child = null;
   scheduleQueuedJobs();
@@ -3256,9 +3609,17 @@ async function acquireSmsNumber(job, providerId, config) {
     // Phone-number filter: before submitting a number to the verification API,
     // skip any number already used up (reuse cap) or risk-blocked, and fetch
     // another. The blocked list and use counts live in the on-disk ledger.
+    //
+    // Fallback khi pool cạn: sau STRICT_ATTEMPTS skip liên tiếp (pool SMSCode
+    // trả toàn số đã dùng), nới cap từ phoneMaxUses (mặc định 1) → FALLBACK_CAP
+    // (2) để cho phép mỗi số dùng tối đa 2 lần. User policy: không bao giờ
+    // vượt 2 lần/số, nhưng cho phép fallback khi hết số mới.
     const maxAttempts = 25;
+    const STRICT_ATTEMPTS = 8;
+    const FALLBACK_CAP = 2;
     let attempt = 0;
     let rejected = 0;
+    let fallbackLogged = false;
     while (true) {
       attempt += 1;
       order = await smsClient.getNumber();
@@ -3266,10 +3627,16 @@ async function acquireSmsNumber(job, providerId, config) {
         void smsClient.release(order.requestId).catch(() => {});
         throw httpError(409, "任务已经不在手机号输入步骤，平台号码已释放");
       }
-      if (isPhoneAvailable(order.number)) break;
+      const useFallback = attempt > STRICT_ATTEMPTS;
+      if (useFallback && !fallbackLogged) {
+        appendJobLog(job, `[sms] Pool đã cạn số mới (${rejected} rejects), nới cap uses≤${FALLBACK_CAP} để tiếp tục.\n`);
+        fallbackLogged = true;
+      }
+      const cap = useFallback ? FALLBACK_CAP : phoneMaxUses;
+      if (isPhoneAvailableWithLimit(order.number, cap)) break;
       const why = phoneUnavailableReason(order.number) === "risk"
         ? "曾被风控或判定不可用"
-        : `已达使用次数上限（${phoneMaxUses}）`;
+        : `已达使用次数上限（${cap}）`;
       rejected += 1;
       void smsClient.release(order.requestId).catch(() => {});
       appendJobLog(job, `[sms] 号码 ${order.number} ${why}，已跳过并重新取号。\n`);
@@ -3548,6 +3915,12 @@ async function submitJobInput(job, body, options = {}) {
     requireStage(job, "email_otp");
     stopMailPolling(job);
     job.parserTail = "";
+    // Nhận "r" từ console-server = request worker click Gửi lại email. Set cutoff
+    // theo giờ hiện tại để mail-poller filter email cũ sau khi polling restart.
+    // (Worker cũng sẽ emit [email-otp-requested-at] khi click thật sự thành công
+    // ở lane browser; cả hai update đều hợp lệ, lấy max.)
+    const now = Date.now();
+    job.mailOtpRequestedAt = Math.max(Number(job.mailOtpRequestedAt) || 0, now);
     inputValue = "r";
     setStage(job, "working", "正在重新发送邮箱验证码");
   } else if (action === "phone") {
@@ -3643,13 +4016,19 @@ async function cancelJob(job) {
   scheduleQueuedJobs();
 }
 
-// Cancel a job because its proxy IP has no registration slot left. Used for the
-// overflow accounts when the user starts more than the IP capacity allows.
+// Queue job for later retry when all proxy IPs at cap. Trước đây CANCEL ngay,
+// nay chuyển sang "proxy_waiting" state: background retry mỗi 60s cho đến khi
+// 1 IP có slot trống (do account complete trước đó, hoặc operator thêm proxy/
+// tăng limitPerIp). Job vẫn visible trong list, giữ email + credentials.
 function cancelForProxyCapacity(job) {
+  queueForProxyCapacity(job);
+}
+
+function queueForProxyCapacity(job) {
   stopMailPolling(job);
   releaseSmsNumber(job, "idle");
-  job.status = "canceled";
-  job.prompt = "代理 IP 注册名额已满，已自动取消该任务";
+  job.status = "proxy_waiting";
+  job.prompt = "等待代理 IP 释放名额（后台自动重试）";
   job.lastError = null;
   job.queueRunId = null;
   job.child?.kill("SIGTERM");
@@ -3657,6 +4036,194 @@ function cancelForProxyCapacity(job) {
   touch(job);
   void saveJobMetadata(job).catch(() => {});
 }
+
+// Global cache của proxy alloc config MỚI NHẤT từ UI (cập nhật mỗi lần batch/
+// single POST). Retry loop ưu tiên config MỚI NHẤT thay vì cached tại job
+// creation time → khi user thêm proxy vào UI "Cấu hình proxy" + tạo bất kỳ
+// job mới nào, config auto cập nhật cho mọi job proxy_waiting.
+// NB: hoisted-up declaration ở gần đầu file (xem #PROXY_ALLOC_CONFIG_STATE)
+// để startup load từ settings không chạm TDZ.
+
+// Build fallback alloc config từ proxyPool DB + jobDao history (dùng khi
+// currentProxyAllocConfig null — vd pm2 restart xoá global cache). proxyPool
+// là explicit curated list; jobDao history enrich thêm các proxy đã từng dùng
+// cho job cũ nhưng chưa add vào proxyPool (dedupe theo host, chọn URL mới
+// nhất per host để lấy creds hợp lệ).
+function buildFallbackProxyAllocConfigFromPool() {
+  const seenHosts = new Set();
+  const lines = [];
+  for (const entry of proxyPool.values()) {
+    if (!entry.url) continue;
+    if (seenHosts.has(entry.host)) continue;
+    seenHosts.add(entry.host);
+    lines.push(entry.url);
+  }
+  // Enrich từ jobDao: nhiều proxy user từng dùng ở job cũ nhưng chưa import
+  // vào proxyPool. Lấy URL mới nhất per host (jobs sort DESC theo created_at).
+  try {
+    const rows = jobDao.listAll({ limit: 500 });
+    for (const row of rows) {
+      const url = row.proxy_url;
+      if (!url) continue;
+      try {
+        const parsed = new URL(url);
+        if (seenHosts.has(parsed.hostname)) continue;
+        seenHosts.add(parsed.hostname);
+        lines.push(url);
+      } catch { /* skip malformed */ }
+    }
+  } catch { /* best-effort */ }
+  if (!lines.length) return null;
+  return { general: lines.join("\n"), groups: [], limitPerIp: 15 };
+}
+
+// Đảm bảo job có proxyUrl trước khi spawn worker (browser lane). Nếu job thiếu
+// proxyUrl (job cũ migrate từ TLS, retry sau fail nhiều lần, hoặc proxy cũ bị
+// cháy), tự allocate từ pool. Trả về true nếu assign thành công, false nếu pool
+// hết slot (caller nên queue proxy_waiting). RÀNG BUỘC: browser lane phải có
+// proxy để tránh burn IP native (xem feedback_browser_lane_proxy_required.md).
+function ensureJobProxyForBrowserLane(job) {
+  if (job.signupBackend !== "browser") return true;
+  if (job.proxyUrl) return true;
+  // Thứ tự fallback: UI global (mới nhất) → job cached → proxyPool DB.
+  let cfg = currentProxyAllocConfig || job.proxyAllocConfig || null;
+  if (!cfg) cfg = buildFallbackProxyAllocConfigFromPool();
+  if (!cfg) {
+    appendJobLog(job, "[proxy] 自动分配失败: proxy pool trống + UI chưa gửi config. Hãy thêm proxy vào \"Cấu hình proxy\" rồi retry.\n");
+    return false;
+  }
+  const hasSource = typeof cfg === "string"
+    ? Boolean(cfg.trim())
+    : Boolean((cfg.general || "").trim()) || Boolean(cfg.groups?.length);
+  if (!hasSource) return false;
+  try {
+    const allocator = makeProxyAllocator(cfg, cfg?.limitPerIp);
+    const proxyUrl = allocator.next(job.email);
+    if (!proxyUrl) return false;
+    job.proxyUrl = proxyUrl;
+    job.proxyAllocConfig = cfg;
+    job.proxyConnectionError = false;
+    job.failedProxyLabel = null;
+    appendJobLog(job, `[proxy] 自动分配代理 ${proxyUrl.replace(/:[^@]*@/, ":****@")}（browser lane 需要代理）\n`);
+    return true;
+  } catch (err) {
+    appendJobLog(job, `[proxy] 自动分配失败: ${String(err?.message || err).slice(0, 200)}\n`);
+    return false;
+  }
+}
+// STRICT domain binding: khi email thuộc 1 domain group và current proxy KHÔNG
+// phải proxy riêng của domain → thử re-allocate về pool domain (strict). Chỉ
+// swap qua updateJobProxy nếu allocator trả được URL nằm trong group list; nếu
+// null (pool rỗng / toàn IP cháy) hoặc URL ngoài group → log cảnh báo + giữ
+// nguyên để relogin vẫn chạy được (không block operator). Gọi trước
+// ensureJobProxyForBrowserLane trong forceReloginJob.
+async function maybeRealignJobProxyToDomain(job) {
+  const cfg = currentProxyAllocConfig || job.proxyAllocConfig;
+  if (!cfg || !Array.isArray(cfg.groups) || !cfg.groups.length) return;
+  const domain = emailDomainPart(job.email);
+  if (!domain) return;
+  const group = cfg.groups.find((g) => g.domain && (domain === g.domain || domain.endsWith(`.${g.domain}`)));
+  if (!group) return;
+  const groupHosts = new Set(dedupeProxyUrls(group.proxies).map((it) => it.host));
+  if (!groupHosts.size) return;
+  const currentHost = job.proxyUrl ? parseProxyUrlForSub2Api(job.proxyUrl)?.host : null;
+  if (currentHost && groupHosts.has(currentHost)) return;
+  const allocator = makeProxyAllocator(cfg, cfg.limitPerIp);
+  const nextUrl = allocator.next(job.email);
+  if (!nextUrl) {
+    appendJobLog(job, `[proxy] Email thuộc domain ${group.domain} nhưng không re-align được: pool riêng hết chỗ hoặc toàn IP đã cháy. Thêm proxy sạch cho domain rồi relogin lại.\n`);
+    return;
+  }
+  const nextHost = parseProxyUrlForSub2Api(nextUrl)?.host;
+  if (!nextHost || !groupHosts.has(nextHost)) {
+    appendJobLog(job, `[proxy] Allocator trả proxy ngoài domain ${group.domain} — bỏ qua re-align.\n`);
+    return;
+  }
+  if (nextUrl === job.proxyUrl) return;
+  appendJobLog(job, `[proxy] Re-align sang proxy riêng của domain ${group.domain}: ${currentHost || "(trống)"} → ${nextHost}.\n`);
+  await updateJobProxy(job, nextUrl);
+}
+
+function updateCurrentProxyAllocConfig(cfg) {
+  if (!cfg) return;
+  const normalized = { ...cfg, limitPerIp: cfg.limitPerIp || 15 };
+  currentProxyAllocConfig = normalized;
+  // Cập nhật proxyAllocConfig cho MỌI job proxy_waiting hiện tại → next retry
+  // dùng config mới nhất.
+  for (const job of jobs.values()) {
+    if (job.status === "proxy_waiting") job.proxyAllocConfig = normalized;
+  }
+  // Trigger retry ngay (không phải chờ 60s)
+  void retryProxyWaitingJobs();
+}
+
+// Startup: nạp currentProxyAllocConfig từ settings DB (UI đã lưu ở
+// PROXY_LINK_SETTING_DB_KEY). Trước đây config chỉ populated khi user tạo
+// batch job đầu tiên — sau pm2 restart, relogin re-align skip vì cfg=null.
+// Giờ load ngay lúc boot để maybeRealignJobProxyToDomain + allocator strict
+// hoạt động liền sau restart, không cần user bấm gì.
+function loadCurrentProxyAllocConfigFromSettings() {
+  try {
+    const raw = settingsDao.get(PROXY_LINK_SETTING_DB_KEY);
+    if (!raw) return;
+    const ui = JSON.parse(raw);
+    if (!ui || typeof ui !== "object") return;
+    const parsed = readProxyAllocConfig({ proxies: ui.proxies, domainProxies: ui.domainProxies });
+    const limitPerIp = Math.max(1, Math.trunc(Number(ui.limitPerIp)) || 15);
+    const hasSource = Boolean(parsed.general?.trim()) || parsed.groups.length > 0;
+    if (!hasSource) return;
+    currentProxyAllocConfig = { ...parsed, limitPerIp };
+    console.log(`[proxy] loaded alloc config from settings: general=${parsed.general.split(/[\r\n,]+/).filter(Boolean).length} proxies, domainGroups=${parsed.groups.length}, limitPerIp=${limitPerIp}`);
+  } catch (err) {
+    console.warn(`[warn] loadCurrentProxyAllocConfigFromSettings: ${String(err?.message || err).slice(0, 180)}`);
+  }
+}
+
+// Background retry cho proxy_waiting jobs: mỗi 60s thử allocator lại với
+// config MỚI NHẤT (currentProxyAllocConfig). Nếu allocator trả proxy → assign
+// + enqueueJob("full"). Config tự cập nhật khi user tạo job mới qua UI với
+// batch config đã thêm proxy mới.
+let proxyWaitRetryInProgress = false;
+async function retryProxyWaitingJobs() {
+  if (proxyWaitRetryInProgress) return;
+  const waiting = [...jobs.values()].filter((j) => j.status === "proxy_waiting");
+  if (!waiting.length) return;
+  proxyWaitRetryInProgress = true;
+  try {
+    for (const job of waiting) {
+      try {
+        // Ưu tiên global config MỚI NHẤT, fallback về cached job config.
+        const cfg = currentProxyAllocConfig || job.proxyAllocConfig;
+        if (!cfg || !cfg.proxies) continue;
+        const allocator = makeProxyAllocator(cfg, cfg.limitPerIp);
+        const proxyUrl = allocator.next(job.email);
+        if (!proxyUrl) continue; // vẫn hết slot
+        await withEmailJobLock(job.email, async () => {
+          job.proxyUrl = proxyUrl;
+          job.proxyAllocConfig = cfg;
+          job.proxyConnectionError = false;
+          job.failedProxyLabel = null;
+          job.lastError = null;
+          job.status = "starting";
+          job.prompt = "正在建立登录会话";
+          job.attempt = (job.attempt || 1) + 1;
+          await saveStoredLoginCredentials(job.email, job);
+          appendJobLog(job, `[proxy-wait] 已获得代理 ${proxyUrl.replace(/:[^@]*@/, ":****@")}，继续授权流程。\n`);
+          enqueueJob(job, "full", "正在重新建立登录会话");
+        });
+      } catch (err) {
+        appendJobLog(job, `[proxy-wait] retry failed: ${String(err?.message || err).slice(0, 200)}\n`);
+      }
+    }
+  } finally {
+    proxyWaitRetryInProgress = false;
+  }
+}
+// Retry-proxy sweep tick — `.unref()` lets Node exit on SIGTERM even nếu interval
+// chưa fire, và shutdown() cũng clearInterval cho chắc để không chạy giữa chừng
+// khi server đang graceful-close.
+const proxyWaitRetryInterval = setInterval(() => { void retryProxyWaitingJobs(); }, 60_000);
+proxyWaitRetryInterval.unref();
 
 async function cancelAllJobs() {
   // "Stop all" targets running/queued work only; staged (idle) jobs stay in the list.
@@ -3743,11 +4310,30 @@ async function buildSub2ApiUploadPayload(downloadable) {
     accounts.push(...data.accounts);
     if (Array.isArray(data.proxies)) proxies.push(...data.proxies);
   }
+  // Convert HTTP → SOCKS5 cho các proxy từ datte.org (sub2api/Codex CLI gọi
+  // HTTP CONNECT không ổn định với residential proxy). Regenerate proxy_key cho
+  // mỗi proxy đã convert + update account.proxy_key references.
+  const convertedProxies = [];
+  const keyRewrite = new Map(); // oldKey -> newKey
+  for (const p of proxies) {
+    if (!p || !p.protocol || !p.host || !p.port) { convertedProxies.push(p); continue; }
+    const converted = toSocks5ProxyIfPossible(p);
+    if (converted === p) { convertedProxies.push(p); continue; }
+    const rawKey = `${converted.protocol}|${converted.host}|${converted.port}|${converted.username || ""}|${converted.password || ""}`;
+    const newKey = `p_${crypto.createHash("sha1").update(rawKey).digest("hex").slice(0, 16)}`;
+    if (p.proxy_key && p.proxy_key !== newKey) keyRewrite.set(p.proxy_key, newKey);
+    convertedProxies.push({ ...converted, proxy_key: newKey, name: `${converted.host}:${converted.port} (${converted.protocol})`, status: p.status || "active" });
+  }
+  if (keyRewrite.size) {
+    for (const acc of accounts) {
+      if (acc && acc.proxy_key && keyRewrite.has(acc.proxy_key)) acc.proxy_key = keyRewrite.get(acc.proxy_key);
+    }
+  }
   return {
     type: "sub2api-data",
     version: 1,
     exported_at: new Date().toISOString(),
-    proxies: uniqueByJson(proxies),
+    proxies: uniqueByJson(convertedProxies),
     accounts,
   };
 }
@@ -3917,6 +4503,21 @@ function markEmailDeactivated(email, reason) {
   return true;
 }
 
+// Tài khoản vừa bị vô hiệu hoá thì job của nó bị XOÁ khỏi bước 4 ngay. Trả về
+// danh sách email mới bị vô hiệu hoá gần đây (dài hơn 20s đồng hồ đếm ngược ở UI
+// một chút) để console còn kịp giữ dòng đó lại, đếm ngược rồi mới cho biến mất.
+const RECENT_DEACTIVATION_WINDOW_MS = 30_000;
+function recentDeactivationList() {
+  const now = Date.now();
+  const out = [];
+  for (const entry of deactivatedEmails.values()) {
+    const at = Date.parse(entry.at);
+    if (!Number.isFinite(at) || now - at > RECENT_DEACTIVATION_WINDOW_MS) continue;
+    out.push({ email: entry.email, reason: entry.reason || null, at: entry.at });
+  }
+  return out;
+}
+
 // Drop the deactivated flag — the mailbox was deleted, or reused for a fresh
 // account that registered successfully.
 function clearEmailDeactivated(email) {
@@ -4012,6 +4613,21 @@ function phoneUnavailableReason(number) {
   if (entry.blocked) return "risk";
   if (phoneMaxUses > 0 && entry.uses >= phoneMaxUses) return "max-uses";
   return null;
+}
+
+// Variant của isPhoneAvailable, override giới hạn reuse cho FALLBACK khi pool
+// SMSCode cạn số mới. User policy: "nếu hết số có thể dùng đại 1 số nhưng
+// không quá 2 lần" → cho phép uses < 2 vẫn chấp nhận.
+function isPhoneAvailableWithLimit(number, maxUsesOverride) {
+  const digits = normalizePhoneKey(number);
+  if (!digits) return true;
+  if (isSuspiciousPrefixCoolingDown(number)) return false;
+  const entry = usedPhoneLedger.get(digits);
+  if (!entry) return true;
+  if (entry.blocked) return false;
+  const cap = Number.isFinite(maxUsesOverride) && maxUsesOverride > 0 ? maxUsesOverride : phoneMaxUses;
+  if (cap > 0 && entry.uses >= cap) return false;
+  return true;
 }
 
 // Count a number as used (it was submitted to the verification API). Never
@@ -4350,15 +4966,46 @@ function emailDomainPart(email) {
 }
 
 // Đọc cấu hình phân bổ proxy từ body: pool chung (`proxies`) + các nhóm proxy
-// gán riêng theo domain (`domainProxies: [{ domain, proxies }]`). Nhóm thiếu
-// domain hoặc rỗng bị bỏ qua.
+// gán riêng theo domain (`domainProxies: [{ domain, proxies, protocol? }]`).
+// Nhóm thiếu domain hoặc rỗng bị bỏ qua.
+// Defensive normalization: domainProxies.proxies có thể ở BARE format
+// `host:port:user:pass` (UI lưu bare + `protocol` riêng). Nếu caller quên
+// normalize sang URL (vd `/api/sub2api/upload` trước fix), parseProxyList sẽ
+// fail và domain group rỗng → fallback tứ phía âm thầm. Giờ normalize ngay tại
+// readProxyAllocConfig: prepend scheme cho dòng bare dựa trên g.protocol
+// (default socks5h), giữ nguyên dòng đã có scheme.
 function readProxyAllocConfig(body) {
   const general = typeof body?.proxies === "string" ? body.proxies : "";
+  const normalizeDomainProxies = (text, protocol) => {
+    const scheme = String(protocol || "socks5h").trim().toLowerCase();
+    const allowed = new Set(["http", "https", "socks5", "socks5h"]);
+    const defaultScheme = allowed.has(scheme) ? scheme : "socks5h";
+    return String(text || "")
+      .split(/[\r\n,]+/)
+      .map((line) => {
+        const trimmed = line.trim();
+        if (!trimmed) return "";
+        // Đã có scheme (socks5://, http://, ...) → giữ nguyên.
+        if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) return trimmed;
+        // Bare: host:port[:user:pass]
+        const parts = trimmed.split(":").map((p) => p.trim());
+        if (parts.length === 4) {
+          const [host, port, user, pass] = parts;
+          return `${defaultScheme}://${encodeURIComponent(user)}:${encodeURIComponent(pass)}@${host}:${port}`;
+        }
+        if (parts.length === 2) {
+          return `${defaultScheme}://${parts[0]}:${parts[1]}`;
+        }
+        return trimmed; // best-effort, parseProxyList sẽ drop nếu không parse được
+      })
+      .filter(Boolean)
+      .join("\n");
+  };
   const groups = Array.isArray(body?.domainProxies)
     ? body.domainProxies
         .map((g) => ({
           domain: String(g?.domain || "").trim().toLowerCase().replace(/^@+/, ""),
-          proxies: typeof g?.proxies === "string" ? g.proxies : "",
+          proxies: normalizeDomainProxies(typeof g?.proxies === "string" ? g.proxies : "", g?.protocol),
         }))
         .filter((g) => g.domain && g.proxies.trim())
     : [];
@@ -4379,10 +5026,12 @@ function dedupeProxyUrls(text) {
 
 // Auto-assign proxies when registering accounts in batch mode. Nhận hoặc 1 khối
 // text (pool chung, tương thích cũ) hoặc cấu hình { general, groups } có proxy
-// gán riêng theo domain. `.next(email)` ưu tiên proxy của domain email đó; hết
-// chỗ (mọi IP riêng đã đạt giới hạn) thì mượn pool chung. Giới hạn limitPerIp
-// đếm theo host và DÙNG CHUNG cho cả proxy riêng lẫn pool chung, nên một IP
-// không bao giờ vượt giới hạn dù nằm ở nhóm nào.
+// gán riêng theo domain. STRICT binding: `.next(email)` CHỈ cấp proxy riêng
+// cho email thuộc domain đã khai báo — không fallback về pool chung khi domain
+// hết chỗ/toàn IP cháy (trả null, caller phải thêm proxy sạch cho domain hoặc
+// queue chờ). Email không thuộc domain nào thì lấy từ pool chung. Giới hạn
+// limitPerIp đếm theo host và DÙNG CHUNG cho cả proxy riêng lẫn pool chung,
+// nên một IP không bao giờ vượt giới hạn dù nằm ở nhóm nào.
 function makeProxyAllocator(proxyConfig, limitPerIpRaw) {
   const limitPerIp = Math.min(999, Math.max(1, Math.trunc(Number(limitPerIpRaw)) || 15));
   const { general, groups } = typeof proxyConfig === "string"
@@ -4400,12 +5049,12 @@ function makeProxyAllocator(proxyConfig, limitPerIpRaw) {
   // tổng tài khoản TỪNG chạy qua host, deactivated = số đã bị OpenAI vô hiệu hoá.
   // Giữ qua cả việc xoá job nên không bao giờ reset.
   const lifetime = usedProxyDao.deactivationHistoryByHost();
-  // Host bị LOẠI HẲN khỏi cấp phát ("chặn cứng"): chủ đã "Quên", HOẶC đã cháy
-  // >= PROXY_BURN_THRESHOLD tài khoản bị vô hiệu. IP đã cháy không bao giờ được
-  // nhồi thêm — buộc đổi sang IP sạch, thay vì tiếp tục đốt cùng một IP.
+  // Host bị LOẠI HẲN khỏi cấp phát ("chặn cứng"): chủ đã "Quên", HOẶC cháy theo
+  // ngưỡng tuyệt đối/tỉ lệ (isBurnedHistory). IP đã cháy không bao giờ được nhồi
+  // thêm — buộc đổi sang IP sạch, thay vì tiếp tục đốt cùng một IP.
   const blockedHosts = new Set(getForgottenProxyHosts());
   for (const [host, h] of lifetime) {
-    if ((h?.deactivated || 0) >= PROXY_BURN_THRESHOLD) blockedHosts.add(host);
+    if (isBurnedHistory(h)) blockedHosts.add(host);
   }
   // Trần limitPerIp đếm theo MAX(slot sống, tổng trọn đời) — nên xoá tài khoản đã
   // chết KHÔNG còn làm tụt bộ đếm về 0 để nhồi tiếp lên cùng IP (lỗi gốc cũ:
@@ -4444,11 +5093,9 @@ function makeProxyAllocator(proxyConfig, limitPerIpRaw) {
     remainingCapacity: () => allItems.reduce((sum, it) => sum + (blockedHosts.has(it.host) ? 0 : Math.max(0, limitPerIp - (usage.get(it.host) || 0))), 0),
     next: (email) => {
       const group = groupFor(email);
-      // Proxy riêng của domain trước; hết chỗ thì mượn pool chung (fallback).
-      if (group) {
-        const url = pickFrom(group.list, `domain:${group.domain}`);
-        if (url) return url;
-      }
+      // STRICT: email thuộc domain đã khai báo CHỈ dùng proxy riêng của domain,
+      // không fallback về pool chung. Hết chỗ / toàn IP cháy → trả null.
+      if (group) return pickFrom(group.list, `domain:${group.domain}`);
       return pickFrom(generalList, "__general__");
     },
   };
@@ -4757,11 +5404,11 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
       const forgottenHosts = getForgottenProxyHosts();
       const isBurnedExit = (job) => {
         if (!job?.proxyUrl) return false;
-        if (job.exitIp && (burnedByExit.get(job.exitIp)?.deactivated || 0) >= PROXY_BURN_THRESHOLD) return true;
+        if (job.exitIp && isBurnedHistory(burnedByExit.get(job.exitIp))) return true;
         const parsed = parseProxyUrlForSub2Api(job.proxyUrl);
         if (!parsed) return false;
         if (forgottenHosts.has(parsed.host)) return true;
-        return (burnedByHost.get(parsed.host)?.deactivated || 0) >= PROXY_BURN_THRESHOLD;
+        return isBurnedHistory(burnedByHost.get(parsed.host));
       };
 
       for (const [email, accounts] of grouped) {
@@ -4813,7 +5460,7 @@ async function runSub2ApiMonitor(trigger = "scheduled") {
             // sạch rồi bấm "re-login" tay để thử lại.
             summary.skippedBurned += accounts.length;
             summary.disabled += (await disableSub2ApiScheduling(config, accounts, job, "Exit IP đã cháy — tạm dừng tự re-login, cần đổi IP sạch")).disabled;
-            appendJobLog(job, `[monitor] Bỏ qua tự re-login: IP ra đã cháy (>= ${PROXY_BURN_THRESHOLD} tài khoản bị vô hiệu). Hãy đổi sang IP sạch rồi re-login tay.\n`);
+            appendJobLog(job, `[monitor] Bỏ qua tự re-login: IP ra đã cháy (>= ${PROXY_BURN_THRESHOLD} acc bị vô hiệu, hoặc >= ${Math.round(PROXY_BURN_RATIO * 100)}% trên >= ${PROXY_BURN_MIN_SAMPLE} acc). Hãy đổi sang IP sạch rồi re-login tay.\n`);
             await saveJobMetadata(job);
             return;
           }
@@ -5365,6 +6012,10 @@ function publicJob(job) {
     // signup_backend A/B lane: which worker handled this row ('tls' | 'browser').
     signupBackend: job.signupBackend || "tls",
     oaiDeviceId: job.oaiDeviceId || null,
+    // Lane routing — xem chooseRefreshLane & docs/lane-routing.md
+    source: job.source || "system",
+    signupCompletedAt: job.signupCompletedAt || null,
+    forceBrowserVerifyRequested: Boolean(job.forceBrowserVerifyRequested),
   };
 }
 
@@ -5598,8 +6249,13 @@ function isActive(status) {
 }
 
 function occupiesActiveSlot(job) {
-  // Staged ("idle") jobs are not running, so they never take a concurrency slot.
-  return isActive(job.status) && job.status !== "queued" && job.status !== "idle";
+  // Staged ("idle"), queued, và proxy_waiting jobs không chạy — không chiếm
+  // concurrency slot. proxy_waiting background retry sẽ enqueueJob khi slot
+  // trống, lúc đó mới chuyển sang starting/queued.
+  return isActive(job.status)
+    && job.status !== "queued"
+    && job.status !== "idle"
+    && job.status !== "proxy_waiting";
 }
 
 function formatClockTime(timestamp) {
@@ -5804,7 +6460,14 @@ async function syncCompletedOutputs(force = false) {
       try {
         const [raw, stat] = await Promise.all([fs.readFile(checkpointPath, "utf8"), fs.stat(checkpointPath)]);
         const checkpoint = JSON.parse(raw);
-        if (checkpoint?.version !== 1 || typeof checkpoint.email !== "string" || !checkpoint.email) return;
+        // Accept 2 checkpoint schemas:
+        //   (A) protocol-login legacy: {version: 1, email: "...", ...}
+        //   (B) browser-login new:     {stage, codeVerifier?, state?, oai_device_id, saved_at}
+        //       (không có version/email — email lấy từ job-meta.json)
+        const hasLegacyV1 = checkpoint?.version === 1 && typeof checkpoint.email === "string" && checkpoint.email;
+        const hasBrowserCp = checkpoint && typeof checkpoint.stage === "string"
+          && metadata.email && isEmail(metadata.email);
+        if (!hasLegacyV1 && !hasBrowserCp) return;
         const mailApiUrl = validateMailApiUrl(metadata.mail_api_url) ? metadata.mail_api_url : null;
         const email = metadata.email || checkpoint.email;
         let storedCredentials = await loadStoredLoginCredentials(email);
@@ -5884,6 +6547,7 @@ async function syncCompletedOutputs(force = false) {
           ...restoredRegistrationState(metadata),
           ...restoredAutoRepairState(metadata),
           ...restoredSub2ApiUploadState(metadata),
+          ...restoredLaneState(metadata),
           totpSetupError: totpRecovery.error || null,
           passwordAddError: passwordRecovery.error || metadata.password_add_error || null,
           passwordAddedAt: metadata.password_added_at || passwordRecovery.addedAt || null,
@@ -5992,6 +6656,7 @@ async function syncCompletedOutputs(force = false) {
           loginCheckpointAvailable: Boolean(metadata.login_checkpoint_available),
           securityCheckRequired: Boolean(metadata.security_check_required),
           ...newSmsState(),
+          ...restoredLaneState(metadata),
           smsCostEvents: Array.isArray(metadata.sms_cost_events) ? metadata.sms_cost_events : [],
         });
       }
@@ -6077,6 +6742,22 @@ async function recoverAddedPasswordCredential({ email, resultPath, credentials }
 function restoredOutputOperationState(metadata, completedAt, totpRecovery, passwordRecovery) {
   const savedStatus = String(metadata.status || "");
   const interrupted = savedStatus && !isTerminalStatus(savedStatus);
+  // Nếu output file đã lưu + registration_succeeded=true → account HOÀN
+  // THÀNH, bất kể saved_status (có thể "canceled", "finalizing", "failed" do
+  // service restart cắt ngang trước khi handleChildClose mark completed).
+  // Caller chỉ gọi restoredOutputOperationState khi outputPath đã tồn tại +
+  // JSON parse thành công, nên dùng result_saved + registration_succeeded
+  // làm proof positive để force "completed".
+  if (metadata.result_saved === true && metadata.registration_succeeded === true) {
+    return {
+      status: "completed",
+      prompt: "授权完成，可以下载导入文件（已从磁盘恢复）",
+      lastError: null,
+      totpSetupError: null,
+      passwordAddError: metadata.password_add_error || null,
+      log: `[restore] 检测到有效授权文件和注册成功记录，强制恢复为 completed。\n`,
+    };
+  }
   const status = !savedStatus || savedStatus === "completed"
     ? "completed"
     : interrupted ? "failed" : savedStatus;
@@ -6256,6 +6937,26 @@ function restoredRegistrationState(metadata = {}) {
   return {
     registrationSucceeded: succeeded,
     registeredAt: metadata.registered_at || (succeeded ? (metadata.updated_at || metadata.created_at || null) : null),
+  };
+}
+
+// Lane routing — xem chooseRefreshLane trong file này + docs/lane-routing.md.
+// Giữ 3 field persist qua reboot để policy không bị reset về default.
+function restoredLaneState(metadata = {}) {
+  const rawBackend = String(metadata.signup_backend || "").toLowerCase();
+  const resolvedBackend = rawBackend === "browser" ? "browser" : rawBackend === "tls" ? "tls" : null;
+  const source = metadata.source === "external" ? "external" : "system";
+  // Fallback cho dữ liệu cũ chưa có signup_completed_at: coi acc đã có refresh_token
+  // (result_saved=1) là đã signup xong — dùng mốc gần đúng. Backfill migration SQL
+  // cũng xử lý y hệt, giữ hai đường đồng bộ.
+  const signupCompletedAt = metadata.signup_completed_at
+    || (metadata.result_saved && (metadata.registered_at || metadata.completed_at || metadata.updated_at))
+    || null;
+  return {
+    source,
+    signupCompletedAt,
+    forceBrowserVerifyRequested: Boolean(metadata.force_browser_verify_requested),
+    ...(resolvedBackend ? { signupBackend: resolvedBackend } : {}),
   };
 }
 
@@ -6795,6 +7496,25 @@ async function updateJobProxy(job, proxyUrl) {
   await rewriteResultFileProxy(job);
   recordJobOperation(job, "proxy_update");
   appendJobLog(job, "[proxy] 账号代理配置已更新。\n");
+  // Auto-sync proxy mới sang Sub2API khi account đã được upload. Trước đây
+  // chỉ `changeJobProxy` (proxy_error flow) sync, nhưng user cũng cần update
+  // proxy cho completed account (vd HTTP → SOCKS5) nên thêm cả vào đây.
+  if (job.sub2apiUploadedAt && proxyUrl) {
+    try {
+      const sub2apiSync = await syncAccountProxyToSub2Api(job, proxyUrl, null);
+      if (sub2apiSync?.ok) {
+        appendJobLog(job, `[proxy] 新代理已同步到 Sub2API（proxy_id ${sub2apiSync.proxyId}）。\n`);
+      } else if (sub2apiSync?.attempted) {
+        appendJobLog(job, `[proxy] 同步新代理到 Sub2API 失败：${sub2apiSync.error || "未知错误"}。\n`);
+      } else {
+        // attempted:false (no-config fallback) — operator cần enable Sub2API
+        // monitor để lưu config server-side thì update proxy mới auto-sync được.
+        appendJobLog(job, `[proxy] 同步新代理到 Sub2API 跳过：${sub2apiSync?.reason === "no-config" ? "chưa cấu hình Sub2API monitor (vào UI → Sub2API Monitor → Enable để lưu baseUrl + adminApiKey)" : "no-config"}。\n`);
+      }
+    } catch (error) {
+      appendJobLog(job, `[proxy] 同步新代理到 Sub2API 异常：${String(error?.message || error).slice(0, 200)}。\n`);
+    }
+  }
   if (isActive(job.status) && job.status !== "queued" && job.status !== "idle") {
     restartJobAfterConfigurationUpdate(job);
   } else {
@@ -6969,13 +7689,37 @@ function restartJobForProxyChange(job, options = {}) {
   enqueueJob(job, "full", enqueueMessage);
 }
 
+// Convert HTTP proxy URL → SOCKS5 variant khi upload sub2api / Codex CLI.
+// Sub2API backend chấp nhận protocol http/socks5, nhưng sub2api/Codex CLI khi
+// gọi ra ngoài qua HTTP CONNECT đôi khi lỗi với residential proxy (datte.org
+// không hỗ trợ CONNECT ổn định) → account signup bằng HTTP không export sang
+// sub2api được. Known provider mappings:
+//   - datte.org: SOCKS5 port = HTTP port + 1000 (vd 13030 → 14030)
+// Người dùng có thể set env SUB2API_FORCE_SOCKS5=0 để skip conversion.
+function toSocks5ProxyIfPossible(parsed) {
+  if (!parsed) return parsed;
+  if (process.env.SUB2API_FORCE_SOCKS5 === "0") return parsed;
+  if (parsed.protocol !== "http" && parsed.protocol !== "https") return parsed;
+  const host = String(parsed.host || "").toLowerCase();
+  // datte.org: SOCKS5 port = HTTP port + 1000
+  if (/\.datte\.org$/.test(host)) {
+    const socks5Port = parsed.port + 1000;
+    if (socks5Port >= 1 && socks5Port <= 65535) {
+      return { ...parsed, protocol: "socks5", port: socks5Port };
+    }
+  }
+  return parsed;
+}
+
 // Build a Sub2API-creatable proxy object (with a proxy_key) from a proxy URL.
 function proxyUrlToCreatableSub2ApiProxy(proxyUrl) {
-  const parsed = parseProxyUrlForSub2Api(proxyUrl);
-  if (!parsed) return null;
+  const parsedRaw = parseProxyUrlForSub2Api(proxyUrl);
+  if (!parsedRaw) return null;
+  const parsed = toSocks5ProxyIfPossible(parsedRaw);
   const rawKey = `${parsed.protocol}|${parsed.host}|${parsed.port}|${parsed.username}|${parsed.password}`;
   const proxyKey = `p_${crypto.createHash("sha1").update(rawKey).digest("hex").slice(0, 16)}`;
-  return { ...parsed, proxy_key: proxyKey, status: "active" };
+  const nameSuffix = parsed.protocol !== parsedRaw.protocol ? ` (${parsed.protocol})` : "";
+  return { ...parsed, name: `${parsed.host}:${parsed.port}${nameSuffix}`, proxy_key: proxyKey, status: "active" };
 }
 
 // Create the new proxy on Sub2API and point the account's proxy_id at it. Uses
@@ -7097,6 +7841,10 @@ async function saveJobMetadata(job) {
         // signup_backend A/B lane: which worker ran this job and its stable device identity.
         signup_backend: job.signupBackend || "tls",
         oai_device_id: job.oaiDeviceId || null,
+        // Lane routing — xem chooseRefreshLane. Giữ qua reboot để policy không reset.
+        source: job.source || "system",
+        signup_completed_at: job.signupCompletedAt || null,
+        force_browser_verify_requested: Boolean(job.forceBrowserVerifyRequested),
         updated_at: new Date().toISOString(),
       };
       const tempPath = `${metadataPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
@@ -7186,7 +7934,13 @@ async function beginMailPolling(job) {
           job.mailOtpRequestedAt,
         );
         if (job.mailPollToken !== pollToken || job.status !== "email_otp" || !job.child) return;
-        const unseen = candidates.filter((candidate) => !job.mailSeenCandidateKeys.has(candidate.key));
+        // Skip candidate đã submit — tránh resubmit cùng 1 code vô hạn khi worker
+        // chưa kịp consume stdin hoặc OpenAI reject code đó. Code mới (khác lần
+        // trước) mới reset counter.
+        const submitted = job.mailSubmittedCodes || new Set();
+        const unseen = candidates
+          .filter((candidate) => !job.mailSeenCandidateKeys.has(candidate.key))
+          .filter((candidate) => !submitted.has(candidate.code));
         let fresh = unseen.find((candidate) => candidate.score >= 12);
         if (!fresh) {
           unseen.forEach((candidate) => {
@@ -7198,6 +7952,8 @@ async function beginMailPolling(job) {
         if (fresh) {
           job.mailSeenCandidateKeys.add(fresh.key);
           job.mailCandidateCounts.delete(fresh.key);
+          submitted.add(fresh.code);
+          job.mailSubmittedCodes = submitted;
           job.mailStatus = "found";
           markAuthorizationRequirement(job, "emailOtp");
           markAuthorizationAutomatic(job, "emailOtp");
@@ -7379,6 +8135,7 @@ async function shutdown() {
       clearInterval(sub2ApiMonitorTimer);
       sub2ApiMonitorTimer = null;
     }
+    clearInterval(proxyWaitRetryInterval);
     for (const controller of sub2ApiRequestControllers) controller.abort();
     await Promise.allSettled([
       sub2ApiMonitorPromise,

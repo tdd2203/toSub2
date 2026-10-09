@@ -19,39 +19,52 @@ const UNCONFIGURED = Symbol("unconfigured");
 // ---- Per-account device-environment fingerprint ---------------------------
 // Chrome's TLS ClientHello (JA3/JA4) does NOT encode the OS, so the only safe
 // axes to vary per account are the JS-environment signals read inside the
-// Sentinel jsdom runtime (screen, cores, memory, heap). We vary ONLY these and
-// keep the UA / sec-ch-ua / platform tied to the TLS profile, so the identity
-// stays internally consistent. Values are derived DETERMINISTICALLY from a
-// stable per-account seed (the oai-did): the same account gets the same
-// fingerprint across re-logins (a fingerprint that changes every login is itself
-// a bot tell), while different accounts sharing one exit IP no longer also share
-// a byte-identical device fingerprint — the glue OpenAI uses to cluster-ban.
-const MAC_SCREENS = [
-  [1440, 900], [1512, 982], [1680, 1050], [1728, 1117], [1920, 1080], [2560, 1440],
+// Sentinel jsdom runtime. The identity's UA / sec-ch-ua / platform stay macOS-
+// Chrome (tied to the TLS profile), so every device below is a REAL shipping Mac
+// and the whole fingerprint is internally coherent.
+//
+// MoreLogin-style real-device database: instead of mixing screen/cores/memory on
+// independent axes (which can produce impossible combos like a 13" 1440x900 panel
+// with 16 cores), each account draws ONE whole REAL Mac config — screen, cores,
+// memory and JS-heap that genuinely ship together. The pick is DETERMINISTIC from
+// a stable per-account seed (the oai-did): the same account keeps the same device
+// across re-logins (a fingerprint that changes every login is itself a bot tell),
+// while different accounts sharing one exit IP no longer share a byte-identical
+// device — the glue OpenAI uses to cluster-ban.
+//
+// Reported values are what Chrome on macOS actually exposes: screen = the LOGICAL
+// (CSS-pixel) resolution at the default scaling; deviceMemory = 8 for every 8GB+
+// Mac (Chrome quantises and caps navigator.deviceMemory at 8); jsHeapSizeLimit =
+// a real observed Chrome-desktop value. GPU/WebGL strings are documented per model
+// for reference but NOT injected — jsdom cannot host a real WebGL context, and a
+// fake one is more detectable than none (true GPU spoofing needs a real browser).
+const MAC_DEVICE_PROFILES = [
+  { model: "MacBook Air (M1, 2020)",          screenWidth: 1440, screenHeight: 900,  cores: 8,  heap: 2172649472, gpu: "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)" },
+  { model: "MacBook Air (M2, 2022)",          screenWidth: 1470, screenHeight: 956,  cores: 8,  heap: 2172649472, gpu: "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)" },
+  { model: "MacBook Air 15 (M2, 2023)",       screenWidth: 1512, screenHeight: 982,  cores: 8,  heap: 4294705152, gpu: "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)" },
+  { model: "MacBook Pro 13 (M2, 2022)",       screenWidth: 1440, screenHeight: 900,  cores: 8,  heap: 2172649472, gpu: "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)" },
+  { model: "MacBook Pro 14 (M1 Pro, 2021)",   screenWidth: 1512, screenHeight: 982,  cores: 10, heap: 4294705152, gpu: "ANGLE (Apple, ANGLE Metal Renderer: Apple M1 Pro, Unspecified Version)" },
+  { model: "MacBook Pro 14 (M2 Pro, 2023)",   screenWidth: 1512, screenHeight: 982,  cores: 12, heap: 4294705152, gpu: "ANGLE (Apple, ANGLE Metal Renderer: Apple M2 Pro, Unspecified Version)" },
+  { model: "MacBook Pro 14 (M3 Pro, 2023)",   screenWidth: 1512, screenHeight: 982,  cores: 12, heap: 4294705152, gpu: "ANGLE (Apple, ANGLE Metal Renderer: Apple M3 Pro, Unspecified Version)" },
+  { model: "MacBook Pro 16 (M1 Pro, 2021)",   screenWidth: 1728, screenHeight: 1117, cores: 10, heap: 4294705152, gpu: "ANGLE (Apple, ANGLE Metal Renderer: Apple M1 Pro, Unspecified Version)" },
+  { model: "MacBook Pro 16 (M2 Max, 2023)",   screenWidth: 1728, screenHeight: 1117, cores: 12, heap: 4294705152, gpu: "ANGLE (Apple, ANGLE Metal Renderer: Apple M2 Max, Unspecified Version)" },
+  { model: "iMac 24 (M1, 2021)",              screenWidth: 2048, screenHeight: 1152, cores: 8,  heap: 4294705152, gpu: "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)" },
+  { model: "Mac mini (M2, 2023) + QHD",       screenWidth: 2560, screenHeight: 1440, cores: 8,  heap: 4294705152, gpu: "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)" },
+  { model: "MacBook Pro 16 (Intel i9, 2019)", screenWidth: 1792, screenHeight: 1120, cores: 16, heap: 4294705152, gpu: "ANGLE (Intel Inc., AMD Radeon Pro 5500M OpenGL Engine, OpenGL 4.1)" },
 ];
-const HW_CONCURRENCY = [8, 10, 12, 16];
-// navigator.deviceMemory is quantised by Chrome and capped at 8 (never 16); 8 is
-// by far the most common, 4 a realistic minority. Using an impossible value such
-// as 16 would itself be a bot signal.
-const DEVICE_MEMORY = [8, 8, 8, 4];
-const JS_HEAP = [2172649472, 3221225472, 4294705152, 4395630592];
-
-function pickBySeed(hex, offset, list) {
-  const n = parseInt(hex.slice(offset, offset + 4), 16) || 0;
-  return list[n % list.length];
-}
 
 export function deviceFingerprintForSeed(seed) {
   const key = String(seed || "").trim();
   if (!key) return null;
   const hex = createHash("sha256").update(key).digest("hex");
-  const [screenWidth, screenHeight] = pickBySeed(hex, 0, MAC_SCREENS);
+  const profile = MAC_DEVICE_PROFILES[parseInt(hex.slice(0, 8), 16) % MAC_DEVICE_PROFILES.length];
   return {
-    screenWidth,
-    screenHeight,
-    hardwareConcurrency: pickBySeed(hex, 4, HW_CONCURRENCY),
-    deviceMemory: pickBySeed(hex, 8, DEVICE_MEMORY),
-    jsHeapSizeLimit: pickBySeed(hex, 12, JS_HEAP),
+    deviceModel: profile.model,       // informational (diagnostics/logs), harmless on the wire
+    screenWidth: profile.screenWidth,
+    screenHeight: profile.screenHeight,
+    hardwareConcurrency: profile.cores,
+    deviceMemory: 8,                  // Chrome caps navigator.deviceMemory at 8; every 8GB+ Mac reports 8
+    jsHeapSizeLimit: profile.heap,
     canvasSeed: hex.slice(0, 16),
   };
 }

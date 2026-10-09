@@ -69,14 +69,12 @@ for (const email of EMAILS) {
 {
   const fp = buildPerAccountFingerprint({ oaiDeviceId: oaiDeviceIdFromEmail("probe@example.com") });
   const script = buildInitScript(fp);
+  // WebGL vendor/renderer, Intl và userAgent nay được init script chỉnh có chủ đích
+  // để khớp máy Mac thật; các mục dưới đây vẫn phải để nguyên.
   const forbidden = [
-    "UNMASKED_RENDERER_WEBGL",
-    "UNMASKED_VENDOR_WEBGL",
     "WEBGL_debug_renderer_info",
     "navigator.platform",
     "screen.width",
-    "Intl.DateTimeFormat",
-    "navigator.userAgent",
     "navigator.vendor",
   ];
   for (const needle of forbidden) {

@@ -1,5 +1,24 @@
 # 更新日志
 
+## v1.7.0 - 2026-10-09
+
+### 新增
+
+- 引入 refresh/verify 分路由策略（`chooseRefreshLane`）：注册始终走浏览器；刷新按账号来源 + 签约时长（默认 60 天）自动决定走浏览器全量验证还是 TLS 刷新令牌。详见 `docs/lane-routing.md`。
+- 任务卡片新增“强制浏览器验证”按钮（单条 & 批量），一次性绕过 60 天与来源策略，强制启动浏览器完整验证流程。对应接口 `POST /api/jobs/:id/force-browser-verify` 与 `POST /api/jobs/force-browser-verify-batch`。
+- 账号列表新增 Lane 徽章，显示下一次刷新/再授权会走的通道（浏览器 / TLS 刷新 / 外部导入 / 强制浏览器）。
+- 新环境变量 `TOSUB2_REFRESH_BROWSER_AGE_DAYS`（默认 60），用于调整 TLS 刷新的年龄门槛；`TOSUB2_ALLOW_TLS_SIGNUP=1` 允许开发环境临时让注册走 TLS。
+
+### 调整
+
+- `TOSUB2_SIGNUP_BACKEND` 对注册不再生效（已标注 deprecated），仅作为内部回退标签；注册强制 `browser`。
+- 刷新失败自动回退（`fallbackFromRefresh`）会设置 `force_browser_verify_requested` 标记并切换至浏览器通道，完成后自动清除。
+
+### 数据库
+
+- 迁移 `004_job_source_and_signup_completed_at`：为 `jobs` 表新增 `source`（`system` / `external`，默认 `system`）与 `signup_completed_at`，并对 `result_saved=1 AND output_path IS NOT NULL` 的历史记录按 `COALESCE(registered_at, completed_at, updated_at)` 回填 `signup_completed_at`，附带 `idx_jobs_source` 与 `idx_jobs_signup_completed_at` 索引。
+- 对应持久化：`saveJobMetadata` 写入三个新字段，`restoreJobFromMetadata` 通过 `restoredLaneState` 恢复，确保重启后策略不丢失。
+
 ## v1.6.2 - 2026-08-20
 
 ### 新增

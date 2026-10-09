@@ -336,7 +336,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   border-radius: 6px;
   font-size: 13px;
 }
-.global-success span { flex: 1; }
+.global-success span { flex: 1; white-space: pre-wrap; }
 .global-success button { display: grid; place-items: center; padding: 4px; border: 0; background: transparent; color: inherit; cursor: pointer; }
 
 .selection-toolbar {
@@ -404,7 +404,10 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .stop-all-button:hover:not(:disabled) { color: #fff; background: var(--danger); border-color: var(--danger); }
 
 .table-frame { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 7px; }
-table { width: 100%; min-width: 1740px; border-collapse: collapse; table-layout: fixed; }
+/* Trước đây min-width 1740 bắt table luôn rộng, container 1481 → overflow 259 ép
+ * horizontal scroll + nút cuối row bị cắt. Hạ xuống 1420 vừa đủ fit text 7 cột
+ * tối thiểu (icon-only ở nút dài nhất). Nếu container < 1420 vẫn scroll. */
+table { width: 100%; min-width: 1420px; border-collapse: collapse; table-layout: fixed; }
 th {
   height: 42px;
   padding: 0 16px;
@@ -478,6 +481,11 @@ tbody tr:last-child td { border-bottom: 0; }
 .account-cell .mail-mode.password-mode { color: var(--blue); background: var(--blue-soft); }
 .account-cell .mail-mode.unknown-mode { color: var(--amber); background: var(--amber-soft); }
 .account-cell .mail-mode.sub2api-uploaded { color: var(--indigo); background: var(--indigo-soft); }
+/* Icon-only compact variant: khi badge chỉ có icon (không text), thắt padding
+   để không chiếm chỗ ngang. Dùng cho LoginMethodBadge sau khi bỏ text để
+   tránh đè cột action khi acc đủ 3 phương thức login (pass + OTP + 2FA). */
+.account-cell .mail-mode.login-icons { padding: 3px 5px; gap: 3px; }
+.status-cell .mail-mode.login-icons { padding: 3px 5px; gap: 3px; }
 
 .status-badge {
   min-height: 25px;
@@ -504,6 +512,21 @@ tbody tr:last-child td { border-bottom: 0; }
 .status-badge.refreshing { color: var(--blue); background: var(--blue-soft); }
 .status-badge.totp_starting { color: var(--blue); background: var(--blue-soft); }
 .status-badge.password_add_starting { color: var(--blue); background: var(--blue-soft); }
+.status-badge.deactivated { color: var(--danger); background: var(--danger-soft); }
+
+/* Dòng tài khoản vừa bị vô hiệu hoá — đang đếm ngược trước khi biến mất. */
+.job-row.deactivated-row { background: color-mix(in srgb, var(--danger) 6%, transparent); opacity: .85; }
+.job-row.deactivated-row:hover { background: color-mix(in srgb, var(--danger) 9%, transparent); }
+.deactivated-countdown {
+  margin-top: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--danger);
+  font-size: 11.5px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
 
 /* Status column: status badge on top, then login-method + "uploaded to Sub2API",
    stacked vertically so each label is clearly readable. */
@@ -526,7 +549,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .status-cell .mail-mode.unknown-mode { color: var(--amber); background: var(--amber-soft); }
 .status-cell .mail-mode.sub2api-uploaded { color: var(--indigo); background: var(--indigo-soft); }
 
-.step-cell { padding-top: 10px; padding-bottom: 10px; }
+.step-cell { padding-top: 10px; padding-bottom: 10px; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .prompt-line { color: #44504c; font-size: 12px; }
 .row-error { margin-top: 5px; color: var(--danger); font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; }
 .proxy-error-banner { margin-top: 6px; display: flex; align-items: center; gap: 6px; padding: 6px 8px; border-radius: 8px; background: color-mix(in srgb, var(--danger) 12%, transparent); color: var(--danger); font-size: 11.5px; font-weight: 600; line-height: 1.4; overflow-wrap: anywhere; }
@@ -717,6 +740,43 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .relogin-button:hover:not(:disabled) { color: #fff; background: var(--blue); border-color: var(--blue); }
 
+/* Force Browser Verify button — xem docs/lane-routing.md. Dùng tông amber để
+ * phân biệt với relogin (xanh) và regenerate (xanh lá); đây là override policy. */
+.verify-button {
+  height: 32px;
+  padding: 0 9px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  color: var(--amber);
+  background: var(--amber-soft);
+  border: 1px solid #e5d4a3;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.verify-button:hover:not(:disabled) { color: #fff; background: var(--amber); border-color: var(--amber); }
+.verify-button:disabled { opacity: 0.55; cursor: not-allowed; }
+/* Icon-only compact variant cho các action button có text dài (vd "Buộc xác
+ * minh qua trình duyệt", "Đăng nhập lại & ủy quyền"). Dùng cùng className
+ * `icon-only` để giữ màu/border theo button type; chỉ bỏ text + thắt padding
+ * thành square 32x32. Tooltip (title) + aria-label giữ cho operator hover. */
+.row-actions > button.icon-only {
+  width: 32px;
+  padding: 0;
+  gap: 0;
+}
+
+/* Lane badge — hiển thị lane sẽ dùng cho lần refresh/regenerate tiếp theo
+ * (khớp chooseRefreshLane trong src/console-server.mjs). */
+.account-cell .mail-mode.lane-badge-browser { color: var(--amber); background: var(--amber-soft); }
+.account-cell .mail-mode.lane-badge-tls { color: var(--green); background: var(--green-soft, #e4f4ea); }
+.account-cell .mail-mode.lane-badge-external { color: var(--indigo); background: var(--indigo-soft); }
+.account-cell .mail-mode.lane-badge-force { color: var(--danger); background: var(--danger-soft); }
+
 .log-row td { padding: 0 16px 16px; background: #fbfcfb; }
 .log-panel { border: 1px solid #dbe1de; border-radius: 6px; overflow: hidden; background: #101815; }
 .log-title { height: 34px; padding: 0 12px; display: flex; align-items: center; gap: 6px; color: #d8e1dd; border-bottom: 1px solid #29332f; font-size: 11px; font-weight: 700; }
@@ -875,10 +935,10 @@ tbody tr:last-child td { border-bottom: 0; }
 .proxy-thead,
 .proxy-row-main {
   display: grid;
-  grid-template-columns: 92px minmax(0, 1fr) 150px 116px 92px 110px 40px;
+  grid-template-columns: minmax(220px, 1fr) 142px 108px 90px 128px 70px 32px;
   align-items: center;
-  gap: 12px;
-  padding: 12px 16px;
+  gap: 8px;
+  padding: 12px 14px;
 }
 .proxy-filters { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
 .proxy-chip {
@@ -891,16 +951,17 @@ tbody tr:last-child td { border-bottom: 0; }
 .proxy-chip .cnt { font-variant-numeric: tabular-nums; opacity: .7; }
 .proxy-chip.active .cnt { opacity: .85; }
 .proxy-old {
-  display: inline-block; margin-left: 8px; font-size: 10.5px; font-weight: 600;
+  display: inline-block; font-size: 10.5px; font-weight: 600;
   padding: 1px 7px; border-radius: 999px; background: #eef1f0; color: var(--muted);
   vertical-align: middle;
 }
 .proxy-domain-tag {
-  display: inline-block; margin-left: 8px; font-size: 10.5px; font-weight: 600;
+  display: inline-block; font-size: 10.5px; font-weight: 600;
   max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   padding: 1px 8px; border-radius: 999px; background: rgba(18, 113, 91, .12); color: var(--green);
   vertical-align: middle;
 }
+.proxy-ipcell .proxy-pill { font-size: 10.5px; padding: 2px 8px; }
 
 /* Cấu hình proxy: khu "Gán proxy riêng theo domain" trong hộp thoại cấu hình */
 .domain-proxy-section { display: flex; flex-direction: column; gap: 10px; }
@@ -966,21 +1027,67 @@ tbody tr:last-child td { border-bottom: 0; }
 .proxy-pill.http { background: var(--blue-soft); color: var(--blue); }
 .proxy-pill.ok { background: var(--green-soft); color: var(--green); }
 .proxy-pill.down { background: var(--danger-soft); color: var(--danger); }
-.proxy-ipcell { min-width: 0; }
-.proxy-ipcell .addr { font-family: ui-monospace, Menlo, monospace; font-size: 13px; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.proxy-ipcell { min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 5px; }
+.proxy-ipcell-top { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; max-width: 100%; min-width: 0; }
+.proxy-ipcell .addr {
+  display: inline-block; max-width: 100%;
+  font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; font-weight: 600;
+  color: var(--ink); letter-spacing: 0;
+  padding: 3px 8px; border-radius: 6px;
+  background: #eef2f0; border: 1px solid #e2e8e5;
+  overflow: visible; white-space: nowrap;
+}
 .proxy-ipcell .exit { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+/* Cột "IP ra" (出口 IP) — IP thực đi ra sau khi qua proxy; nổi bật, dễ đọc, có nền nhẹ. */
+.proxy-exitcell { min-width: 0; display: flex; align-items: center; }
+.proxy-exitcell .exit-ip {
+  display: inline-block; max-width: 100%;
+  font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; font-weight: 600;
+  color: var(--green); letter-spacing: .01em;
+  padding: 3px 9px; border-radius: 7px;
+  background: var(--green-soft);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.proxy-exitcell.down .exit-err {
+  display: inline-block; max-width: 100%;
+  font-size: 11.5px; font-weight: 600; color: var(--danger);
+  padding: 3px 9px; border-radius: 7px; background: var(--danger-soft);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.proxy-exitcell .exit-dash { font-size: 13px; color: var(--muted); opacity: .55; padding-left: 2px; }
 .proxy-remain { font-size: 13px; font-variant-numeric: tabular-nums; color: var(--ink); }
 .proxy-remain small { color: var(--muted); font-weight: 400; }
-/* Số tài khoản bị vô hiệu hoá (ban) trên IP đó: 0 = xám · 1–4 = vàng · >=ngưỡng = đỏ */
-.proxy-disabled {
-  display: inline-flex; align-items: center; justify-content: center; gap: 4px;
-  justify-self: center; min-width: 34px; padding: 2px 9px; border-radius: 999px;
-  font-size: 12.5px; font-weight: 700; font-variant-numeric: tabular-nums;
+/* Cột "Bị vô hiệu" — 3 tham số xếp dọc:
+   (1) pd-flag: đã đổi IP chưa (sạch/còn cháy/chưa rõ)
+   (2) pd-stat "IP mới": số email IP ra hiện tại đã làm vô hiệu
+   (3) pd-stat "Tổng": tổng email bị vô hiệu bởi proxy này (trọn đời).
+   Màu số: 0 = xám · 1..ngưỡng-1 = vàng · >=ngưỡng = đỏ. */
+.proxy-ban {
+  justify-self: center; display: flex; flex-direction: column; align-items: center; gap: 4px;
+  min-width: 0;
+}
+.pd-flag {
+  display: inline-flex; align-items: center; gap: 3px; white-space: nowrap;
+  font-size: 10.5px; font-weight: 700; letter-spacing: .01em;
+  padding: 1px 8px; border-radius: 999px;
+}
+.pd-flag.yes { background: var(--green-soft); color: var(--green); }
+.pd-flag.no  { background: var(--danger-soft); color: var(--danger); }
+.pd-flag.unk { background: #eef1f0; color: var(--muted); }
+.pd-flag.err { background: var(--amber-soft); color: var(--amber); }
+.pd-stats { display: flex; flex-wrap: wrap; justify-content: center; gap: 5px; }
+.pd-stat {
+  display: inline-flex; align-items: baseline; gap: 3px; white-space: nowrap;
+  font-size: 12px; font-weight: 700; font-variant-numeric: tabular-nums;
+  padding: 1px 7px; border-radius: 999px;
   background: #eef1f0; color: var(--muted);
 }
-.proxy-disabled small { font-weight: 400; }
-.proxy-disabled.warn { background: var(--amber-soft); color: var(--amber); }
-.proxy-disabled.burn { background: var(--danger-soft); color: var(--danger); }
+.pd-stat em {
+  font-style: normal; font-size: 9px; font-weight: 700; letter-spacing: .03em;
+  text-transform: uppercase; opacity: .7;
+}
+.pd-stat.warn { background: var(--amber-soft); color: var(--amber); }
+.pd-stat.burn { background: var(--danger-soft); color: var(--danger); }
 /* Nhãn "cần đổi IP" ngay cạnh địa chỉ IP đã cháy */
 /* Chip "checking" cạnh địa chỉ IP: trạng thái của IP RA THỰC đang ra */
 .proxy-check {
@@ -1040,6 +1147,8 @@ tbody tr:last-child td { border-bottom: 0; }
   .proxy-stats { grid-template-columns: 1fr; }
   .proxy-thead { display: none; }
   .proxy-row-main { grid-template-columns: 1fr 1fr; gap: 8px; }
+  .proxy-exitcell { grid-column: 1 / -1; }
+  .proxy-exitcell .exit-ip, .proxy-exitcell .exit-err { max-width: 100%; }
 }
 
 .sub2api-config-grid { margin-top: 18px; }

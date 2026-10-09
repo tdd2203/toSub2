@@ -28,6 +28,8 @@ const child = spawn(process.execPath, [
     ONBOARDING_OUTPUT_ROOT: outputRoot,
     TOSUB2_MAC_CREDENTIAL_ROOT: path.join(outputRoot, "test-mac-credentials"),
     ONBOARDING_PROTOCOL_SCRIPT: path.join(projectRoot, "test", "mock-protocol-login.mjs"),
+    TOSUB2_SIGNUP_BACKEND: "tls",
+    TOSUB2_ALLOW_TLS_SIGNUP: "1",
     PROXY_SIGNUP_WINDOW_MS: String(WINDOW_MS),
     PROXY_SIGNUP_MAX_PER_WINDOW: String(MAX_PER_WINDOW),
     // The throttle keys by real exit IP; this seam maps each test proxy host to a

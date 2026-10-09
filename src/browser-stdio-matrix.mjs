@@ -163,6 +163,16 @@ export const WORKER_MARKERS = {
     meaning: "operational — this run-mode is v1-unsupported for the browser lane",
     domHint: "--setup-totp or --add-password were requested",
   },
+  accountPasswordAutoset: {
+    // Format: "[account] auto-generated password=<16-char>" — console-server
+    // scanner saves <value> to credential store so future relogin auto-fills.
+    // Fires after /create-account/password OR /reset-password/new-password
+    // OR /log-in/password (fallback) submits a deterministic password.
+    key: "accountPasswordAutoset",
+    marker: "[account] auto-generated password=",
+    meaning: "worker auto-filled a deterministic password (no stored) — save to credentials",
+    domHint: "after fillPasswordInputs on create-account/reset-password/log-in password pages",
+  },
 };
 
 // Helper: emit a marker as a single stdout line, flushing immediately.

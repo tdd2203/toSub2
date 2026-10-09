@@ -41,6 +41,10 @@ const child = spawn(process.execPath, [
     TOSUB2_MAC_CREDENTIAL_ROOT: path.join(outputRoot, "test-mac-credentials"),
     ONBOARDING_PROTOCOL_SCRIPT: path.join(projectRoot, "test", "mock-queue-protocol.mjs"),
     TOSUB2_TLS_PROFILE: "chrome142",
+    // Dev override: lane routing policy forces browser signup, but these smoke
+    // tests exercise the TLS mock. Allow TLS signup here only.
+    TOSUB2_SIGNUP_BACKEND: "tls",
+    TOSUB2_ALLOW_TLS_SIGNUP: "1",
   },
   stdio: ["ignore", "pipe", "pipe"],
   windowsHide: true,

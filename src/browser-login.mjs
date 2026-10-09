@@ -35,6 +35,9 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import net from "node:net";
+import tls from "node:tls";
+import http from "node:http";
 import readline from "node:readline";
 import { pathToFileURL, fileURLToPath } from "node:url";
 
@@ -71,6 +74,11 @@ const SIGNUP_URL_CANDIDATES = [
 const MANUAL_ASSIST = process.env.TOSUB2_BROWSER_MANUAL === "1" || process.argv.includes("--manual-assist");
 const PAGE_IDLE_TIMEOUT_MS = MANUAL_ASSIST ? 1_800_000 : 60_000;
 const INPUT_TIMEOUT_MS = MANUAL_ASSIST ? 1_800_000 : 300_000;
+// Adaptive loop whole-session cap: email OTP + profile + password + phone +
+// OAuth tổng cần 3-5 phút ổn định. 60s cũ gây CODEX_CALLBACK_TIMEOUT ngay
+// khi handler nào mất 10-20s (PROFILE waitForURL, SMS poll). 10 min cho
+// non-manual, 30 min cho manual-assist.
+const ADAPTIVE_LOOP_TIMEOUT_MS = MANUAL_ASSIST ? 1_800_000 : 10 * 60_000;
 
 // auth.openai.com signup selectors.
 //
@@ -153,6 +161,9 @@ const SELECTORS = {
     'button:has-text("Gửi lại")',
     'a:has-text("Resend")',
     'a:has-text("Gửi lại")',
+    '[data-testid*="resend" i]',
+    '[role="button"]:has-text("Resend")',
+    '[role="button"]:has-text("Gửi lại")',
   ],
   passwordInput: [
     'input[type="password"]',
@@ -645,13 +656,20 @@ async function handleSignup(args) {
 
     await fillAndSubmit(session.page, selectorFor("emailInput"), args.email, selectorFor("continueButton"));
     emit(WORKER_MARKERS.emailOtpPageReached);
+    console.log(`[email-otp-requested-at] ${new Date().toISOString()}`);
     await inspectPauseIfRequested(args, session.page, "after-email-submit");
 
-    // 2. Email OTP — ask console-server, type into DOM, submit.
+    // 2. Email OTP — ask console-server, type into DOM, submit. checkpointSavedEmail
+    // chỉ emit SAU khi submit thành công (URL rời /email-verification).
     const emailOtp = await promptForInput("emailOtpPrompt");
-    emit(WORKER_MARKERS.checkpointSavedEmail);
     await fillAndSubmit(session.page, selectorFor("emailOtpInput"), emailOtp, selectorFor("continueButton"));
-    await saveCheckpoint(checkpointPath, { stage: "email_verified", oai_device_id: session.oaiDeviceId });
+    try {
+      await session.page.waitForURL((u) => !/\/email-verification/.test(String(u)), { timeout: 15_000 });
+      emit(WORKER_MARKERS.checkpointSavedEmail);
+      await saveCheckpoint(checkpointPath, { stage: "email_verified", oai_device_id: session.oaiDeviceId });
+    } catch {
+      console.log("[email-otp-rejected] 邮箱验证码错误，请重新输入，或输入 r 重新发送。");
+    }
     await inspectPauseIfRequested(args, session.page, "after-email-otp");
 
     // 3. Password (OpenAI sometimes asks for a new password at signup).
@@ -664,7 +682,7 @@ async function handleSignup(args) {
     }
 
     // 4. Account profile — name + birthdate.
-    const profile = generateInlineProfile();
+    const profile = generateInlineProfile(session.oaiDeviceId);
     emit(WORKER_MARKERS.sentinelProfilePrepare);
     const nameLocator = session.page.locator(selectorFor("nameInput")).first();
     if (await nameLocator.isVisible({ timeout: 30_000 }).catch(() => false)) {
@@ -736,7 +754,14 @@ async function handleSignup(args) {
     await writeJsonAtomic(sub2apiOut, sub2apiPayload);
     emit(WORKER_MARKERS.savedSub2api, sub2apiOut);
   } finally {
-    await session.close();
+    const forceExitTimer = setTimeout(() => {
+      try { if (process.stdout.write("")) process.stdout.end?.(); } catch {}
+      process.exit(0);
+    }, 8_000);
+    forceExitTimer.unref?.();
+    try { await session.close(); } catch { /* best-effort */ }
+    clearTimeout(forceExitTimer);
+    setTimeout(() => { process.exit(0); }, 500);
   }
 }
 
@@ -755,6 +780,7 @@ async function handleSignup(args) {
 
 const PAGE_KINDS = Object.freeze({
   LANDING: "landing",
+  ONBOARDING: "onboarding",
   LOGIN_EMAIL: "login-email",
   SIGNUP_EMAIL: "signup-email",
   EMAIL_OTP: "email-otp",
@@ -765,6 +791,7 @@ const PAGE_KINDS = Object.freeze({
   OAUTH_CONSENT: "oauth-consent",
   WORKSPACE_SELECT: "workspace-select",
   SESSION_EXPIRED: "session-expired",
+  ACCOUNT_DEACTIVATED: "account-deactivated",
   DONE: "done",
   WRONG_OAUTH: "wrong-oauth",
   UNKNOWN: "unknown",
@@ -792,19 +819,25 @@ async function detectPageKind(page) {
   const corpus = `${url} | ${title} | ${headings} | ${bodyPrefix}`.toLowerCase();
 
   if (/\/oauth\/authorize|\/consent|\/sign-in-with-chatgpt\/codex/.test(url)) return PAGE_KINDS.OAUTH_CONSENT;
+  // Cloudflare Turnstile challenge page (/api/accounts/logout + anti-bot pages).
+  // Logout endpoint luôn bị Cloudflare gate → worker không thể bypass tự động.
+  // Trả UNKNOWN để adaptive loop sameKindCount>=2 → navigate oauth.authUrl recover
+  // thay vì misroute về email-otp (body có "xác minh"/"verification" keyword).
+  if (/\/api\/accounts\/logout/.test(url) || /just a moment|cloudflare|thực hiện xác minh bảo mật/i.test(title + " " + headings)) {
+    return PAGE_KINDS.UNKNOWN;
+  }
   // Session expired page tại /create-account: OpenAI invalidate session cookie
   // sau khi worker trước đó bị abort. Page chỉ hiển thị "Your session has
   // ended" + nút "Log in", KHÔNG có email input → SIGNUP_EMAIL handler loop
   // 30s timeout. Issue traced job 90884d3f. Route riêng → handler click Log in
   // để tiếp tục flow bình thường.
   if (/\/create-account/.test(url) && /session has ended|session expired|phiên.*hết hạn|phiên đã kết thúc/i.test(corpus)) return PAGE_KINDS.SESSION_EXPIRED;
-  // chatgpt.com/onboarding: multi-step survey ("What kind of work do you do?",
-  // "Tell us about you", …). SPA pre-renders future steps including an "about
-  // you" fragment → corpus matches /about you/ at line 816 and classifier
-  // misroute to PROFILE in a loop (handler re-runs forever on same URL).
-  // Short-circuit here as UNKNOWN; adaptive loop sameKindCount>=2 then navigates
-  // to Codex OAuth URL to bypass onboarding entirely. Issue traced job 90884d3f.
-  if (/^https?:\/\/chatgpt\.com\/onboarding/.test(url)) return PAGE_KINDS.UNKNOWN;
+  // chatgpt.com/onboarding: multi-step survey ("Bạn làm trong lĩnh vực nào?",
+  // "Tell us about you", …). Route tới ONBOARDING handler để click đại 1 option
+  // + Continue → tiến tới trang kế hoặc chatgpt.com main → OAuth loopback catch
+  // code → DONE. Tránh bypass OAuth navigate (navigatedToOauth flag chỉ fire 1
+  // lần, không recover nếu stuck sau tick 2).
+  if (/^https?:\/\/chatgpt\.com\/onboarding/.test(url)) return PAGE_KINDS.ONBOARDING;
   // chatgpt.com root MUST short-circuit BEFORE any text/keyword checks: the
   // landing SPA pre-renders a hidden modal with headings "Welcome back" and
   // "Log in or sign up" + a hidden <input id=mobile-auth-email name=login_hint>.
@@ -825,11 +858,27 @@ async function detectPageKind(page) {
     return PAGE_KINDS.LANDING;
   }
   if (/\/choose-an-account|\/workspace\/select|choose an account|chọn tài khoản|workspace/.test(corpus)) return PAGE_KINDS.WORKSPACE_SELECT;
+  // Account deactivated (OpenAI đã xoá/vô hiệu hóa tài khoản): URL vẫn
+  // /email-verification nhưng body có "error_code: account_deactivated" / "Lỗi
+  // xác thực" / "đã bị xóa hoặc vô hiệu hóa". Phải short-circuit TRƯỚC
+  // EMAIL_OTP branch để adaptive loop không re-submit OTP vô ích. Trigger
+  // isPermanentAccountFailure path trong server.
+  if (/account_deactivated|account_deleted|user_deactivated|user_deleted|đã bị xóa hoặc vô hiệu hóa|đã bị vô hiệu hóa|đã bị xóa|account has been (?:deleted|deactivated|suspended|disabled)|do not have an account because it has been (?:deleted|deactivated)/i.test(corpus)) {
+    return PAGE_KINDS.ACCOUNT_DEACTIVATED;
+  }
   // URL-first precedence cho các page có path cụ thể — tránh substring collision
   // với landing/signup corpus check.
   if (/\/create-account\/password|\/log-in\/password|\/account\/password/.test(url)) return PAGE_KINDS.PASSWORD;
   if (/\/email-verification/.test(url)) return PAGE_KINDS.EMAIL_OTP;
   if (/\/about-you/.test(url)) return PAGE_KINDS.PROFILE;
+  // /log-in URL check SỚM: trang này có nút "Tiếp tục với số điện thoại" →
+  // body chứa "số điện thoại" → sẽ misroute PHONE_NUMBER ở line 849 nếu
+  // không short-circuit ở đây. Issue trace job c9b33fc1.
+  if (/\/log-in(\/|$|\?|#)/.test(url)) return PAGE_KINDS.LOGIN_EMAIL;
+  // Tương tự /create-account URL cho signup flow — trang có nhiều keyword
+  // Vietnamese dễ misroute (sẽ tiếp tục fallthrough nếu cần SIGNUP_EMAIL kind
+  // riêng cho session_expired, logic đó đã handle qua regex sớm hơn).
+  if (/\/create-account(\/|$|\?|#)/.test(url)) return PAGE_KINDS.SIGNUP_EMAIL;
   if (/\/add-phone|\/phone-number|\/phone-verification/.test(url)) {
     // /phone-verification URL luôn là OTP step. /add-phone có thể là input hoặc
     // verify tùy state. Dùng URL path + body keywords để phân biệt.
@@ -1058,6 +1107,49 @@ const PAGE_HANDLERS = {
     await input.fill(args.email);
     await clickFormSubmit(session.page);
   },
+  async [PAGE_KINDS.ONBOARDING](session) {
+    // chatgpt.com/onboarding survey multi-step. Click skip liên tục trong 1
+    // handler call cho đến khi URL rời /onboarding (tránh chờ adaptive loop
+    // tick 1.5s giữa mỗi câu). Giới hạn 15 round để không treo nếu stuck.
+    console.log("[onboarding] handler entering, url=" + session.page.url());
+    await session.page.waitForTimeout(600);
+    for (let round = 0; round < 15; round += 1) {
+      const beforeUrl = session.page.url();
+      if (!/\/onboarding/.test(beforeUrl)) {
+        console.log(`[onboarding] exited at round ${round}, url=${beforeUrl}`);
+        return;
+      }
+      const picked = await clickOneOnboardingOption(session);
+      if (!picked) {
+        // Thử click Continue/Tiếp tục nếu có (step chỉ có nút submit, không option)
+        try {
+          const cont = session.page.getByRole("button", { name: /^(tiếp tục|continue|next|submit|đồng ý|xong|done)$/i }).first();
+          if (await cont.isVisible({ timeout: 1200 }).catch(() => false)) {
+            await cont.click({ timeout: 3000, force: true }).catch(() => {});
+            console.log(`[onboarding] round ${round}: clicked Continue`);
+            await session.page.waitForTimeout(900);
+            continue;
+          }
+        } catch { /* next */ }
+        console.log(`[onboarding] round ${round}: no option found, break`);
+        break;
+      }
+      await session.page.waitForTimeout(900);
+    }
+  },
+  async [PAGE_KINDS.ACCOUNT_DEACTIVATED](session) {
+    // Trích error_code + request_id (nếu có) để log + fail job.
+    const info = await session.page.evaluate(() => {
+      const main = document.querySelector('main') || document.body;
+      const text = (main.innerText || "").slice(0, 1500);
+      const codeMatch = text.match(/error_code:\s*(\S+)/i);
+      const reqMatch = text.match(/request_id:\s*([a-f0-9-]+)/i);
+      return { code: codeMatch ? codeMatch[1] : "account_deactivated", request_id: reqMatch ? reqMatch[1] : null, text };
+    }).catch(() => ({ code: "account_deactivated", request_id: null, text: "" }));
+    const reason = `${info.code}: OpenAI đã xóa hoặc vô hiệu hóa tài khoản này` + (info.request_id ? ` (request_id=${info.request_id})` : "");
+    console.log(`[error] ${reason}`);
+    throw new Error(`ACCOUNT_DEACTIVATED: ${reason}`);
+  },
   async [PAGE_KINDS.SESSION_EXPIRED](session) {
     // Page: /create-account với "Your session has ended" + nút "Log in" single.
     // Click Log in để OpenAI điều hướng về /log-in (clean session), classifier
@@ -1089,6 +1181,8 @@ const PAGE_HANDLERS = {
     await input.waitFor({ state: "visible", timeout: 30_000 });
     await input.fill(args.email);
     await clickFormSubmit(session.page);
+    // Signal mail-poller: OTP vừa được request lúc này; email cũ hơn → ignore.
+    console.log(`[email-otp-requested-at] ${new Date().toISOString()}`);
   },
   async [PAGE_KINDS.EMAIL_OTP](session) {
     await waitForReactReady(session.page);
@@ -1096,34 +1190,208 @@ const PAGE_HANDLERS = {
     const otp = await promptForInputOrPageAdvance("emailOtpPrompt", session.page, /\/email-verification/, { timeoutMs: 300_000 });
     if (!otp) return;
     // "r" từ console-server = resend_email. Click Resend button rồi return,
-    // next tick sẽ re-prompt stdin cho OTP mới.
+    // next tick sẽ re-prompt stdin cho OTP mới. Chỉ emit requested-at khi click
+    // thật sự thành công — mail-poller dùng mốc này cutoff email cũ.
     if (String(otp).trim().toLowerCase() === "r") {
       const sel = selectorFor("resendEmailOtpButton");
+      let clicked = false;
       try {
         const btn = session.page.locator(sel).first();
         if (await btn.isVisible({ timeout: 3000 }).catch(() => false)) {
           await btn.click({ timeout: 5000 });
+          clicked = true;
+        } else {
+          // Fallback: role-based match (anchor/text có thể là <div role="button">)
+          const roleBtn = session.page.getByRole("button", { name: /resend|gửi lại|resend email|gửi lại email/i }).first();
+          const roleLink = session.page.getByRole("link", { name: /resend|gửi lại|resend email|gửi lại email/i }).first();
+          for (const cand of [roleBtn, roleLink]) {
+            if (await cand.isVisible({ timeout: 1500 }).catch(() => false)) {
+              await cand.click({ timeout: 5000 }).catch(() => {});
+              clicked = true;
+              break;
+            }
+          }
         }
+      } catch { /* best-effort */ }
+      if (clicked) {
+        console.log(`[email-otp-requested-at] ${new Date().toISOString()}`);
+      } else {
+        console.log("[email-otp-resend-failed] Gửi lại email button không visible/clickable.");
+      }
+      return;
+    }
+    // Ưu tiên CSS selector từ SELECTORS.emailOtpInput (input[name=code], one-time-code,
+    // v.v.) — parity với legacy flow L653. getByLabel KHÔNG match placeholder-only
+    // input (OpenAI render <input name=code placeholder=Mã> không có <label>), nên
+    // chỉ dùng getByLabel làm fallback cho các UI biến thể có label.
+    let input = session.page.locator(selectorFor("emailOtpInput")).first();
+    let visible = await input.isVisible({ timeout: 10_000 }).catch(() => false);
+    if (!visible) {
+      input = session.page.getByLabel(/mã|code|verification|otp/i).first();
+      visible = await input.isVisible({ timeout: 3000 }).catch(() => false);
+    }
+    if (!visible) {
+      // Dump DOM để debug — selector miss khi OpenAI đổi UI.
+      try {
+        const dumpDir = path.join(process.cwd(), "tmp", "email-otp-debug");
+        await fs.mkdir(dumpDir, { recursive: true });
+        const stamp = String(Date.now());
+        const htmlPath = path.join(dumpDir, `email-otp-miss-${stamp}.html`);
+        const html = await session.page.content();
+        await fs.writeFile(htmlPath, html, "utf8");
+        console.log(`[email-otp] input locator MISS — snapshot ${htmlPath}; otp '${otp}' bị bỏ qua.`);
       } catch { /* best-effort */ }
       return;
     }
-    emit(WORKER_MARKERS.checkpointSavedEmail);
-    const input = session.page.getByLabel(/mã|code|verification|otp/i).first();
-    if (!(await input.isVisible({ timeout: 5000 }).catch(() => false))) return;
     await reactSafeFill(input, otp);
     await clickFormSubmit(session.page);
+    // Chờ URL rời /email-verification (OpenAI accept code → điều hướng sang
+    // password/profile/phone). Timeout = reject → emit [email-otp-rejected] để
+    // console-server biết user cần nhập lại.
+    try {
+      await session.page.waitForURL((u) => !/\/email-verification/.test(String(u)), { timeout: 15_000 });
+      emit(WORKER_MARKERS.checkpointSavedEmail);
+    } catch {
+      console.log("[email-otp-rejected] 邮箱验证码错误，请重新输入，或输入 r 重新发送。");
+    }
   },
   async [PAGE_KINDS.PASSWORD](session) {
     await waitForReactReady(session.page);
-    const pwd = process.env.CHATGPT_NEW_PASSWORD || process.env.CHATGPT_LOGIN_PASSWORD || "";
-    if (!pwd) throw new Error("MISSING_PASSWORD");
-    const input = session.page.getByLabel(/mật khẩu|password/i).first();
-    await reactSafeFill(input, pwd);
+    const url = session.page.url();
+    // 3 nhánh URL password của OpenAI:
+    //  - /create-account/password: signup tạo mật khẩu mới (có sẵn).
+    //  - /reset-password/new-password: sau quên-mật-khẩu, cần đặt pass mới
+    //    (CÓ 2 input: "Mật khẩu mới" + "Nhập lại mật khẩu mới").
+    //  - /log-in/password: đăng nhập account có sẵn.
+    // STRICT auto-flow policy (per [[feedback_password_handler_fill_dummy]]):
+    // KHÔNG throw MISSING_PASSWORD cho email-OTP acc không có pass stored —
+    // auto-generate deterministic bằng oai-did, điền vào, submit. Nếu OpenAI
+    // từ chối (pass trùng, pass yếu...), adaptive loop sẽ handle. Pass mới
+    // emit marker `[account] auto-generated password=...` để console-server
+    // lưu vào credential store cho relogin tương lai auto-fill.
+    const isCreateAccount = /\/create-account\/password/.test(url);
+    const isResetPassword = /\/reset-password\/new-password/.test(url);
+    const isLogInPassword = /\/log-in\/password/.test(url);
+    const needsNewPassword = isCreateAccount || isResetPassword;
+    let pwd = process.env.CHATGPT_NEW_PASSWORD || process.env.CHATGPT_LOGIN_PASSWORD || "";
+    let autoGenerated = false;
+    if (!pwd) {
+      pwd = generatePasswordForAccount(session.oaiDeviceId);
+      autoGenerated = true;
+      const label = isCreateAccount ? "/create-account/password" : (isResetPassword ? "/reset-password/new-password" : "/log-in/password (fallback)");
+      console.log(`[password] ${label} reached — auto-generated 16-char password (deterministic by oai-did).`);
+    }
+    // Safeguard: nếu /log-in/password + autoGenerated + đã visit >=2 lần (lần
+    // trước submit bị OpenAI từ chối, URL vẫn /log-in/password) → có khả năng
+    // email-OTP acc chưa từng set password → chuyển qua "Đăng nhập bằng mã
+    // dùng một lần" (OTP button) thay vì cứ submit sai hoài làm OpenAI nghi.
+    session.__passwordVisits = (session.__passwordVisits || 0) + 1;
+    if (isLogInPassword && autoGenerated && session.__passwordVisits >= 2) {
+      console.log(`[password] auto-gen pass bị reject ${session.__passwordVisits - 1} lần → thử nút "Đăng nhập bằng mã dùng một lần"`);
+      const otpBtn = session.page.getByRole("button", { name: /mã dùng một lần|one.time code|sign.in with code|dùng mã/i }).first();
+      if (await otpBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+        await reactSafeClick(otpBtn).catch(() => {});
+        await session.page.waitForURL((u) => !/\/log-in\/password/.test(String(u)), { timeout: 6_000 }).catch(() => {});
+        console.log(`[password] clicked OTP button, url=${session.page.url()}`);
+        return;
+      }
+      console.log(`[password] OTP button không tìm thấy — fallback fill pass`);
+    }
+    // Selector mạnh: `input[type="password"]:visible` chuẩn hơn getByLabel vì
+    // OpenAI render floating label (không phải <label for>), getByLabel đôi khi
+    // miss hoặc map lên form wrapper.
+    let input = session.page.locator('input[type="password"]:visible').first();
+    if (!await input.isVisible({ timeout: 3000 }).catch(() => false)) {
+      input = session.page.getByLabel(/mật khẩu|password/i).first();
+    }
+    // Multi-strategy fill giống PROFILE: locator.fill() → keyboard.type → native
+    // setter + dispatch events. Verify giá trị sau mỗi strategy.
+    const readValue = async () => await input.evaluate((el) => el.value || "").catch(() => "");
+    try { await input.fill(pwd, { timeout: 3000 }); } catch { /* next */ }
+    let have = await readValue();
+    if (have !== pwd) {
+      try {
+        await input.click({ timeout: 3000, force: true }).catch(() => {});
+        await input.press("Control+a").catch(() => {});
+        await input.press("Delete").catch(() => {});
+        await session.page.keyboard.type(pwd, { delay: 40 });
+      } catch { /* next */ }
+      have = await readValue();
+    }
+    if (have !== pwd) {
+      await input.evaluate((el, val) => {
+        const proto = window.HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+        setter.call(el, val);
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        el.dispatchEvent(new Event("blur", { bubbles: true }));
+      }, pwd).catch(() => {});
+      have = await readValue();
+    }
+    console.log(`[password] fill final: ${have.length} chars (expected ${pwd.length})`);
+    // Trang /reset-password/new-password có 2 input: "Mật khẩu mới" + "Nhập
+    // lại mật khẩu mới". Fill cả 2 với cùng pass để OpenAI chấp nhận.
+    if (needsNewPassword) {
+      const confirmInput = session.page.locator('input[type="password"]:visible').nth(1);
+      if (await confirmInput.isVisible({ timeout: 1500 }).catch(() => false)) {
+        try { await confirmInput.fill(pwd, { timeout: 2000 }); } catch { /* best-effort */ }
+        const confirmHave = await confirmInput.evaluate((el) => el.value || "").catch(() => "");
+        if (confirmHave !== pwd) {
+          await confirmInput.evaluate((el, val) => {
+            const proto = window.HTMLInputElement.prototype;
+            const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+            setter.call(el, val);
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
+            el.dispatchEvent(new Event("blur", { bubbles: true }));
+          }, pwd).catch(() => {});
+        }
+        console.log(`[password] confirm input filled (reset/create flow)`);
+      }
+    }
+    // Dispatch Tab để trigger React blur + unlock submit button (OpenAI validate
+    // password-strength onBlur, nếu không blur button sẽ disabled).
+    await session.page.keyboard.press("Tab").catch(() => {});
+    await session.page.waitForTimeout(300);
     await clickFormSubmit(session.page);
+    try {
+      await session.page.waitForURL((u) => !/\/password/.test(String(u)), { timeout: 10_000 });
+      console.log(`[password] left /password, url=${session.page.url()}`);
+      // Submit success + password auto-generated → emit marker để console-server
+      // lưu pass vào credential store (relogin tiếp theo auto-fill từ env). Chỉ
+      // emit sau khi rời khỏi /password (nếu còn kẹt ở /password → có thể là
+      // OpenAI reject pass → không lưu nhầm pass sai).
+      if (autoGenerated) {
+        emit(WORKER_MARKERS.accountPasswordAutoset, pwd);
+      }
+    } catch {
+      console.log(`[password] stuck at /password after submit, trying Enter + reactSafeClick`);
+      await session.page.keyboard.press("Enter").catch(() => {});
+      try {
+        const cont = session.page.getByRole("button", { name: /^(tiếp tục|continue|next|submit)$/i }).first();
+        if (await cont.isVisible({ timeout: 1500 }).catch(() => false)) {
+          await reactSafeClick(cont);
+        }
+      } catch { /* best-effort */ }
+      const leftPassword = await session.page.waitForURL((u) => !/\/password/.test(String(u)), { timeout: 6_000 }).then(() => true).catch(() => false);
+      if (leftPassword && autoGenerated) {
+        emit(WORKER_MARKERS.accountPasswordAutoset, pwd);
+      }
+    }
   },
   async [PAGE_KINDS.PROFILE](session) {
     emit(WORKER_MARKERS.sentinelProfilePrepare);
-    const profile = generateInlineProfile(); // {name, birthdate:"YYYY-MM-DD"}
+    // Đóng tabs lạc (Terms/Privacy tab mở nhầm từ click sai) để tránh accumulate.
+    try {
+      const pages = session.context.pages();
+      for (const p of pages) {
+        if (p === session.page) continue;
+        const u = p.url();
+        if (/privacy|terms|chính sách|điều khoản/i.test(u)) await p.close().catch(() => {});
+      }
+    } catch { /* best-effort */ }
+    const profile = generateInlineProfile(session.oaiDeviceId); // deterministic per account
     // Thử getByLabel (ưu tiên), fallback getByPlaceholder, fallback input[type=text]:nth
     const findName = async () => {
       for (const build of [
@@ -1151,37 +1419,123 @@ const PAGE_HANDLERS = {
     const bYear = Number(profile.birthdate.slice(0, 4));
     const bMonth = Number(profile.birthdate.slice(5, 7));
     const bDay = Number(profile.birthdate.slice(8, 10));
-    const mmddyyyy = `${String(bMonth).padStart(2, "0")}${String(bDay).padStart(2, "0")}${bYear}`;
+    const mm = String(bMonth).padStart(2, "0");
+    const dd = String(bDay).padStart(2, "0");
+    const mmddyyyy = `${mm}${dd}${bYear}`;
+    const ddmmyyyy = `${dd}${mm}${bYear}`;
     // Fallback for age/birthday field — label-less floating label ở OpenAI
+    // VERIFY: candidate phải là <input>, không được là <form>/<div>/<label>
+    // (getByLabel đôi khi match aria-labelledby lên form container → tag=form).
+    const isInputElement = async (el) => {
+      try {
+        return await el.evaluate((node) => node.tagName && node.tagName.toLowerCase() === "input");
+      } catch { return false; }
+    };
     const findAge = async () => {
       for (const build of [
-        () => session.page.getByLabel(/họ sinh|birthday|birthdate|birth|date of birth|ngày sinh|tuổi|age/i).first(),
-        () => session.page.getByPlaceholder(/age|tuổi|birth|sinh|mm.?dd.?yyyy|dd.?mm.?yyyy/i).first(),
+        () => session.page.getByLabel(/birthday|birthdate|birth|date of birth|ngày sinh|ngày tháng năm sinh|năm sinh|sinh nhật|bao nhiêu tuổi|tuổi của bạn|tuổi|age/i).first(),
+        () => session.page.getByPlaceholder(/age|tuổi|birth|sinh|mm.?dd.?yyyy|dd.?mm.?yyyy|nn.?tt.?nnnn/i).first(),
+        // Fallback: input type=number visible (VN UI "Tuổi" thường là <input type="number">)
+        () => session.page.locator('input[type="number"]:visible').first(),
+        // Fallback: input[inputmode="numeric"] (nhiều UI dùng text + inputmode)
+        () => session.page.locator('input[inputmode="numeric"]:visible').first(),
         // Nth(1) = input thứ 2 trên trang (Full name là #1, Age/Birthday là #2)
         () => session.page.locator('input[type="text"]:visible, input[type="number"]:visible, input[type="tel"]:visible, input[type="date"]:visible, input:not([type]):visible').nth(1),
       ]) {
         try {
           const el = build();
-          if (await el.isVisible({ timeout: 2000 }).catch(() => false)) return el;
+          if (!await el.isVisible({ timeout: 2000 }).catch(() => false)) continue;
+          if (!await isInputElement(el)) continue; // skip <form>/<div>/<label>
+          return el;
         } catch { /* next */ }
       }
       return null;
     };
     const ageInput = await findAge();
+    if (!ageInput) {
+      // Dump visible inputs để debug — regex label miss khi OpenAI đổi UI copy
+      try {
+        const dumpDir = path.join(process.cwd(), "tmp", "profile-debug");
+        await fs.mkdir(dumpDir, { recursive: true });
+        const stamp = String(Date.now());
+        const metaPath = path.join(dumpDir, `profile-${stamp}.json`);
+        const visible = await session.page.evaluate(() => {
+          return [...document.querySelectorAll('input, button, [role="button"], label, h1, h2, h3')].slice(0, 60).map((el) => {
+            const r = el.getBoundingClientRect();
+            if (r.width === 0 && r.height === 0 && el.tagName !== 'LABEL') return null;
+            return {
+              tag: el.tagName.toLowerCase(),
+              type: el.getAttribute('type'),
+              id: el.id || null,
+              name: el.getAttribute('name'),
+              ariaLabel: el.getAttribute('aria-label'),
+              ariaLabelledby: el.getAttribute('aria-labelledby'),
+              placeholder: el.getAttribute('placeholder'),
+              label: (el.innerText || '').trim().slice(0, 100),
+            };
+          }).filter(Boolean);
+        });
+        await fs.writeFile(metaPath, `${JSON.stringify({ url: session.page.url(), visible }, null, 2)}\n`, "utf8");
+        console.log(`[profile] age input NOT found — snapshot: ${metaPath}`);
+      } catch { /* best-effort */ }
+    }
     if (ageInput) {
       const inputType = await ageInput.getAttribute("type").catch(() => null);
+      const tagName = await ageInput.evaluate((el) => el.tagName.toLowerCase()).catch(() => "?");
       const label = (await ageInput.getAttribute("aria-label").catch(() => "")) || "";
       const placeholder = (await ageInput.getAttribute("placeholder").catch(() => "")) || "";
       const descriptor = (label + " " + placeholder).toLowerCase();
-      const isBirthday = /birth|sinh|birthday|birthdate|mm|dd|yyyy/.test(descriptor) || /\/|-/.test(placeholder);
+      const isBirthday = /birth|sinh|birthday|birthdate|mm|dd|yyyy|nn|tt|nnnn/.test(descriptor) || /\/|-/.test(placeholder);
+      console.log(`[profile] age field: tag=${tagName} type=${inputType} aria-label="${label.slice(0,40)}" placeholder="${placeholder.slice(0,40)}" isBirthday=${isBirthday}`);
+      // Detect order từ placeholder: EN "MM/DD/YYYY" vs VN "DD/MM/YYYY" (hoặc
+      // "NN/TT/NNNN"). OpenAI Vietnamese UI dùng DD/MM/YYYY → fill ddmmyyyy
+      // thay vì mmddyyyy nếu không sẽ day=15,month=15 → invalid, form reject
+      // → PROFILE handler re-loop. Check "dd" đứng trước "mm" trong placeholder.
+      const placeLower = placeholder.toLowerCase();
+      const ddBeforeMm = /dd[^m]*mm|nn[^t]*tt/.test(placeLower);
+      const birthdaySequence = ddBeforeMm ? ddmmyyyy : mmddyyyy;
+      // Multi-strategy fill: thử .fill() → .type() → native setter. Verify
+      // value sau mỗi strategy. CloakBrowser humanize layer đôi khi nuốt mất
+      // keypress, native setter đôi khi bị React 18 validation reject nếu
+      // không có focus event thật.
+      const readValue = async () => {
+        return await ageInput.evaluate((el) => el.value).catch(() => "");
+      };
+      const forceFill = async (value) => {
+        const v = String(value);
+        // Strategy 1: Playwright locator.fill() — robust cho controlled input
+        try { await ageInput.fill(v, { timeout: 3000 }); } catch { /* next */ }
+        if ((await readValue()) === v) return;
+        // Strategy 2: click + keyboard type (real keypress events qua CDP)
+        try {
+          await ageInput.click({ timeout: 3000, force: true }).catch(() => {});
+          await ageInput.press("Control+a").catch(() => {});
+          await ageInput.press("Delete").catch(() => {});
+          await session.page.keyboard.type(v, { delay: 60 });
+        } catch { /* next */ }
+        if ((await readValue()) === v) return;
+        // Strategy 3: native setter + dispatch input/change/focus/blur
+        await ageInput.evaluate((el, val) => {
+          const proto = window.HTMLInputElement.prototype;
+          const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+          setter.call(el, val);
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          el.dispatchEvent(new Event("blur", { bubbles: true }));
+          el.blur();
+        }, v).catch(() => {});
+        const final = await readValue();
+        console.log(`[profile] age field final value after fill: "${final}" (expected "${v}")`);
+      };
       try {
         if (inputType === "date") {
-          await reactSafeFill(ageInput, profile.birthdate);
+          await forceFill(profile.birthdate);
         } else if (isBirthday) {
-          await reactSafeFill(ageInput, mmddyyyy);
+          await forceFill(birthdaySequence);
         } else {
+          // Age numeric (VN UI "Tuổi" field): fill số nguyên từ profile birthdate.
           const age = Math.max(18, 2026 - bYear);
-          await reactSafeFill(ageInput, String(age));
+          await forceFill(String(age));
         }
       } catch { /* best-effort */ }
     }
@@ -1191,6 +1545,24 @@ const PAGE_HANDLERS = {
     }
     await clickFormSubmit(session.page);
     emit(WORKER_MARKERS.profileCompleted);
+    // Chờ URL rời /about-you (OpenAI thường redirect sang /onboarding hoặc
+    // chatgpt.com). Nếu stuck 10s → thử Enter press (React form onKeyDown handler
+    // đôi khi submit được khi click button bị disabled). Return để adaptive loop
+    // reclassify — tránh handler fire lại ngay next tick với findName chờ 30s.
+    try {
+      await session.page.waitForURL((u) => !/\/about-you/.test(String(u)), { timeout: 10_000 });
+      console.log(`[profile] left /about-you, url=${session.page.url()}`);
+    } catch {
+      console.log(`[profile] stuck at /about-you after submit, trying Enter + reactSafeClick on Continue`);
+      await session.page.keyboard.press("Enter").catch(() => {});
+      try {
+        const cont = session.page.getByRole("button", { name: /^(tiếp tục|continue|next|submit)$/i }).first();
+        if (await cont.isVisible({ timeout: 1500 }).catch(() => false)) {
+          await reactSafeClick(cont);
+        }
+      } catch { /* best-effort */ }
+      await session.page.waitForURL((u) => !/\/about-you/.test(String(u)), { timeout: 6_000 }).catch(() => {});
+    }
   },
   async [PAGE_KINDS.PHONE_NUMBER](session) {
     const phone = await promptForInputOrPageAdvance("phoneNumberPrompt", session.page, /\/add-phone/, { timeoutMs: 600_000 });
@@ -1227,7 +1599,65 @@ const PAGE_HANDLERS = {
     const fullE164 = String(phone).trim().startsWith("+") ? phone : (countryCode ? `+${countryCode}${subscriberNumber}` : subscriberNumber);
     await reactSafeFill(input, fullE164);
     await session.page.waitForTimeout(500); // chờ validation
+    // VN UI: OpenAI add-phone yêu cầu chọn "Gửi mã qua" (Tin nhắn văn bản /
+    // WhatsApp) TRƯỚC khi nút Tiếp tục enable. Default EN UI chỉ có text SMS →
+    // continue sẵn enable. Click "Tin nhắn văn bản" / "Text message" nếu có.
+    try {
+      const smsPill = session.page.getByRole("button", { name: /^(tin nhắn văn bản|text message|sms)$/i }).first();
+      if (await smsPill.isVisible({ timeout: 1500 }).catch(() => false)) {
+        await smsPill.click({ timeout: 3000, force: true }).catch(() => {});
+        await session.page.waitForTimeout(300);
+      } else {
+        // Fallback: locator CSS has-text
+        const alt = session.page.locator('button:has-text("Tin nhắn văn bản"), button:has-text("Text message"), [role="radio"]:has-text("Tin nhắn")').first();
+        if (await alt.isVisible({ timeout: 1200 }).catch(() => false)) {
+          await alt.click({ timeout: 3000, force: true }).catch(() => {});
+          await session.page.waitForTimeout(300);
+        }
+      }
+    } catch { /* best-effort */ }
     await clickFormSubmit(session.page);
+    // Verify: nếu OpenAI reject số (hiển "không hợp lệ" / "invalid" / "chuyển
+    // sang WhatsApp" / bất kỳ error UI nào ngay dưới input), URL vẫn /add-phone
+    // hoặc có alert đỏ sau submit. Emit "[warn] Could not send SMS to <phone>:
+    // <reason>" để console-server tự block số + trigger change_phone (xem
+    // console-server.mjs:3034). Scan 2 nguồn: URL change + visible alert text.
+    // User policy: bất kỳ phản hồi lỗi về SMS cho số đó = số không sạch, phải
+    // đổi số, không cố retry.
+    const urlLeft = await session.page.waitForURL(
+      (u) => !/\/add-phone/.test(String(u)),
+      { timeout: 6_000 },
+    ).then(() => true).catch(() => false);
+    // Scan error alert dù URL đã rời hay không — OpenAI đôi khi redirect sang
+    // /phone-verification nhưng vẫn hiển error (WhatsApp fallback modal).
+    const uiState = await session.page.evaluate(() => {
+      const main = document.querySelector('main') || document.body;
+      // Thu error alerts qua role=alert, aria-live, class chứa red/error/danger
+      const alerts = [...main.querySelectorAll('[role="alert"], [aria-live], [class*="error" i], [class*="danger" i], [class*="red" i], [class*="warn" i]')]
+        .map((el) => (el.innerText || "").trim())
+        .filter((t) => t && t.length < 500);
+      const fullText = (main.innerText || "").slice(0, 1500);
+      return { alerts, fullText };
+    }).catch(() => ({ alerts: [], fullText: "" }));
+    const corpus = `${uiState.alerts.join("\n")}\n${uiState.fullText}`;
+    // Broad regex: bất kỳ phrase về SMS fail / WhatsApp fallback / invalid /
+    // retry → block số. User policy: "bất kì phản hồi đều là lỗi về sms".
+    const smsBadPatterns = /số điện thoại.*không hợp lệ|không hợp lệ|vui lòng kiểm tra|kiểm tra và thử lại|không thể gửi|không gửi được|chuyển sang whatsapp|whatsapp|invalid.*phone|phone.*invalid|phone.*not.*valid|not valid|cannot send|can'?t send|unable to send|try again|retry|verify.*whatsapp|số không được chấp nhận|unsupported|please check/i;
+    const hasError = smsBadPatterns.test(corpus);
+    if (hasError) {
+      // Lấy snippet lỗi để log (ưu tiên alert, fallback full text match)
+      const match = (uiState.alerts.find((a) => smsBadPatterns.test(a))
+        || corpus.match(smsBadPatterns)?.[0]
+        || "SMS/WhatsApp warning detected"
+      ).toString().replace(/\s+/g, " ").slice(0, 160);
+      console.log(`[warn] Could not send SMS to ${fullE164}: ${match}`);
+      return;
+    }
+    if (urlLeft) {
+      console.log(`[phone] accepted ${fullE164}, url=${session.page.url()}`);
+    } else {
+      console.log(`[phone] still at /add-phone after submit, no explicit error detected — continuing loop; snippet: ${uiState.fullText.slice(0, 160).replace(/\s+/g, " ")}`);
+    }
   },
   async [PAGE_KINDS.PHONE_OTP](session) {
     await waitForReactReady(session.page);
@@ -1292,34 +1722,69 @@ const PAGE_HANDLERS = {
   },
   async [PAGE_KINDS.OAUTH_CONSENT](session) {
     emit(WORKER_MARKERS.codexOauthStart);
-    // Chờ React hydrate
     await session.page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => {});
     await session.page.waitForTimeout(1200);
-    // Consent page: thường là "Continue" button đen. Thử nhiều strategies để
-    // chắc chắn fire.
-    for (const name of [AUTHORIZE_NAME, CONTINUE_NAME]) {
+    // SAFETY: chỉ click EXACT safe text, không bao giờ click Cancel/Hủy/Logout.
+    const SAFE_NAMES = /^(tiếp tục|continue|authorize|allow|accept|cho phép|chấp nhận|đồng ý|next|xác nhận|confirm)$/i;
+    const UNSAFE_NAMES = /^(cancel|hủy|deny|từ chối|back|quay lại|dùng tài khoản khác|switch account|sign out|đăng xuất|logout)$/i;
+
+    const tryClickSafe = async (locator) => {
+      if (!await locator.isVisible({ timeout: 2000 }).catch(() => false)) return false;
+      const txt = (await locator.innerText().catch(() => "")).trim();
+      if (!txt || UNSAFE_NAMES.test(txt)) return false;
+      console.log(`[oauth-consent] click safe button "${txt}"`);
+      // Escalation: scroll + hover + CDP mouse → locator click → focus+Enter → JS dispatch
+      await locator.scrollIntoViewIfNeeded({ timeout: 1500 }).catch(() => {});
+      await locator.hover({ timeout: 1500 }).catch(() => {});
+      await session.page.waitForTimeout(150);
+      const urlBefore = session.page.url();
+      // A: CDP mouse via bounding box
+      const box = await locator.boundingBox().catch(() => null);
+      if (box) {
+        await session.page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 10 }).catch(() => {});
+        await session.page.waitForTimeout(80);
+        await session.page.mouse.down().catch(() => {});
+        await session.page.waitForTimeout(50);
+        await session.page.mouse.up().catch(() => {});
+        await session.page.waitForTimeout(1500);
+        if (session.page.url() !== urlBefore) return true;
+      }
+      // B: locator.click force
+      await locator.click({ timeout: 4000, force: true }).catch(() => {});
+      await session.page.waitForTimeout(1500);
+      if (session.page.url() !== urlBefore) return true;
+      // C: focus + Enter
+      await locator.focus().catch(() => {});
+      await session.page.keyboard.press("Enter").catch(() => {});
+      await session.page.waitForTimeout(1500);
+      if (session.page.url() !== urlBefore) return true;
+      // D: JS dispatchEvent chain
+      await locator.evaluate((node) => {
+        const rect = node.getBoundingClientRect();
+        const opts = { bubbles: true, cancelable: true, view: window, button: 0,
+          clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2 };
+        ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach((t) => {
+          try { node.dispatchEvent(new PointerEvent(t, opts)); } catch { node.dispatchEvent(new MouseEvent(t, opts)); }
+        });
+        node.click();
+      }).catch(() => {});
+      await session.page.waitForTimeout(1500);
+      return session.page.url() !== urlBefore;
+    };
+
+    // Candidates: role=button SAFE_NAMES first, then form submit[type=submit]
+    const candidates = [
+      () => session.page.getByRole("button", { name: SAFE_NAMES }).first(),
+      () => session.page.locator('form button[type="submit"]:visible').first(),
+      () => session.page.locator('button:visible').filter({ hasText: SAFE_NAMES }).filter({ hasNotText: UNSAFE_NAMES }).first(),
+    ];
+    for (const build of candidates) {
       try {
-        const btn = roleButton(session.page, name);
-        if (await btn.isVisible({ timeout: 2000 }).catch(() => false)) {
-          await btn.click({ timeout: 5000 });
-          return;
-        }
+        const el = build();
+        if (await tryClickSafe(el)) return;
       } catch { /* next */ }
     }
-    // Fallback: clickFormSubmit (exact text + form submit + Enter)
-    try { await clickFormSubmit(session.page); return; } catch { /* next */ }
-    // JS click fallback — scan buttons với text continue/authorize/allow
-    try {
-      await session.page.evaluate(() => {
-        const re = /^(continue|tiếp tục|authorize|allow|cho phép|accept|next)$/i;
-        const btns = [...document.querySelectorAll('button, [role="button"], a[role="button"]')];
-        for (const b of btns) {
-          const t = (b.innerText || "").trim();
-          if (re.test(t)) { b.click(); return true; }
-        }
-        return false;
-      });
-    } catch { /* give up */ }
+    console.log("[oauth-consent] all strategies did not advance URL");
   },
   async [PAGE_KINDS.WORKSPACE_SELECT](session, args) {
     // Chờ React hydrate (page vừa load từ redirect)
@@ -1561,11 +2026,21 @@ async function handleSignupAdaptive(args) {
     let lastKind = null;
     let sameKindCount = 0;
     let navigatedToOauth = false;
-    while (Date.now() - startedAt < PAGE_IDLE_TIMEOUT_MS) {
+    while (Date.now() - startedAt < ADAPTIVE_LOOP_TIMEOUT_MS) {
       if (oauth.capturedUrl) break;
       const kind = await detectPageKind(session.page);
       if (kind === PAGE_KINDS.DONE) break;
       if (kind === PAGE_KINDS.WRONG_OAUTH) throw new Error(`WRONG_OAUTH_DESTINATION: ${session.page.url()}`);
+      // Account deactivated: fail-fast, không retry. Gọi handler để extract
+      // request_id + log, rồi throw thẳng ra try/catch outer để adaptive loop
+      // không bắt (handler throw ACCOUNT_DEACTIVATED → server scan [error] →
+      // isPermanentAccountFailure → failAccountClosedDuringLogin).
+      if (kind === PAGE_KINDS.ACCOUNT_DEACTIVATED) {
+        console.log(`[adaptive] page=${kind} url=${session.page.url()} — fail-fast, không retry`);
+        await PAGE_HANDLERS[PAGE_KINDS.ACCOUNT_DEACTIVATED](session, args);
+        // handler đã throw; code dưới không chạy, nhưng để chắc:
+        throw new Error("ACCOUNT_DEACTIVATED: handler returned without throwing");
+      }
 
       if (kind === lastKind) {
         sameKindCount += 1;
@@ -1581,6 +2056,41 @@ async function handleSignupAdaptive(args) {
         await session.page.goto(oauth.authUrl, { timeout: PAGE_IDLE_TIMEOUT_MS, waitUntil: "domcontentloaded" }).catch(() => {});
         navigatedToOauth = true;
         await session.page.waitForTimeout(1500);
+        continue;
+      }
+      // Sau onboarding (chatgpt.com main → LANDING kind): user đã signed in,
+      // navigate thẳng oauth.authUrl để Codex consent → callback → DONE.
+      // Dùng flag riêng để không conflict với navigatedToOauth path trên.
+      if (!navigatedToOauth && kind === PAGE_KINDS.LANDING && lastKind === PAGE_KINDS.ONBOARDING) {
+        console.log("[adaptive] onboarding done, chatgpt.com reached — navigating to Codex OAuth authorize");
+        await session.page.goto(oauth.authUrl, { timeout: PAGE_IDLE_TIMEOUT_MS, waitUntil: "domcontentloaded" }).catch(() => {});
+        navigatedToOauth = true;
+        await session.page.waitForTimeout(1500);
+        continue;
+      }
+      // Force-relogin: user đã có session (userDataDir có cookie), chatgpt.com
+      // không hiện login modal → LANDING handler click vào trống → sameKindCount
+      // tăng. Sau 2 LANDING tick vẫn ở landing (không advance) → nghĩa là đã
+      // signed in, cần navigate oauth luôn để trigger Codex consent → callback.
+      if (!navigatedToOauth && kind === PAGE_KINDS.LANDING && sameKindCount >= 2) {
+        console.log("[adaptive] LANDING loop — session đã có, navigate Codex OAuth để capture code");
+        await session.page.goto(oauth.authUrl, { timeout: PAGE_IDLE_TIMEOUT_MS, waitUntil: "domcontentloaded" }).catch(() => {});
+        navigatedToOauth = true;
+        await session.page.waitForTimeout(1500);
+        continue;
+      }
+      // PROFILE stuck: handler fire >= 2 lần, URL vẫn /about-you. React submit
+      // không propagate (button disabled hoặc field validation reject). Force
+      // navigate chatgpt.com/ để OpenAI tự redirect sang onboarding hoặc
+      // return LANDING. Giải pháp triệt để cho edge case controlled input +
+      // age validation reject. Giảm threshold xuống 2 (từ 3) để không hit
+      // CODEX_CALLBACK_TIMEOUT khi handler mỗi call ~16s (waitForURL + fallback).
+      if (kind === PAGE_KINDS.PROFILE && sameKindCount >= 2) {
+        console.log("[adaptive] PROFILE loop stuck — force navigate chatgpt.com/ để bypass form");
+        await session.page.goto("https://chatgpt.com/", { timeout: PAGE_IDLE_TIMEOUT_MS, waitUntil: "domcontentloaded" }).catch(() => {});
+        sameKindCount = 0;
+        lastKind = null;
+        await session.page.waitForTimeout(2000);
         continue;
       }
 
@@ -1628,7 +2138,18 @@ async function handleSignupAdaptive(args) {
     await writeJsonAtomic(sub2apiOut, sub2apiPayload);
     emit(WORKER_MARKERS.savedSub2api, sub2apiOut);
   } finally {
-    await session.close();
+    // 2 lớp exit: (1) 8s watchdog nếu session.close() treo; (2) explicit
+    // process.exit(0) sau 500ms khi close xong (không rely event loop drain —
+    // CloakBrowser humanize đôi khi để lại timer giữ loop → server thấy child
+    // không close → job treo "finalizing" vĩnh viễn).
+    const forceExitTimer = setTimeout(() => {
+      try { if (process.stdout.write("")) process.stdout.end?.(); } catch {}
+      process.exit(0);
+    }, 8_000);
+    forceExitTimer.unref?.();
+    try { await session.close(); } catch { /* best-effort */ }
+    clearTimeout(forceExitTimer);
+    setTimeout(() => { process.exit(0); }, 500);
   }
 }
 
@@ -1723,12 +2244,18 @@ async function openBrowser({ email, proxy, verbose }) {
     throw new Error("BROWSER_PROXY_SCHEME_UNSUPPORTED: Patchright/Chromium does not accept SOCKS5 proxy credentials via --proxy-server. Switch to CHATGPT_BROWSER_ENGINE=cloak for socks5+auth, or use HTTP(S) proxy.");
   }
 
+  // Compute viewport sớm để pass vào launchArgs --window-size (tránh Chromium
+  // mở fullscreen → viewport nhỏ hơn window → trống đen phía dưới page).
+  const _earlyFp = buildPerAccountFingerprint({ oaiDeviceId });
+  const _vw = Number(_earlyFp.viewport?.width) || 1440;
+  const _vh = Number(_earlyFp.viewport?.height) || 900;
   const launchArgs = [
     "--webrtc-ip-handling-policy=disable_non_proxied_udp",
     "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
     "--disable-blink-features=AutomationControlled",
     "--disable-features=Translate,InterestFeedContentSuggestions,PasswordLeakDetection,CalculateNativeWinOcclusion,HeavyAdPrivacyMitigations,HttpsUpgrades,InsecureFormSubmissionWarning,InsecurePasswordRedaction,BackForwardCache,DisableLoadExtensionCommandLineSwitch",
     "--disk-cache-size=52428800",
+    `--window-size=${_vw},${_vh + 100}`,
   ];
   const launchOptions = {
     headless: false,
@@ -1737,23 +2264,49 @@ async function openBrowser({ email, proxy, verbose }) {
     // Manual-assist: giữ Chromium alive khi worker exit (user tiếp tục drive tay).
     ...(MANUAL_ASSIST ? { handleSIGINT: false, handleSIGTERM: false, handleSIGHUP: false } : {}),
   };
+  // Local chain proxy: nếu upstream cần auth hoặc dùng SOCKS5, mở local
+  // 127.0.0.1:0 HTTP proxy no-auth → forward sang upstream với creds. Chromium
+  // thấy proxy localhost thì không cần Fetch.continueWithAuth → bypass
+  // CloakBrowser humanize interception. Root cause fix cho
+  // ERR_NO_SUPPORTED_PROXIES / 407 khi upstream HTTP có Basic auth.
+  let localChain = null;
+  const needsChain = Boolean(proxyUrl && (proxyUrl.username || proxyUrl.scheme === "socks5" || proxyUrl.scheme === "socks5h"));
+  if (needsChain) {
+    localChain = await startLocalChainProxy(proxyUrl).catch((e) => {
+      console.log(`[chain-proxy] start failed: ${e.message} — falling back to direct proxy launch`);
+      return null;
+    });
+    if (localChain) {
+      console.log(`[chain-proxy] listening http://127.0.0.1:${localChain.port} → upstream ${proxyUrl.scheme}://${proxyUrl.host}:${proxyUrl.port}`);
+    }
+  }
   if (proxyUrl) {
-    launchOptions.proxy = {
-      server: `${proxyUrl.scheme}://${proxyUrl.host}:${proxyUrl.port}`,
-      ...(proxyUrl.username ? { username: proxyUrl.username, password: proxyUrl.password || "" } : {}),
-    };
+    if (localChain) {
+      launchOptions.proxy = { server: `http://${localChain.host}:${localChain.port}` };
+    } else {
+      launchOptions.proxy = {
+        server: `${proxyUrl.scheme}://${proxyUrl.host}:${proxyUrl.port}`,
+        ...(proxyUrl.username ? { username: proxyUrl.username, password: proxyUrl.password || "" } : {}),
+      };
+    }
   }
 
   let context;
   if (engine === "cloak") {
-    // CloakBrowser — proxy string form, humanize=true, geoip=true cho timezone/locale auto.
+    // CloakBrowser — proxy object form. Nếu local chain đã mở, pass
+    // {server: "http://127.0.0.1:PORT"} no-auth → tránh CloakBrowser humanize
+    // layer nuốt CDP Fetch.continueWithAuth (root cause ERR_NO_SUPPORTED_PROXIES).
+    // Nếu không có chain (upstream no-auth), vẫn pass object form với creds.
     const cb = await import("cloakbrowser");
-    const proxyString = proxyUrl
-      ? (proxyUrl.username
-          ? `${proxyUrl.scheme}://${encodeURIComponent(proxyUrl.username)}:${encodeURIComponent(proxyUrl.password || "")}@${proxyUrl.host}:${proxyUrl.port}`
-          : `${proxyUrl.scheme}://${proxyUrl.host}:${proxyUrl.port}`)
-      : undefined;
-    if (verbose) console.log(`[browser] launching CloakBrowser (version=${cb.CHROMIUM_VERSION}) proxy=${proxyString ? "set" : "none"}`);
+    const proxyObject = localChain
+      ? { server: `http://${localChain.host}:${localChain.port}` }
+      : proxyUrl
+        ? {
+            server: `${proxyUrl.scheme}://${proxyUrl.host}:${proxyUrl.port}`,
+            ...(proxyUrl.username ? { username: proxyUrl.username, password: proxyUrl.password || "" } : {}),
+          }
+        : undefined;
+    if (verbose) console.log(`[browser] launching CloakBrowser (version=${cb.CHROMIUM_VERSION}) proxy=${proxyObject ? (localChain ? "chain" : "set") : "none"}`);
     const cbInfo = cb.binaryInfo();
     // UA phải khớp Chromium runtime THẬT của CloakBrowser (vd runtime 146 mà
     // CloakBrowser humanize UA pool có khi lagging 145 → pixelscan flag
@@ -1769,7 +2322,7 @@ async function openBrowser({ email, proxy, verbose }) {
       humanize: true,
       // geoip:true cần mmdb-lib + .mmdb file (MaxMind GeoLite2). Bật qua
       // env TOSUB2_CLOAK_GEOIP=1 nếu đã nạp DB. Mặc định false để tránh crash.
-      geoip: process.env.TOSUB2_CLOAK_GEOIP === "1" && Boolean(proxyString),
+      geoip: process.env.TOSUB2_CLOAK_GEOIP === "1" && Boolean(proxyObject),
       args: launchArgs,
       // Chuẩn hoá UA + locale + timezone để fingerprint consistent (fix
       // pixelscan "Masking detected" do Chrome UA mismatch Chromium runtime major
@@ -1778,7 +2331,7 @@ async function openBrowser({ email, proxy, verbose }) {
       locale: "vi-VN",
       timezoneId: "Asia/Ho_Chi_Minh",
       viewport: { width: _fp.viewport.width, height: _fp.viewport.height },
-      ...(proxyString ? { proxy: proxyString } : {}),
+      ...(proxyObject ? { proxy: proxyObject } : {}),
       ...(MANUAL_ASSIST ? { handleSIGINT: false, handleSIGTERM: false, handleSIGHUP: false } : {}),
     };
     context = await cb.launchPersistentContext(cbOpts);
@@ -1804,23 +2357,14 @@ async function openBrowser({ email, proxy, verbose }) {
   const hostProfile = await detectHostProfile(context).catch(() => ({}));
   const fingerprint = buildPerAccountFingerprint({ oaiDeviceId, hostProfile });
   await context.addInitScript({ content: buildInitScript(fingerprint) });
-  // Accept-Language header + Sec-CH-UA: CloakBrowser humanize ghi đè bất chấp
+  // Accept-Language header only: CloakBrowser humanize ghi đè bất chấp
   // buildContextOptions. Force sau khi context ready để match navigator.languages
-  // = vi-VN. Pixelscan + creepjs cross-check HTTP Accept-Language vs JS
-  // navigator.language → mismatch = red flag.
-  //
-  // Sec-CH-UA brand pin: CloakBrowser's Chromium 146 ship Sec-CH-UA brands
-  // "145.0.7632.109" baked trong binary. UA mình set Chrome 146 → mismatch
-  // Sec-CH-UA 145. Override 3 headers Client Hints để match UA major.
-  const _cloakMajorForHeaders = (engine === "cloak") ? Number(chrome.major) || 146 : null;
-  const _chUAHeaders = _cloakMajorForHeaders ? {
-    "sec-ch-ua": `"Chromium";v="${_cloakMajorForHeaders}", "Google Chrome";v="${_cloakMajorForHeaders}", "Not=A?Brand";v="24"`,
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"macOS"',
-  } : {};
+  // = vi-VN. KHÔNG set Sec-CH-UA manual — CloakBrowser's Chromium gửi Sec-CH-UA
+  // native từ binary, duplicate hoặc override thường trigger Cloudflare challenge
+  // (double headers inconsistent). UA mình set qua launch option (Chrome/146.0.0.0)
+  // sẽ sync với Sec-CH-UA native của Chromium 146.
   await context.setExtraHTTPHeaders({
     "accept-language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
-    ..._chUAHeaders,
   }).catch(() => {});
 
   // Pre-set oai-did on both OpenAI domains BEFORE first navigation, so
@@ -1859,6 +2403,7 @@ async function openBrowser({ email, proxy, verbose }) {
     chrome,
     userDataDir,
     proxyUrl: proxy || "",
+    chainProxy: localChain || null,
     close: async () => {
       if (MANUAL_ASSIST) {
         // User muốn drive tay sau khi worker exit — Chromium survive (SIG* false).
@@ -1871,6 +2416,9 @@ async function openBrowser({ email, proxy, verbose }) {
         return;
       }
       await context.close().catch(() => {});
+      if (localChain) {
+        try { localChain.server.close(); } catch { /* best-effort */ }
+      }
     },
   };
 }
@@ -1891,40 +2439,280 @@ async function sweepStaleSingletonLocks(userDataDir) {
 
 async function proxyPreflight(session, args) {
   if (!session.proxyUrl) return;
-  const page = await session.context.newPage();
+  // Node-side preflight: không dùng page.goto vì CloakBrowser humanize layer
+  // đôi khi nuốt CDP Fetch.continueWithAuth → Chromium báo
+  // ERR_NO_SUPPORTED_PROXIES mơ hồ ngay cả khi proxy OK. Tự mở TCP CONNECT
+  // (HTTP proxy) hoặc SOCKS5 handshake (SOCKS5 proxy), rồi gọi
+  // https://api.ipify.org (ít block hơn httpbin) qua tunnel đó. Lỗi phân loại
+  // rõ: 407 auth → BROWSER_PROXY_AUTH_FAILED, timeout → BROWSER_PROXY_TIMEOUT,
+  // reset/connect → BROWSER_PROXY_UNREACHABLE.
   try {
-    await page.goto("https://httpbin.org/ip", { timeout: 15_000, waitUntil: "domcontentloaded" });
-    const body = await page.evaluate(() => document.body?.innerText || "");
-    const match = body.match(/"origin"\s*:\s*"([^"]+)"/);
-    const seen = match ? match[1].split(",")[0].trim() : null;
-    if (!seen) {
-      emit(WORKER_MARKERS.browserProxyAuthFailed);
-      throw new Error("BROWSER_PROXY_AUTH_FAILED: httpbin probe did not report an origin IP");
-    }
-    if (args.verbose) console.log(`[browser-proxy] httpbin origin=${seen}`);
+    const seen = await probeExitIpThroughProxy(session.proxyUrl, { timeoutMs: 15_000 });
+    if (!seen) throw new Error("empty response from ip probe");
+    if (args.verbose) console.log(`[browser-proxy] exit-ip=${seen}`);
+    else console.log(`[browser-proxy] exit-ip=${seen}`);
   } catch (error) {
     emit(WORKER_MARKERS.browserProxyAuthFailed);
     throw new Error(`BROWSER_PROXY_AUTH_FAILED: ${error.message}`);
-  } finally {
-    await page.close().catch(() => {});
   }
 }
 
-async function findReachableSignupUrl(session) {
-  const page = await session.context.newPage();
-  try {
-    for (const url of SIGNUP_URL_CANDIDATES) {
-      try {
-        const res = await page.goto(url, { timeout: 15_000, waitUntil: "domcontentloaded" });
-        if (res && res.status() < 400) return url;
-      } catch {
-        /* try next */
-      }
-    }
-    return SIGNUP_URL_CANDIDATES[0];
-  } finally {
-    await page.close().catch(() => {});
+// Mở TCP tunnel qua proxy (HTTP CONNECT / SOCKS5) đến api.ipify.org:443,
+// gửi 1 request HTTPS tối thiểu, parse response để lấy IP egress thật.
+// Trả về string IP, hoặc throw error có mã rõ (AUTH_FAILED/TIMEOUT/UNREACHABLE).
+async function probeExitIpThroughProxy(proxyUrl, { timeoutMs = 15_000 } = {}) {
+  const parsed = typeof proxyUrl === "string" ? normalizeProxyUrl(proxyUrl) : proxyUrl;
+  if (!parsed) throw new Error("INVALID_PROXY_URL");
+  const target = { host: "api.ipify.org", port: 443, pathname: "/" };
+  let socket;
+  if (parsed.scheme === "http" || parsed.scheme === "https") {
+    socket = await openHttpConnectTunnel(parsed, target, timeoutMs);
+  } else if (parsed.scheme === "socks5" || parsed.scheme === "socks5h") {
+    socket = await openSocks5Tunnel(parsed, target, timeoutMs);
+  } else {
+    throw new Error(`UNSUPPORTED_PROXY_SCHEME: ${parsed.scheme}`);
   }
+  return await fetchOverTunnel(socket, target, timeoutMs);
+}
+
+function openHttpConnectTunnel(proxy, target, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const port = Number(proxy.port || (proxy.scheme === "https" ? 443 : 80));
+    let timer;
+    const bare = net.connect({ host: proxy.host, port }, () => {
+      const credsHeader = proxy.username
+        ? `Proxy-Authorization: Basic ${Buffer.from(`${proxy.username}:${proxy.password || ""}`).toString("base64")}\r\n`
+        : "";
+      const req = `CONNECT ${target.host}:${target.port} HTTP/1.1\r\n`
+        + `Host: ${target.host}:${target.port}\r\n`
+        + credsHeader
+        + "User-Agent: tosub2-preflight/1.0\r\n"
+        + "Proxy-Connection: Keep-Alive\r\n\r\n";
+      bare.write(req);
+    });
+    let buf = Buffer.alloc(0);
+    timer = setTimeout(() => { try { bare.destroy(); } catch {} ; reject(new Error("PROXY_TIMEOUT")); }, timeoutMs);
+    bare.on("error", (e) => { clearTimeout(timer); reject(new Error(`PROXY_UNREACHABLE: ${e.code || e.message}`)); });
+    bare.on("data", (chunk) => {
+      buf = Buffer.concat([buf, chunk]);
+      const idx = buf.indexOf(Buffer.from("\r\n\r\n"));
+      if (idx < 0) return;
+      const headers = buf.slice(0, idx).toString("utf8");
+      const firstLine = headers.split(/\r?\n/)[0];
+      const status = Number(firstLine.split(/\s+/)[1] || 0);
+      if (status === 200) {
+        clearTimeout(timer);
+        bare.removeAllListeners("data");
+        bare.removeAllListeners("error");
+        resolve(bare);
+        return;
+      }
+      clearTimeout(timer);
+      try { bare.destroy(); } catch {}
+      if (status === 407) return reject(new Error(`PROXY_AUTH_REJECTED (HTTP 407, headers=${headers.slice(0, 200)})`));
+      if (status === 403) return reject(new Error(`PROXY_FORBIDDEN (HTTP 403, headers=${headers.slice(0, 200)})`));
+      return reject(new Error(`PROXY_CONNECT_FAILED: ${firstLine}`));
+    });
+  });
+}
+
+function openSocks5Tunnel(proxy, target, timeoutMs) {
+  // SOCKS5 handshake (RFC 1928) + optional username/password (RFC 1929).
+  return new Promise((resolve, reject) => {
+    const port = Number(proxy.port || 1080);
+    let timer = setTimeout(() => { try { bare.destroy(); } catch {} ; reject(new Error("SOCKS5_TIMEOUT")); }, timeoutMs);
+    const hasAuth = Boolean(proxy.username);
+    const bare = net.connect({ host: proxy.host, port }, () => {
+      // Greeting: VER=5 NMETHODS=1-2 METHODS=[0x00, 0x02?]
+      const methods = hasAuth ? Buffer.from([0x05, 0x02, 0x00, 0x02]) : Buffer.from([0x05, 0x01, 0x00]);
+      bare.write(methods);
+    });
+    let phase = "greet";
+    let acc = Buffer.alloc(0);
+    bare.on("error", (e) => { clearTimeout(timer); reject(new Error(`SOCKS5_UNREACHABLE: ${e.code || e.message}`)); });
+    bare.on("data", (chunk) => {
+      acc = Buffer.concat([acc, chunk]);
+      try {
+        if (phase === "greet") {
+          if (acc.length < 2) return;
+          if (acc[0] !== 0x05) throw new Error("SOCKS5_BAD_VERSION");
+          const method = acc[1];
+          acc = acc.slice(2);
+          if (method === 0xFF) throw new Error("SOCKS5_NO_ACCEPTABLE_METHOD");
+          if (method === 0x02) {
+            if (!hasAuth) throw new Error("SOCKS5_AUTH_REQUIRED_BUT_NO_CREDENTIALS");
+            const u = Buffer.from(String(proxy.username || ""));
+            const p = Buffer.from(String(proxy.password || ""));
+            const authMsg = Buffer.concat([Buffer.from([0x01, u.length]), u, Buffer.from([p.length]), p]);
+            bare.write(authMsg);
+            phase = "auth";
+            return;
+          }
+          if (method === 0x00) {
+            sendConnect(bare, target);
+            phase = "connect";
+            return;
+          }
+          throw new Error(`SOCKS5_UNEXPECTED_METHOD: 0x${method.toString(16)}`);
+        }
+        if (phase === "auth") {
+          if (acc.length < 2) return;
+          if (acc[1] !== 0x00) throw new Error("SOCKS5_AUTH_REJECTED");
+          acc = acc.slice(2);
+          sendConnect(bare, target);
+          phase = "connect";
+          return;
+        }
+        if (phase === "connect") {
+          // Reply: VER REP RSV ATYP BND.ADDR BND.PORT (variable)
+          if (acc.length < 10) return;
+          if (acc[0] !== 0x05) throw new Error("SOCKS5_BAD_REPLY_VERSION");
+          const rep = acc[1];
+          if (rep !== 0x00) throw new Error(`SOCKS5_CONNECT_FAILED: rep=0x${rep.toString(16)}`);
+          const atyp = acc[3];
+          const addrLen = atyp === 0x01 ? 4 : atyp === 0x04 ? 16 : atyp === 0x03 ? (acc[4] + 1) : null;
+          if (!addrLen) throw new Error(`SOCKS5_BAD_ATYP: ${atyp}`);
+          const totalLen = 4 + addrLen + 2;
+          if (acc.length < totalLen) return;
+          clearTimeout(timer);
+          bare.removeAllListeners("data");
+          bare.removeAllListeners("error");
+          resolve(bare);
+        }
+      } catch (err) {
+        clearTimeout(timer);
+        try { bare.destroy(); } catch {}
+        reject(err);
+      }
+    });
+  });
+  function sendConnect(sock, tgt) {
+    const hostBuf = Buffer.from(tgt.host);
+    const msg = Buffer.concat([
+      Buffer.from([0x05, 0x01, 0x00, 0x03, hostBuf.length]),
+      hostBuf,
+      Buffer.from([(tgt.port >> 8) & 0xff, tgt.port & 0xff]),
+    ]);
+    sock.write(msg);
+  }
+}
+
+async function fetchOverTunnel(socket, target, timeoutMs) {
+  return await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { try { tlsSock.destroy(); } catch {} ; reject(new Error("TLS_REQ_TIMEOUT")); }, timeoutMs);
+    const tlsSock = tls.connect({ socket, servername: target.host, ALPNProtocols: ["http/1.1"] }, () => {
+      tlsSock.write(
+        `GET ${target.pathname} HTTP/1.1\r\n`
+        + `Host: ${target.host}\r\n`
+        + "User-Agent: tosub2-preflight/1.0\r\n"
+        + "Accept: text/plain\r\n"
+        + "Connection: close\r\n\r\n",
+      );
+    });
+    let body = "";
+    tlsSock.on("error", (e) => { clearTimeout(timer); reject(new Error(`TLS_ERR: ${e.code || e.message}`)); });
+    tlsSock.on("data", (c) => { body += c.toString("utf8"); });
+    tlsSock.on("end", () => {
+      clearTimeout(timer);
+      const idx = body.indexOf("\r\n\r\n");
+      const payload = idx > 0 ? body.slice(idx + 4).trim() : body.trim();
+      // api.ipify.org trả raw IP; last chunk nếu chunked encoding.
+      const match = payload.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b|\b[0-9a-fA-F:]{3,}\b/);
+      resolve(match ? match[0] : payload.slice(0, 40));
+    });
+  });
+}
+
+// Local no-auth HTTP proxy forwarder → upstream HTTP/SOCKS5 proxy with auth.
+// Mục đích: Chromium (CloakBrowser) ↔ localhost:random (no auth) ↔ upstream
+// proxy với Basic/SOCKS5 auth. Tránh CloakBrowser humanize layer nuốt CDP
+// Fetch.continueWithAuth → root cause của ERR_NO_SUPPORTED_PROXIES khi upstream
+// cần auth. Server listen 127.0.0.1 only, bind port=0 (OS pick), handle:
+//   - CONNECT host:port → mở tunnel qua upstream, pipe hai socket.
+//   - GET/POST http://remote → forward lên upstream (HTTP proxy relay cổ điển).
+// Lifetime gắn với browser session: close khi context closed.
+async function startLocalChainProxy(upstream) {
+  if (!upstream) return null;
+  const server = http.createServer();
+  // Non-CONNECT HTTP: proxy GET/POST (plain HTTP sites). Chromium ChatGPT luôn
+  // CONNECT (TLS), nhưng vẫn relay HTTP cho hoàn chỉnh (http://httpbin, OCSP, …).
+  server.on("request", (req, res) => {
+    try {
+      const parsed = new URL(req.url);
+      const upstreamSocket = net.connect({ host: upstream.host, port: Number(upstream.port) });
+      upstreamSocket.on("error", () => { try { res.destroy(); } catch {} });
+      upstreamSocket.on("connect", () => {
+        const authHeader = upstream.username
+          ? `Proxy-Authorization: Basic ${Buffer.from(`${upstream.username}:${upstream.password || ""}`).toString("base64")}\r\n`
+          : "";
+        const headerLines = [`${req.method} ${req.url} HTTP/1.1`];
+        for (const [k, v] of Object.entries(req.headers)) {
+          if (/^proxy-/i.test(k)) continue;
+          headerLines.push(`${k}: ${Array.isArray(v) ? v.join(", ") : v}`);
+        }
+        upstreamSocket.write(headerLines.join("\r\n") + "\r\n" + authHeader + "\r\n");
+        req.pipe(upstreamSocket, { end: false });
+        upstreamSocket.pipe(res.socket);
+      });
+    } catch (e) {
+      try { res.statusCode = 502; res.end("chain-proxy-error: " + e.message); } catch {}
+    }
+  });
+  server.on("connect", async (req, clientSocket, head) => {
+    const [host, portStr] = req.url.split(":");
+    const port = Number(portStr || 443);
+    try {
+      let upstreamSocket;
+      if (upstream.scheme === "http" || upstream.scheme === "https") {
+        upstreamSocket = await openHttpConnectTunnel(upstream, { host, port }, 30_000);
+      } else if (upstream.scheme === "socks5" || upstream.scheme === "socks5h") {
+        upstreamSocket = await openSocks5Tunnel(upstream, { host, port }, 30_000);
+      } else {
+        throw new Error(`UNSUPPORTED_UPSTREAM_SCHEME: ${upstream.scheme}`);
+      }
+      clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      if (head && head.length) upstreamSocket.write(head);
+      upstreamSocket.pipe(clientSocket);
+      clientSocket.pipe(upstreamSocket);
+      upstreamSocket.on("error", () => { try { clientSocket.destroy(); } catch {} });
+      clientSocket.on("error", () => { try { upstreamSocket.destroy(); } catch {} });
+      upstreamSocket.on("end", () => { try { clientSocket.end(); } catch {} });
+      clientSocket.on("end", () => { try { upstreamSocket.end(); } catch {} });
+    } catch (e) {
+      try {
+        const msg = String(e.message || e);
+        const status = /AUTH/i.test(msg) ? "502 Proxy Auth Failed"
+          : /TIMEOUT/i.test(msg) ? "504 Gateway Timeout"
+          : "502 Bad Gateway";
+        clientSocket.write(`HTTP/1.1 ${status}\r\nContent-Length: ${msg.length}\r\n\r\n${msg}`);
+        clientSocket.destroy();
+      } catch {}
+    }
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  // Unref so the chain server does NOT keep the event loop alive after signup
+  // completes. Without this, Chromium's keep-alive socket to localhost giữ
+  // server active → process không exit → worker không trả về → server treo
+  // ở "finalizing" (code === 0 branch trong handleChildClose không chạy).
+  try { server.unref(); } catch { /* best-effort */ }
+  const addr = server.address();
+  return { server, port: addr.port, host: "127.0.0.1", scheme: "http" };
+}
+
+async function findReachableSignupUrl(session) {
+  // Skip probe tab: trước đây mở tab mới (context.newPage) để probe, nhưng
+  // Chromium đôi khi không close kịp → user thấy 2 tab chatgpt mở cùng lúc
+  // (default tab + probe tab). SIGNUP_URL_CANDIDATES[0] = chatgpt.com/ luôn
+  // reachable qua proxy VN đã verify, không cần probe.
+  // Đóng extra tabs mở lạc trong context (default blank tab, residual probe).
+  try {
+    const pages = session.context.pages();
+    for (const p of pages) {
+      if (p === session.page) continue;
+      await p.close().catch(() => {});
+    }
+  } catch { /* best-effort */ }
+  return SIGNUP_URL_CANDIDATES[0];
 }
 
 async function assertNotCloudflareStuck(session) {
@@ -2061,8 +2849,11 @@ function proxyUrlToSub2ApiProxy(raw) {
   const normalized = normalizeProxyUrl(raw);
   if (!normalized) return null;
   const key = `${normalized.scheme}://${normalized.host}:${normalized.port}`;
+  // Sub2API /import endpoint yêu cầu field `protocol` (http/https/socks5/socks5h).
+  // Giữ cả `type` legacy để không vỡ old consumers nếu còn ai parse theo tên cũ.
   const payload = {
     proxy_key: key,
+    protocol: normalized.scheme,
     type: normalized.scheme,
     host: normalized.host,
     port: Number(normalized.port) || 0,
@@ -2257,6 +3048,70 @@ async function waitForModalEmailInput(page) {
   }
 }
 
+// Click 1 option trong onboarding survey. Return text đã click hoặc null.
+async function clickOneOnboardingOption(session) {
+  const PREFERRED_SRC = "^(để sau|tạm bỏ qua|later|not now|khác|other|something else|cá nhân|personal|skip|bỏ qua|maybe later)$";
+  const target = await session.page.evaluate((preferredSrc) => {
+    const PREFERRED_RE = new RegExp(preferredSrc, "i");
+    const main = document.querySelector('main') || document.body;
+    const nodes = [...main.querySelectorAll('button, [role="button"], [role="radio"], label, div[tabindex], a[role="button"], a[href^="#"], a:not([href^="http"]):not([href=""])')];
+    const options = [];
+    for (const n of nodes) {
+      const txt = (n.innerText || "").trim();
+      if (!txt || txt.length > 80) continue;
+      const rect = n.getBoundingClientRect();
+      if (rect.width < 80 || rect.height < 24) continue;
+      if (n.closest('nav, aside, header')) continue;
+      options.push(txt);
+    }
+    if (!options.length) return null;
+    return options.find((t) => PREFERRED_RE.test(t)) || options[0];
+  }, PREFERRED_SRC).catch(() => null);
+
+  if (!target) return null;
+  console.log(`[onboarding] target option: "${target}"`);
+
+  const esc = target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const regex = new RegExp("^" + esc + "$", "i");
+  const candidates = [
+    () => session.page.locator('main').getByRole("button", { name: regex }).first(),
+    () => session.page.locator('main').getByRole("radio", { name: regex }).first(),
+    () => session.page.locator('main').getByRole("link", { name: regex }).first(),
+    () => session.page.locator('main').getByText(regex, { exact: true }).first(),
+    () => session.page.locator('main button:visible, main [role="button"]:visible, main [role="radio"]:visible, main label:visible, main a:visible').filter({ hasText: regex }).first(),
+  ];
+  for (const build of candidates) {
+    try {
+      const el = build();
+      if (!await el.isVisible({ timeout: 1200 }).catch(() => false)) continue;
+      await el.scrollIntoViewIfNeeded({ timeout: 1200 }).catch(() => {});
+      await el.click({ timeout: 3000, force: true });
+      console.log(`[onboarding] clicked "${target}" via locator`);
+      return target;
+    } catch { /* next */ }
+  }
+  // JS fallback
+  await session.page.evaluate((txt) => {
+    const re = new RegExp("^" + txt.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$", "i");
+    const main = document.querySelector('main') || document.body;
+    const nodes = [...main.querySelectorAll('button, [role="button"], [role="radio"], label, div[tabindex], a')];
+    for (const n of nodes) {
+      if (re.test((n.innerText || "").trim())) {
+        const rect = n.getBoundingClientRect();
+        const opts = { bubbles: true, cancelable: true, view: window, button: 0, clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2 };
+        ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach((t) => {
+          try { n.dispatchEvent(new PointerEvent(t, opts)); } catch { n.dispatchEvent(new MouseEvent(t, opts)); }
+        });
+        n.click();
+        return true;
+      }
+    }
+    return false;
+  }, target).catch(() => {});
+  console.log(`[onboarding] clicked "${target}" via JS fallback`);
+  return target;
+}
+
 async function dismissCookieBannerIfVisible(page) {
   // Try reject-first (privacy), fallback accept. Short 3s window — if no banner
   // in 3s, assume there isn't one and move on.
@@ -2334,14 +3189,40 @@ async function writeJsonAtomic(filePath, data) {
   await fs.rename(tmp, filePath);
 }
 
-function generateInlineProfile() {
+// Password hợp lệ cho OpenAI create-account (≥12 chars, upper + lower + digit
+// + symbol). Deterministic theo oaiDeviceId; worker không persist password
+// riêng (OpenAI chấp nhận email-OTP login sau khi create xong, nên password
+// chỉ dùng 1 lần qua trang /create-account/password). Guarantees: 1 upper
+// + 1 lower + 1 digit + 1 symbol + 12 base64url chars = 16 chars total.
+function generatePasswordForAccount(seedKey) {
+  const h = crypto.createHash("sha256").update(String(seedKey || "")).digest();
+  const b64 = Buffer.from(h).toString("base64url").slice(0, 12);
+  const upper = String.fromCharCode(65 + (h[12] % 26)); // A..Z
+  const lower = String.fromCharCode(97 + (h[13] % 26)); // a..z
+  const digit = String(h[14] % 10); // 0..9
+  const symbols = "!@#$%^&*";
+  const symbol = symbols[h[15] % symbols.length];
+  return `${upper}${lower}${digit}${symbol}${b64}`;
+}
+
+function generateInlineProfile(seedKey) {
   const pool = ["Nguyễn An", "Trần Linh", "Lê Minh", "Phạm Thảo", "Hoàng Quân", "Vũ Hà", "Đặng Nhi", "Bùi Tâm"];
+  // Deterministic nếu có seedKey (vd oaiDeviceId) → cùng account luôn generate
+  // CÙNG name/age. Tránh PROFILE handler re-run tạo random khác mỗi tick khiến
+  // OpenAI thấy "name A → B → C" trong cùng form, loop vô tận.
+  if (seedKey) {
+    const h = crypto.createHash("sha256").update(String(seedKey)).digest();
+    const name = pool[h[0] % pool.length];
+    const age = 25 + (h[1] % 16); // 25..40
+    const year = 2026 - age;
+    const month = 1 + (h[2] % 12);
+    const day = 1 + (h[3] % 28);
+    const birthdate = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+    return { name, birthdate };
+  }
+  // Fallback random cho call không có seed (vd probe mode)
   const name = pool[crypto.randomInt(pool.length)];
-  // Birthdate: age 20-30 random as of 2026 (user policy) → year 1996-2006.
-  // Also keeps numeric-age form fields consistent (same `profile.birthdate` is
-  // used by both the MM/DD/YYYY birthday mask AND the 2026-bYear age fallback
-  // at the PROFILE handler).
-  const age = 20 + crypto.randomInt(11); // 20..30 inclusive
+  const age = 25 + crypto.randomInt(16);
   const year = 2026 - age;
   const month = 1 + crypto.randomInt(12);
   const day = 1 + crypto.randomInt(28);

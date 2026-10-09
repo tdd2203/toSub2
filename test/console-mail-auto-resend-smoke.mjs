@@ -36,6 +36,8 @@ const child = spawn(process.execPath, [
     ONBOARDING_OUTPUT_ROOT: outputRoot,
     TOSUB2_MAC_CREDENTIAL_ROOT: path.join(outputRoot, "test-mac-credentials"),
     ONBOARDING_PROTOCOL_SCRIPT: path.join(projectRoot, "test", "mock-resend-protocol.mjs"),
+    TOSUB2_SIGNUP_BACKEND: "tls",
+    TOSUB2_ALLOW_TLS_SIGNUP: "1",
     MAIL_AUTO_RESEND_AFTER_MS: "400",
     TOSUB2_TLS_PROFILE: "chrome142",
   },

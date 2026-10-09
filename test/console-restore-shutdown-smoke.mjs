@@ -132,6 +132,8 @@ const child = spawn(process.execPath, [
     ...process.env,
     ONBOARDING_OUTPUT_ROOT: outputRoot,
     ONBOARDING_PROTOCOL_SCRIPT: path.join(projectRoot, "test", "mock-protocol-login.mjs"),
+    TOSUB2_SIGNUP_BACKEND: "tls",
+    TOSUB2_ALLOW_TLS_SIGNUP: "1",
     TOSUB2_MAC_CREDENTIAL_ROOT: path.join(tempRoot, "credentials"),
     TOSUB2_TLS_PROFILE: "chrome142",
   },

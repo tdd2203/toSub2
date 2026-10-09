@@ -57,7 +57,12 @@ const sub2api = http.createServer(async (req, res) => {
     const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
     uploadedAccounts = body.accounts || [];
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ success: uploadedAccounts.length, failed: 0, results: [] }));
+    res.end(JSON.stringify({
+      success: uploadedAccounts.length,
+      failed: 0,
+      // Sub2API trả kết quả từng tài khoản trong data.results, cùng thứ tự gửi lên.
+      data: { results: uploadedAccounts.map((account, index) => ({ id: 9000 + index, name: account.name, success: true })) },
+    }));
     return;
   }
   if (req.method === "GET" && req.url?.startsWith("/api/v1/admin/accounts?")) {
@@ -143,6 +148,11 @@ const child = spawn(process.execPath, [
     ...process.env,
     ONBOARDING_OUTPUT_ROOT: outputRoot,
     ONBOARDING_PROTOCOL_SCRIPT: path.join(projectRoot, "test", "mock-protocol-login.mjs"),
+    TOSUB2_SIGNUP_BACKEND: "tls",
+    TOSUB2_ALLOW_TLS_SIGNUP: "1",
+    // Cutoff 0 ngày để "regenerate" đi nhánh TLS refresh như test mong đợi
+    // (mặc định 60 ngày sẽ đẩy tài khoản vừa tạo sang browser full).
+    TOSUB2_REFRESH_BROWSER_AGE_DAYS: "0",
     TOSUB2_TLS_PROFILE: "chrome142",
     PROXY_CONNECTION_RETRY_BASE_MS: "1",
     PROXY_CHANGE_SKIP_LIVE_CHECK: "1",
@@ -154,6 +164,7 @@ const child = spawn(process.execPath, [
       "10.0.0.3": "10.0.0.3",
       "10.0.0.4": "10.0.0.4",
       "10.0.0.5": "10.0.0.5",
+      "10.0.0.6": "10.0.0.6",
       "10.0.0.9": "10.0.0.9",
     }),
     SUB2API_AUTO_REPAIR_COOLDOWN_MS: "0",
@@ -298,6 +309,29 @@ try {
   });
   assert.equal(deleteDomainProxyJobs.status, 200, await deleteDomainProxyJobs.text());
 
+  // --- STRICT domain binding: pool riêng đầy KHÔNG được fallback về pool chung.
+  // Config: d4.test có 1 proxy riêng, limitPerIp=1 → chỉ fit 1 account; account
+  // thứ 2 cùng domain phải NHẬN NULL proxy (strict), KHÔNG được âm thầm rơi vào
+  // pool chung 10.0.0.9. Trước đây allocator fallback giấu lỗi — nay strict trả
+  // null, caller biết phải thêm proxy sạch cho domain.
+  const strictBatch = await fetch(`${baseUrl}/api/jobs/batch`, {
+    method: "POST", headers,
+    body: JSON.stringify({
+      text: ["s1@d4.test", "s2@d4.test"].join("\n"),
+      proxyMode: "batch", limitPerIp: 1, signupBackend: "tls",
+      proxies: "socks5h://10.0.0.9:1080",
+      domainProxies: [{ domain: "d4.test", proxies: "socks5h://10.0.0.6:1080" }],
+    }),
+  });
+  const strictBatchText = await strictBatch.text();
+  assert.equal(strictBatch.status, 201, strictBatchText);
+  const strictJobs = JSON.parse(strictBatchText).jobs;
+  const s1 = strictJobs.find((job) => job.email === "s1@d4.test");
+  const s2 = strictJobs.find((job) => job.email === "s2@d4.test");
+  assert.equal(s1.proxyConfigured, true, `s1 phải nhận domain proxy 10.0.0.6: ${strictBatchText}`);
+  assert.equal(s2.proxyConfigured, false, `s2: domain pool đầy (limit=1) → strict KHÔNG fallback về general 10.0.0.9 (proxyConfigured phải là false): ${strictBatchText}`);
+  await fetch(`${baseUrl}/api/jobs/delete-batch`, { method: "POST", headers, body: JSON.stringify({ ids: strictJobs.map((job) => job.id) }) });
+
   // --- apply-domains: đổi proxy cho tài khoản cũ đặt sai proxy. ---
   //   x@other.test trên 10.0.0.1 (nay là độc quyền d1.test) → đẩy sang pool chung 10.0.0.9 (case B)
   //   y@d1.test   trên 10.0.0.1 (đúng proxy riêng của d1.test) → giữ nguyên
@@ -435,6 +469,8 @@ try {
   }).then((response) => response.json());
   assert.ok(substringSearch.jobs.some((item) => item.email === "cross-platform@example.com"));
   assert.equal(substringSearch.filter.searchEmails, 0);
+  // Danh sách email vừa bị vô hiệu hoá đi kèm response để UI còn đếm ngược trước khi bỏ dòng.
+  assert.ok(Array.isArray(substringSearch.recentDeactivations), "jobs query trả về recentDeactivations");
 
   const downloadResponse = await fetch(`${baseUrl}/api/jobs/${jobId}/download`, { headers });
   assert.equal(downloadResponse.status, 200);
@@ -1456,6 +1492,7 @@ async function waitForJson(url) {
 
 async function waitForJob(headers, jobId, predicate) {
   const deadline = Date.now() + 10_000;
+  let lastSeen = null;
   while (Date.now() < deadline) {
     // The list is sorted by status (running first, completed last), so a job can be on any page.
     let pageNumber = 1;
@@ -1466,12 +1503,13 @@ async function waitForJob(headers, jobId, predicate) {
       const page = await response.json();
       totalPages = page.pagination?.totalPages || 1;
       const job = page.jobs.find((item) => item.id === jobId);
+      if (job) lastSeen = job;
       if (job && predicate(job)) return job;
       pageNumber += 1;
     } while (pageNumber <= totalPages);
     await delay(100);
   }
-  throw new Error(`job ${jobId} did not reach the expected state`);
+  throw new Error(`job ${jobId} did not reach the expected state; last seen: ${JSON.stringify(lastSeen && { status: lastSeen.status, prompt: lastSeen.prompt, lastError: lastSeen.lastError, attempt: lastSeen.attempt, autoRepairBlocked: lastSeen.autoRepairBlocked, lastOperationType: lastSeen.lastOperationType })}`);
 }
 
 async function submitEmailOtp(headers, jobId) {

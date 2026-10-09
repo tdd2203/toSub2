@@ -238,6 +238,28 @@ CREATE TABLE IF NOT EXISTS settings (
     name: "003_used_proxy_emails_exit_ip",
     sql: `ALTER TABLE used_proxy_emails ADD COLUMN exit_ip TEXT;`,
   },
+  {
+    // Phân luồng refresh/verify theo tuổi acc + nguồn.
+    //   source='system'    → acc do console tự signup
+    //   source='external'  → acc nhập từ ngoài (chưa có endpoint, dành cho tương lai)
+    //   signup_completed_at = ISO khi job hoàn tất full-signin lần đầu (sub2api-import-oauth.json ghi xong)
+    // Backfill: mọi row result_saved=1 có output_path → signup_completed_at = COALESCE(registered_at, completed_at, updated_at)
+    name: "004_job_source_and_signup_completed_at",
+    sql: `
+ALTER TABLE jobs ADD COLUMN source TEXT NOT NULL DEFAULT 'system';
+ALTER TABLE jobs ADD COLUMN signup_completed_at TEXT;
+
+UPDATE jobs
+   SET signup_completed_at = COALESCE(registered_at, completed_at, updated_at)
+ WHERE signup_completed_at IS NULL
+   AND result_saved = 1
+   AND output_path IS NOT NULL
+   AND output_path != '';
+
+CREATE INDEX IF NOT EXISTS idx_jobs_source ON jobs(source);
+CREATE INDEX IF NOT EXISTS idx_jobs_signup_completed_at ON jobs(signup_completed_at);
+    `,
+  },
 ];
 
 // ============================================================
@@ -265,6 +287,7 @@ const JOB_COLS = [
   "auto_repair_pending_account_ids", "auto_repair_pending_backend", "auto_repair_operation",
   "sub2api_uploaded_at", "sub2api_uploaded_base_url",
   "tls_profile",
+  "source", "signup_completed_at",
 ];
 
 const JOB_INSERT_SQL = `INSERT INTO jobs (${JOB_COLS.join(", ")}) VALUES (${JOB_COLS.map((c) => ":" + c).join(", ")})`;
@@ -332,6 +355,19 @@ export const jobDao = {
     const placeholders = emails.map(() => "?").join(",");
     return db.prepare(`SELECT * FROM jobs WHERE LOWER(email) IN (${placeholders}) ORDER BY created_at DESC`)
       .all(emails.map((e) => e.toLowerCase())).map(deserializeJob);
+  },
+
+  markSignupCompleted(id, isoTs) {
+    getDb().prepare("UPDATE jobs SET signup_completed_at = :ts, updated_at = :ts WHERE id = :id AND signup_completed_at IS NULL")
+      .run({ id, ts: isoTs || new Date().toISOString() });
+  },
+
+  setSource(id, source) {
+    if (source !== "system" && source !== "external") {
+      throw new Error(`invalid source: ${source}`);
+    }
+    getDb().prepare("UPDATE jobs SET source = :source, updated_at = :ts WHERE id = :id")
+      .run({ id, source, ts: new Date().toISOString() });
   },
 };
 
@@ -401,6 +437,8 @@ function serializeJob(job) {
     sub2api_uploaded_at: job.sub2api_uploaded_at ?? job.sub2apiUploadedAt ?? null,
     sub2api_uploaded_base_url: job.sub2api_uploaded_base_url ?? job.sub2apiUploadedBaseUrl ?? null,
     tls_profile: job.tls_profile ?? job.tlsProfile ?? null,
+    source: job.source ?? job.accountSource ?? "system",
+    signup_completed_at: job.signup_completed_at ?? job.signupCompletedAt ?? null,
   };
 }
 
@@ -564,6 +602,32 @@ export const usedProxyDao = {
     const map = new Map();
     for (const r of rows) {
       map.set(r.host, { total: Number(r.total) || 0, deactivated: Number(r.deactivated) || 0 });
+    }
+    return map;
+  },
+
+  // Per-HOST breakdown of every exit IP that host has gone out through, so the
+  // console can tell "fresh IP after a rotate" apart from "no data" — a host that
+  // previously burned on IP X and now exits via IP Y is semantically "đã đổi IP"
+  // even if Y has not had new registrations yet. Records with NULL exit_ip (older
+  // writes) are excluded. Returns Map<host, Map<exit_ip, { total, deactivated }>>.
+  exitIpsByHost() {
+    const rows = getDb().prepare(`
+      SELECT p.host AS host,
+             e.exit_ip AS exitIp,
+             COUNT(DISTINCT e.email) AS total,
+             COUNT(DISTINCT CASE WHEN d.email IS NOT NULL THEN e.email END) AS deactivated
+      FROM used_proxies p
+      JOIN used_proxy_emails e ON e.identity_key = p.identity_key
+      LEFT JOIN deactivated_emails d ON lower(e.email) = d.email
+      WHERE p.host <> '' AND e.exit_ip IS NOT NULL AND e.exit_ip <> ''
+      GROUP BY p.host, e.exit_ip
+    `).all();
+    const map = new Map();
+    for (const r of rows) {
+      let bucket = map.get(r.host);
+      if (!bucket) { bucket = new Map(); map.set(r.host, bucket); }
+      bucket.set(r.exitIp, { total: Number(r.total) || 0, deactivated: Number(r.deactivated) || 0 });
     }
     return map;
   },

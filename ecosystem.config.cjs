@@ -21,6 +21,16 @@ module.exports = {
     env: {
       NODE_ENV: "production",
       ONBOARDING_OUTPUT_ROOT: outputRoot,
+      // Profile curl_cffi cho TÀI KHOẢN MỚI (tài khoản cũ giữ chrome146 đã đóng dấu).
+      // Đổi giá trị ở đây rồi chạy `pm2 restart tosub2 --update-env` để áp dụng.
+      TOSUB2_TLS_PROFILE: String(process.env.TOSUB2_TLS_PROFILE || "chrome142"),
+      // Signup backend mặc định cho job mới qua UI "Đưa vào tác vụ":
+      // "browser" (CloakBrowser + full automation) hoặc "tls" (protocol-login
+      // cũ qua curl_cffi). UI không pass signupBackend → fallback về giá trị này.
+      TOSUB2_SIGNUP_BACKEND: String(process.env.TOSUB2_SIGNUP_BACKEND || "browser"),
+      // Engine cho browser lane: "cloak" (CloakBrowser 146, SOCKS5+auth native)
+      // hoặc "patchright" (Google Chrome stable). Mặc định cloak.
+      CHATGPT_BROWSER_ENGINE: String(process.env.CHATGPT_BROWSER_ENGINE || "cloak"),
     },
   }],
 };

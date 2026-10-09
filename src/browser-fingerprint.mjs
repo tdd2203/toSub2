@@ -299,69 +299,13 @@ export function buildInitScript(fingerprint) {
     }
   } catch {}
 
-  // Worker context inject: addInitScript chỉ chạy ở main window + iframes,
-  // không chạy trong Web Workers. Creepjs cross-check main vs worker và sees
-  // worker có lang=en-US + timezone=Asia/Saigon + UA Chrome/145 + GPU M3 Max
-  // trong khi main đã patch → "lies detected". Hook Worker constructor để
-  // inject lại init script source qua blob URL trước khi worker script chạy.
-  try {
-    const INIT_SRC = \`
-      try { Object.defineProperty(Navigator.prototype, 'language', { get: () => 'vi-VN', configurable: true }); } catch(e){}
-      try { Object.defineProperty(Navigator.prototype, 'languages', { get: () => Object.freeze(['vi-VN','vi','en-US','en']), configurable: true }); } catch(e){}
-      try { Object.defineProperty(Navigator.prototype, 'hardwareConcurrency', { get: () => ${Number(hardwareConcurrency)}, configurable: true }); } catch(e){}
-      try { Object.defineProperty(Navigator.prototype, 'deviceMemory', { get: () => ${Number(deviceMemory)}, configurable: true }); } catch(e){}
-      try { Object.defineProperty(Navigator.prototype, 'webdriver', { get: () => false, configurable: true }); } catch(e){}
-      try {
-        const canonicalTZ = (tz) => tz === 'Asia/Saigon' ? 'Asia/Ho_Chi_Minh' : tz;
-        const spoof = (orig) => function patched() {
-          const o = orig.call(this);
-          if (o) {
-            if (o.timeZone) o.timeZone = canonicalTZ(o.timeZone);
-            if (o.locale === 'en-US') o.locale = 'vi-VN';
-          }
-          return o;
-        };
-        for (const Ctor of [Intl.DateTimeFormat, Intl.NumberFormat, Intl.Collator, Intl.RelativeTimeFormat, Intl.ListFormat, Intl.PluralRules]) {
-          try { if (Ctor && Ctor.prototype && Ctor.prototype.resolvedOptions) Ctor.prototype.resolvedOptions = spoof(Ctor.prototype.resolvedOptions); } catch(e){}
-        }
-      } catch(e){}
-      try {
-        const WEBGL_VENDOR = 0x1F00, WEBGL_RENDERER = 0x1F01, UNMASKED_VENDOR_WEBGL = 0x9245, UNMASKED_RENDERER_WEBGL = 0x9246;
-        const v = 'Google Inc. (Apple)', r = 'ANGLE (Apple, ANGLE Metal Renderer: Apple M1 Pro, Unspecified Version)';
-        const spoofP = (orig) => function patched(p) {
-          if (p === WEBGL_VENDOR || p === UNMASKED_VENDOR_WEBGL) return v;
-          if (p === WEBGL_RENDERER || p === UNMASKED_RENDERER_WEBGL) return r;
-          return orig.call(this, p);
-        };
-        if (typeof WebGLRenderingContext !== 'undefined') WebGLRenderingContext.prototype.getParameter = spoofP(WebGLRenderingContext.prototype.getParameter);
-        if (typeof WebGL2RenderingContext !== 'undefined') WebGL2RenderingContext.prototype.getParameter = spoofP(WebGL2RenderingContext.prototype.getParameter);
-      } catch(e){}
-    \`;
-    const OrigWorker = window.Worker;
-    if (OrigWorker) {
-      const wrapScript = (urlOrScript) => {
-        try {
-          // Fetch worker script source, prepend INIT_SRC, serve via Blob URL.
-          // Giữ nguyên type (classic/module) + semantics; nếu fetch fail
-          // fall-through dùng URL gốc để không break worker.
-          const stringScript = typeof urlOrScript === 'string' ? urlOrScript : (urlOrScript && urlOrScript.href);
-          if (!stringScript) return urlOrScript;
-          const xhr = new XMLHttpRequest();
-          xhr.open('GET', stringScript, false); // sync để chạy trước Worker ctor
-          xhr.send();
-          if (xhr.status === 200 || xhr.status === 0) {
-            const blob = new Blob([INIT_SRC + '\\n' + xhr.responseText], { type: 'application/javascript' });
-            return URL.createObjectURL(blob);
-          }
-        } catch(e){}
-        return urlOrScript;
-      };
-      window.Worker = function WrappedWorker(scriptURL, opts) {
-        return new OrigWorker(wrapScript(scriptURL), opts);
-      };
-      window.Worker.prototype = OrigWorker.prototype;
-    }
-  } catch {}
+  // NOTE: Worker constructor hook (window.Worker = WrappedWorker + sync XHR
+  // + Blob URL rewrite) đã BỊ TẮT. Pattern này quá aggressive: Cloudflare bot
+  // detection flag khi window.Worker bị override + sync XHR fetch cross-origin
+  // worker script → trigger "just a moment" challenge trên chatgpt.com/
+  // auth.openai.com. Trade-off: creepjs sẽ hiện Worker scope leak lại (lang
+  // en-US, timezone Asia/Saigon, UA 145, GPU M3 Max) nhưng OpenAI/Cloudflare
+  // care về consistency MAIN thread chủ yếu — worker leak không block login.
 })();
 `;
 }

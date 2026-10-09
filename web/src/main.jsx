@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Ban,
@@ -9,6 +9,7 @@ import {
   ChevronDown,
   ChevronUp,
   CircleAlert,
+  Clock,
   CloudUpload,
   Copy,
   Download,
@@ -34,6 +35,7 @@ import {
   RotateCcw,
   Send,
   Settings2,
+  ShieldAlert,
   ShieldCheck,
   Smartphone,
   PhoneIncoming,
@@ -45,6 +47,8 @@ import { t, tf, ts, tsLines, LANGS, getLang, setActiveLang, readInitialLang, per
 import * as settingsStore from "./settings-store.js";
 
 const POLL_INTERVAL_MS = 900;
+// Tài khoản bị vô hiệu hoá ở bước 4 còn nán lại bao lâu (đếm ngược) trước khi mất.
+const GHOST_DEACTIVATION_TTL_MS = 20_000;
 const LUBAN_API_KEY_STORAGE_KEY = "chatgpt-onboarding.luban-api-key";
 const LUBAN_SERVICE_ID_STORAGE_KEY = "chatgpt-onboarding.luban-service-id";
 const SMS_PROVIDER_SETTINGS_KEY = "chatgpt-onboarding.sms-provider-settings-v1";
@@ -75,6 +79,11 @@ function App() {
   const [token, setToken] = useState("");
   const [features, setFeatures] = useState({});
   const [jobs, setJobs] = useState([]);
+  // Dòng "bóng" cho tài khoản vừa bị vô hiệu hoá ở bước 4: job đã bị xoá khỏi
+  // server nhưng vẫn giữ lại dòng, đếm ngược GHOST_DEACTIVATION_TTL_MS rồi mới bỏ.
+  const [ghostJobs, setGhostJobs] = useState([]);
+  const [deactivationTick, setDeactivationTick] = useState(() => Date.now());
+  const jobsRef = useRef([]);
   const [email, setEmail] = useState("");
   const [busy, setBusy] = useState(false);
   const [batchOpen, setBatchOpen] = useState(false);
@@ -516,6 +525,8 @@ function App() {
             })
           : await apiFetch(token, `/api/jobs?page=${page}`);
         if (!stopped) {
+          registerDeactivatedGhosts(jobsRef.current, data.jobs, data.recentDeactivations || []);
+          jobsRef.current = data.jobs;
           setJobs(data.jobs);
           setJobSelectionIndex(data.selection || data.jobs);
           setPagination(data.pagination || { page, pageSize: 20, total: data.jobs.length, totalPages: 1 });
@@ -536,6 +547,65 @@ function App() {
       window.clearTimeout(timer);
     };
   }, [token, page, emailFilter, emailSearch]);
+
+  // Tài khoản ở bước 4 bị vô hiệu hoá → server xoá job nên nó biến mất khỏi lần
+  // poll kế tiếp. Dòng nào vừa biến mất MÀ email của nó nằm trong danh sách vừa bị
+  // vô hiệu hoá thì giữ lại thành dòng "bóng" để đếm ngược trước khi bỏ hẳn.
+  const registerDeactivatedGhosts = useCallback((previousJobs, incomingJobs, recentDeactivations) => {
+    if (!recentDeactivations.length || !previousJobs.length) return;
+    const incomingIds = new Set(incomingJobs.map((job) => job.id));
+    const recentByEmail = new Map(recentDeactivations.map((item) => [item.email.toLowerCase(), item]));
+    const vanished = previousJobs.filter(
+      (job) => !incomingIds.has(job.id) && recentByEmail.has(job.email.toLowerCase()),
+    );
+    if (!vanished.length) return;
+    setGhostJobs((ghosts) => {
+      const known = new Set(ghosts.map((ghost) => ghost.email.toLowerCase()));
+      const additions = vanished
+        .filter((job) => !known.has(job.email.toLowerCase()))
+        .map((job) => {
+          const info = recentByEmail.get(job.email.toLowerCase());
+          // Đếm ngược tính từ lúc console thấy nó biến mất → luôn đủ trọn 20s.
+          return {
+            ...job,
+            deactivated: true,
+            deactivatedReason: info.reason,
+            deactivatedAt: info.at,
+            ghostExpiresAt: Date.now() + GHOST_DEACTIVATION_TTL_MS,
+          };
+        });
+      return additions.length ? [...ghosts, ...additions] : ghosts;
+    });
+  }, []);
+
+  // Nhịp 1s để đếm ngược; chỉ chạy khi còn dòng bóng.
+  useEffect(() => {
+    if (!ghostJobs.length) return undefined;
+    const timer = window.setInterval(() => setDeactivationTick(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [ghostJobs.length]);
+
+  // Bỏ dòng bóng khi hết giờ đếm ngược, hoặc khi email đó đăng ký lại (job sống lại).
+  useEffect(() => {
+    setGhostJobs((ghosts) => {
+      if (!ghosts.length) return ghosts;
+      const liveEmails = new Set(jobs.map((job) => job.email.toLowerCase()));
+      const next = ghosts.filter(
+        (ghost) => ghost.ghostExpiresAt > deactivationTick && !liveEmails.has(ghost.email.toLowerCase()),
+      );
+      return next.length === ghosts.length ? ghosts : next;
+    });
+  }, [deactivationTick, jobs]);
+
+  // Gộp job thật với dòng bóng, sắp theo thời điểm tạo (mới nhất trên đầu) để dòng
+  // bóng vẫn nằm đúng vị trí cũ của nó trong lúc đếm ngược.
+  const displayJobs = useMemo(() => {
+    if (!ghostJobs.length) return jobs;
+    const liveEmails = new Set(jobs.map((job) => job.email.toLowerCase()));
+    const ghosts = ghostJobs.filter((ghost) => !liveEmails.has(ghost.email.toLowerCase()));
+    if (!ghosts.length) return jobs;
+    return [...jobs, ...ghosts].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  }, [jobs, ghostJobs]);
 
   useEffect(() => {
     if (!token || !features.sub2apiMonitor) return undefined;
@@ -596,6 +666,8 @@ function App() {
   const forceReloginSelectedCount = selectedJobs.filter((job) => job.canForceRelogin).length;
   const canForceReloginSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && forceReloginSelectedCount > 0;
+  const forceBrowserVerifySelectedCount = forceReloginSelectedCount;
+  const canForceBrowserVerifySelected = canForceReloginSelected;
   const canUploadSelected = selectedJobs.length > 0 && downloadableSelectedCount > 0;
   const totpSetupSelectedCount = selectedJobs.filter((job) => job.canSetupTotp).length;
   const canSetupTotpSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
@@ -748,14 +820,38 @@ function App() {
     setBatchAction("upload");
     setUploadNotice("");
     try {
+      // Normalize proxyLink trước khi gửi: server `readProxyAllocConfig` parse
+      // bằng `new URL(line)` nên domainProxies.proxies PHẢI ở URL format đầy
+      // đủ (scheme://user:pass@host:port). State lưu bare `host:port:user:pass`
+      // + protocol riêng, nên normalize giống `newJobProxyPayload` ở trên.
+      // Trước đây gửi RAW → bare lines parse fail → domain group rỗng → acc
+      // dataidcc.com không nhận đúng proxy riêng khi upload Sub2API.
+      const normalizedProxyLink = {
+        mode: proxyLinkConfig.mode,
+        limitPerIp: proxyLinkConfig.limitPerIp,
+        proxies: normalizeProxyText(proxyLinkConfig.proxies || ""),
+        domainProxies: (proxyLinkConfig.domainProxies || [])
+          .map((g) => ({ domain: String(g?.domain || "").trim(), proxies: normalizeProxyText(g?.proxies || "", g?.protocol || "socks5h") }))
+          .filter((g) => g.domain && g.proxies.trim()),
+      };
       const data = await apiFetch(token, "/api/sub2api/upload", {
         method: "POST",
-        body: JSON.stringify({ ids, config: sub2apiSettings, proxyLink: proxyLinkConfig }),
+        body: JSON.stringify({ ids, config: sub2apiSettings, proxyLink: normalizedProxyLink }),
       });
       const result = data.result || {};
-      const created = result.account_created ?? result.success ?? data.uploaded;
-      const failed = result.account_failed ?? result.failed ?? 0;
-      setUploadNotice(`${tf("已上传 {0} 条", created)}${failed ? tf("，失败 {0} 条", failed) : ""}${data.proxiesCreated ? tf("，创建代理 {0} 个", data.proxiesCreated) : ""}${data.unassigned ? tf("，{0} 条未分配代理", data.unassigned) : ""}${data.skipped ? tf("，跳过未完成任务 {0} 条", data.skipped) : ""}`);
+      const created = data.uploaded ?? result.account_created ?? result.success ?? 0;
+      const failed = data.failed ?? result.account_failed ?? result.failed ?? 0;
+      // Per-account breakdown: show mỗi email thành công/thất bại + lý do
+      // trong notice. Giới hạn 10 dòng tránh overflow; append "..." nếu nhiều hơn.
+      const statuses = Array.isArray(data.accountStatuses) ? data.accountStatuses : [];
+      const okLines = statuses.filter((s) => s.success).map((s) => `✓ ${s.email}${s.sub2apiId ? ` (id ${s.sub2apiId})` : ""}`);
+      const failLines = statuses.filter((s) => !s.success).map((s) => `✗ ${s.email}: ${s.error || "unknown"}`);
+      const allLines = [...failLines, ...okLines]; // failures first
+      const shownLines = allLines.slice(0, 10);
+      const extra = allLines.length > 10 ? tf("…和另外 {0} 条", allLines.length - 10) : "";
+      const summary = `${tf("已上传 {0} 条", created)}${failed ? tf("，失败 {0} 条", failed) : ""}${data.proxiesCreated ? tf("，创建代理 {0} 个", data.proxiesCreated) : ""}${data.unassigned ? tf("，{0} 条未分配代理", data.unassigned) : ""}${data.skipped ? tf("，跳过未完成任务 {0} 条", data.skipped) : ""}`;
+      const detail = shownLines.length ? `\n${shownLines.join("\n")}${extra ? "\n" + extra : ""}` : "";
+      setUploadNotice(`${summary}${detail}`);
       setSelectedJobIds(new Set());
       setError("");
     } catch (requestError) {
@@ -1021,7 +1117,7 @@ function App() {
     try {
       const data = await apiFetch(token, "/api/jobs", {
         method: "POST",
-        body: JSON.stringify({ email: email.trim(), ...newJobProxyPayload() }),
+        body: JSON.stringify({ email: email.trim(), signupBackend: "browser", ...newJobProxyPayload() }),
       });
       setPage(1);
       if (page === 1) setJobs((current) => mergeJobs([data.job], current).slice(0, 20));
@@ -1083,7 +1179,12 @@ function App() {
     try {
       const data = await apiFetch(token, "/api/jobs/batch", {
         method: "POST",
-        body: JSON.stringify({ text: runText, ...newJobProxyPayload() }),
+        // signupBackend: "browser" → mặc định dùng CloakBrowser real browser lane.
+        // Server default DEFAULT_SIGNUP_BACKEND trong env, nhưng pm2 reload có khi
+        // không pick up — force client-side để chắc chắn tất cả job mới dùng
+        // browser lane với toàn bộ auto-flow (LANDING/OTP/PROFILE/ONBOARDING/
+        // PHONE/OAUTH_CONSENT escalation).
+        body: JSON.stringify({ text: runText, signupBackend: "browser", ...newJobProxyPayload() }),
       });
       setPage(1);
       if (page === 1) setJobs((current) => mergeJobs(data.jobs, current).slice(0, 20));
@@ -1431,10 +1532,11 @@ function App() {
     if (!canReauthorizeSelected || batchAction) return;
     setBatchAction("reauthorize");
     try {
-      await apiFetch(token, "/api/jobs/reauthorize-batch", {
+      const data = await apiFetch(token, "/api/jobs/reauthorize-batch", {
         method: "POST",
         body: JSON.stringify({ ids: [...selectedJobIds], ...reuseProxyPayload() }),
       });
+      setUploadNotice(tf("已刷新 {0} 个账号授权", data?.started ?? selectedJobIds.size));
       setSelectedJobIds(new Set());
       setError("");
     } catch (requestError) {
@@ -1498,6 +1600,27 @@ function App() {
         body: JSON.stringify({ ids: [...selectedJobIds], ...reuseProxyPayload() }),
       });
       setUploadNotice(`${tf("已开始重新登录并授权 {0} 个账号", data.started)}${data.skipped ? tf("，跳过 {0} 个", data.skipped) : ""}`);
+      setSelectedJobIds(new Set());
+      setError("");
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBatchAction("");
+    }
+  }
+
+  async function forceBrowserVerifySelected() {
+    if (!canForceBrowserVerifySelected || batchAction) return;
+    const skipped = selectedJobIds.size - forceBrowserVerifySelectedCount;
+    const message = `${tf("确定对选中的 {0} 个账号强制浏览器验证吗？将忽略刷新令牌策略（含年龄 60 天规则）。", forceBrowserVerifySelectedCount)}${skipped ? tf("另有 {0} 个进行中账号将自动跳过。", skipped) : ""}`;
+    if (!window.confirm(message)) return;
+    setBatchAction("force-browser-verify");
+    try {
+      const data = await apiFetch(token, "/api/jobs/force-browser-verify-batch", {
+        method: "POST",
+        body: JSON.stringify({ ids: [...selectedJobIds], ...reuseProxyPayload() }),
+      });
+      setUploadNotice(`${tf("已开始强制浏览器验证 {0} 个账号", data.started)}${data.skipped ? tf("，跳过 {0} 个", data.skipped) : ""}`);
       setSelectedJobIds(new Set());
       setError("");
     } catch (requestError) {
@@ -1970,6 +2093,18 @@ function App() {
                   {t("批量重新登录并授权")}
                 </button>
               )}
+              {features.forceBrowserVerify && (
+                <button
+                  type="button"
+                  className="verify-button bulk-button"
+                  onClick={forceBrowserVerifySelected}
+                  disabled={!canForceBrowserVerifySelected || Boolean(batchAction)}
+                  title={t("跳过策略（含 60 天刷新规则），强制启动浏览器完整验证流程")}
+                >
+                  {batchAction === "force-browser-verify" ? <LoaderCircle className="spin" size={16} /> : <ShieldAlert size={16} />}
+                  {t("批量强制浏览器验证")}
+                </button>
+              )}
               {features.totpSetup && (
                 <button type="button" className="secondary-button bulk-button" onClick={setupTotpSelected} disabled={!canSetupTotpSelected || Boolean(batchAction)}>
                   {batchAction === "setup-2fa" ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}
@@ -2012,30 +2147,36 @@ function App() {
               </tr>
             </thead>
             <tbody>
-              {!jobs.length && <EmptyState filtered={emailFilter.length > 0} />}
-              {jobs.map((job) => (
+              {!displayJobs.length && <EmptyState filtered={emailFilter.length > 0} />}
+              {displayJobs.map((job) => (
                 <React.Fragment key={job.id}>
-                  <JobRow
-                    job={job}
-                    token={token}
-                    expanded={expandedJobId === job.id}
-                    onToggleLogs={() => setExpandedJobId((current) => current === job.id ? null : job.id)}
-                    onError={setError}
-                    selected={selectedJobIds.has(job.id)}
-                    onToggleSelected={() => toggleJobSelection(job.id)}
-                    selectionSupported={Boolean(features.bulkActions)}
-                    smsProviderAvailable={smsProviderDefinitions.length > 0}
-                    smsProvider={activeSmsProvider}
-                    onUpload={() => uploadSelected([job.id])}
-                    sub2apiUploadAvailable={Boolean(features.sub2apiUpload && sub2apiSettings.baseUrl && sub2apiSettings.adminApiKey)}
-                    totpSetupAvailable={Boolean(features.totpSetup)}
-                    passwordAddAvailable={Boolean(features.passwordAdd)}
-                    forceReloginAvailable={Boolean(features.forceRelogin)}
-                    accountProxyUrl={accountProxyUrl}
-                    proxyBatchMode={proxyBatchMode}
-                    sub2apiConfig={sub2apiSettings}
-                  />
-                  {expandedJobId === job.id && (
+                  {job.deactivated ? (
+                    <DeactivatedGhostRow job={job} tick={deactivationTick} />
+                  ) : (
+                    <JobRow
+                      job={job}
+                      token={token}
+                      expanded={expandedJobId === job.id}
+                      onToggleLogs={() => setExpandedJobId((current) => current === job.id ? null : job.id)}
+                      onError={setError}
+                      selected={selectedJobIds.has(job.id)}
+                      onToggleSelected={() => toggleJobSelection(job.id)}
+                      selectionSupported={Boolean(features.bulkActions)}
+                      smsProviderAvailable={smsProviderDefinitions.length > 0}
+                      smsProvider={activeSmsProvider}
+                      onUpload={() => uploadSelected([job.id])}
+                      sub2apiUploadAvailable={Boolean(features.sub2apiUpload && sub2apiSettings.baseUrl && sub2apiSettings.adminApiKey)}
+                      totpSetupAvailable={Boolean(features.totpSetup)}
+                      passwordAddAvailable={Boolean(features.passwordAdd)}
+                      forceReloginAvailable={Boolean(features.forceRelogin)}
+                      forceBrowserVerifyAvailable={Boolean(features.forceBrowserVerify)}
+                      refreshLaneAgeDays={Number(features.refreshLaneAgeDays) || 60}
+                      accountProxyUrl={accountProxyUrl}
+                      proxyBatchMode={proxyBatchMode}
+                      sub2apiConfig={sub2apiSettings}
+                    />
+                  )}
+                  {!job.deactivated && expandedJobId === job.id && (
                     <tr className="log-row">
                       <td colSpan="7"><JobLogs token={token} jobId={job.id} /></td>
                     </tr>
@@ -2594,8 +2735,8 @@ function App() {
 
             <div className="proxy-table">
               <div className="proxy-thead">
-                <span>{t("协议")}</span>
                 <span>{t("代理 IP")}</span>
+                <span>{t("出口 IP")}</span>
                 <span>{t("状态")}</span>
                 <span>{t("已注册邮箱")}</span>
                 <span style={{ textAlign: "center" }}>{t("被封号")}</span>
@@ -2616,31 +2757,24 @@ function App() {
                     return (
                       <div key={p.label} className={`proxy-row ${p.burned ? "burned" : ""}`}>
                         <div className="proxy-row-main">
-                          <span className={`proxy-pill ${isSocks ? "socks" : "http"}`}>
-                            <Network size={12} />{isSocks ? "SOCKS5" : (p.protocol || "?").toUpperCase()}
-                          </span>
                           <div className="proxy-ipcell">
-                            <div className="addr" title={p.label}>
-                              {p.label}
+                            <div className="proxy-ipcell-top">
+                              <span className="addr" title={p.label}>{p.label}</span>
                               {!p.configured ? <span className="proxy-old">{t("IP 旧")}</span> : null}
                               {proxyDomainByHost.get(p.host) ? <span className="proxy-domain-tag" title={proxyDomainByHost.get(p.host)}>{proxyDomainByHost.get(p.host)}</span> : null}
-                              {(() => {
-                                // "Checking" — IP RA THỰC đang ra đã sạch hay vẫn cháy
-                                switch (p.curExitStatus) {
-                                  case "burned":
-                                    return <span className="proxy-check burn" title={tf("当前出口 IP 已有 {0} 个账号被封，需更换", p.curExitDisabled)}><Ban size={11} />{t("需换 IP")}</span>;
-                                  case "burning":
-                                    return <span className="proxy-check warn" title={tf("当前出口 IP 已有 {0} 个账号被封", p.curExitDisabled)}><CircleAlert size={11} />{tf("当前 IP {0} 封", p.curExitDisabled)}</span>;
-                                  case "clean":
-                                    return <span className="proxy-check ok" title={t("当前出口 IP 尚无账号被封，已更换成功")}><Check size={11} />{t("已换 IP")}</span>;
-                                  case "nodata":
-                                    return <span className="proxy-check muted" title={t("当前出口 IP 还没有新账号数据")}>{t("当前 IP 暂无数据")}</span>;
-                                  default:
-                                    return null; // unknown: proxy chết, pill "连接失败" đã báo
-                                }
-                              })()}
                             </div>
-                            {p.connected && p.ip ? <div className="exit">{tf("出口 {0}", p.ip)}</div> : (!p.connected && p.error ? <div className="exit" title={p.error}>{ts(p.error)}</div> : null)}
+                            <span className={`proxy-pill ${isSocks ? "socks" : "http"}`}>
+                              <Network size={12} />{isSocks ? "SOCKS5" : (p.protocol || "?").toUpperCase()}
+                            </span>
+                          </div>
+                          <div className={`proxy-exitcell ${p.connected && p.ip ? "ok" : (!p.connected ? "down" : "muted")}`}>
+                            {p.connected && p.ip ? (
+                              <span className="exit-ip" title={p.ip}>{p.ip}</span>
+                            ) : !p.connected && p.error ? (
+                              <span className="exit-err" title={p.error}>{ts(p.error)}</span>
+                            ) : (
+                              <span className="exit-dash">—</span>
+                            )}
                           </div>
                           <span className={`proxy-pill ${p.connected ? "ok" : "down"}`} title={p.connected ? "" : (p.error || "")}>
                             {p.connected ? <Check size={12} /> : <CircleAlert size={12} />}
@@ -2650,12 +2784,47 @@ function App() {
                             <Mail size={14} />{tf("{0} 个邮箱", p.emailCount)}
                             {p.emailCount ? (expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />) : null}
                           </button>
-                          <span
-                            className={`proxy-disabled ${p.disabledCount >= (proxyStatus.burnThreshold || 5) ? "burn" : (p.disabledCount ? "warn" : "")}`}
-                            title={p.disabledCount ? tf("历史封号 {0}/{1}（该代理全部记录，不随换 IP 清零）", p.disabledCount, p.disabledTotal) : t("该代理暂无封号记录")}
-                          >
-                            {p.disabledCount ? <><Ban size={12} />{p.disabledCount}</> : <small>0</small>}
-                          </span>
+                          {(() => {
+                            const burnTh = proxyStatus.burnThreshold || 5;
+                            // (1) Đã đổi IP chưa — dựa trên IP RA THỰC đang ra hiện tại:
+                            //     clean → đã đổi (sạch, hoặc rotate khỏi IP cũ đã cháy)
+                            //     burning/burned → chưa đổi (còn cháy)
+                            //     error → proxy lỗi (đã thử nhưng probe fail)
+                            //     nodata/unknown → chưa rõ.
+                            const changed = p.curExitStatus === "clean" ? "yes"
+                              : (p.curExitStatus === "burning" || p.curExitStatus === "burned") ? "no"
+                              : p.curExitStatus === "error" ? "err"
+                              : "unk";
+                            // (2) IP mới (IP ra hiện tại) đã làm vô hiệu hoá bao nhiêu email.
+                            const newKnown = p.curExitStatus !== "unknown" && p.curExitStatus !== "error";
+                            const newTone = !newKnown ? "" : (p.curExitDisabled >= burnTh ? "burn" : (p.curExitDisabled ? "warn" : ""));
+                            // (3) Tổng email bị vô hiệu bởi proxy này (trọn đời, không reset khi đổi IP).
+                            const totTone = p.disabledCount >= burnTh ? "burn" : (p.disabledCount ? "warn" : "");
+                            return (
+                              <div className="proxy-ban">
+                                <span
+                                  className={`pd-flag ${changed}`}
+                                  title={changed === "yes" ? t("当前出口 IP 尚无账号被封，已更换成功")
+                                    : changed === "no" ? tf("当前出口 IP 已有 {0} 个账号被封", p.curExitDisabled)
+                                    : changed === "err" ? ts(p.error || t("代理连接失败"))
+                                    : t("当前出口 IP 还没有新账号数据")}
+                                >
+                                  {changed === "yes" ? <><Check size={11} />{t("已换 IP")}</>
+                                    : changed === "no" ? <><Ban size={11} />{t("未换 IP")}</>
+                                    : changed === "err" ? <><CircleAlert size={11} />{t("代理异常")}</>
+                                    : <><CircleAlert size={11} />{t("未知")}</>}
+                                </span>
+                                <div className="pd-stats">
+                                  <span className={`pd-stat ${newTone}`} title={tf("当前出口 IP 封 {0}/{1}", p.curExitDisabled, p.curExitTotal)}>
+                                    <em>{t("新 IP")}</em>{newKnown ? p.curExitDisabled : "—"}
+                                  </span>
+                                  <span className={`pd-stat ${totTone}`} title={p.disabledCount ? tf("历史封号 {0}/{1}（该代理全部记录，不随换 IP 清零）", p.disabledCount, p.disabledTotal) : t("该代理暂无封号记录")}>
+                                    <em>{t("合计")}</em>{p.disabledCount}
+                                  </span>
+                                </div>
+                              </div>
+                            );
+                          })()}
                           <span className="proxy-remain" style={{ textAlign: "right" }}>
                             {p.remaining}<small>{tf(" / {0}", proxyStatus.limitPerIp)}</small>
                           </span>
@@ -3424,7 +3593,46 @@ function EmptyState({ filtered = false }) {
   );
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, proxyBatchMode, sub2apiConfig }) {
+// Dòng của tài khoản vừa bị vô hiệu hoá: job đã bị xoá khỏi server, giữ lại để
+// đếm ngược cho người vận hành kịp thấy rồi tự bỏ đi.
+function DeactivatedGhostRow({ job, tick }) {
+  const remaining = Math.max(0, Math.ceil((job.ghostExpiresAt - tick) / 1000));
+  return (
+    <tr className="job-row deactivated-row">
+      <td className="select-cell">
+        <input type="checkbox" checked={false} readOnly disabled aria-hidden="true" />
+      </td>
+      <td>
+        <div className="account-cell">
+          <div className="account-avatar">{job.email.slice(0, 1).toUpperCase()}</div>
+          <div className="account-details"><strong>{job.email}</strong><span>{shortId(job.id)}</span></div>
+        </div>
+      </td>
+      <td>
+        <div className="status-cell">
+          <span className="status-badge deactivated"><Ban size={14} />{t("已停用")}</span>
+        </div>
+      </td>
+      <td className="step-cell">
+        {job.deactivatedReason && (
+          <div className="row-error">{ts(extractResponseMessage(job.deactivatedReason))}</div>
+        )}
+        <div className="deactivated-countdown">
+          <Clock size={13} />
+          <span>{tf("{0} 秒后从列表移除", remaining)}</span>
+        </div>
+      </td>
+      <td className="time-cell"><time dateTime={job.createdAt}>{formatDateTime(job.createdAt)}</time></td>
+      <td className="operation-time-cell">
+        <time dateTime={job.deactivatedAt || job.createdAt}>{formatDateTime(job.deactivatedAt || job.createdAt)}</time>
+        <span>{t("已停用")}</span>
+      </td>
+      <td />
+    </tr>
+  );
+}
+
+function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, forceBrowserVerifyAvailable, refreshLaneAgeDays, accountProxyUrl, proxyBatchMode, sub2apiConfig }) {
   // Ở chế độ nhiều IP: thao tác lại trên tài khoản giữ nguyên proxy đã gán (không gửi proxyUrl).
   const reuseProxyBody = () => (proxyBatchMode ? {} : { proxyUrl: accountProxyUrl.trim() });
   const [value, setValue] = useState("");
@@ -3592,6 +3800,21 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
     }
   }
 
+  async function forceBrowserVerify() {
+    setSubmitting(true);
+    try {
+      await apiFetch(token, `/api/jobs/${job.id}/force-browser-verify`, {
+        method: "POST",
+        body: JSON.stringify(reuseProxyBody()),
+      });
+      onError("");
+    } catch (requestError) {
+      onError(requestError.message);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
   async function setupTotp() {
     setSubmitting(true);
     try {
@@ -3681,6 +3904,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
           <span className="account-badges">
             <LoginMethodBadge job={job} />
             <Sub2ApiUploadBadge job={job} />
+            <RefreshLaneBadge job={job} ageDays={refreshLaneAgeDays} />
           </span>
         </div>
       </td>
@@ -3807,9 +4031,27 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
             </button>
           )}
           {forceReloginAvailable && job.canForceRelogin && (
-            <button type="button" className="relogin-button" onClick={forceRelogin} disabled={submitting} title={t("跳过刷新令牌和旧检查点，完整重新登录后自动授权")}>
+            <button
+              type="button"
+              className="relogin-button icon-only"
+              onClick={forceRelogin}
+              disabled={submitting}
+              aria-label={t("重新登录并授权")}
+              title={`${t("重新登录并授权")} — ${t("跳过刷新令牌和旧检查点，完整重新登录后自动授权")}`}
+            >
               {submitting ? <LoaderCircle className="spin" size={16} /> : <LogIn size={16} />}
-              {t("重新登录并授权")}
+            </button>
+          )}
+          {forceBrowserVerifyAvailable && job.canForceRelogin && (
+            <button
+              type="button"
+              className="verify-button icon-only"
+              onClick={forceBrowserVerify}
+              disabled={submitting}
+              aria-label={t("强制浏览器验证")}
+              title={`${t("强制浏览器验证")} — ${tf("跳过策略（含 {0} 天刷新规则），强制启动浏览器完整验证流程", refreshLaneAgeDays || 60)}`}
+            >
+              {submitting ? <LoaderCircle className="spin" size={16} /> : <ShieldAlert size={16} />}
             </button>
           )}
           {totpSetupAvailable && job.canSetupTotp && (
@@ -3967,34 +4209,31 @@ function StatusBadge({ status }) {
 }
 
 function LoginMethodBadge({ job }) {
-  if (job.loginMode === "password") {
-    const methods = [t("密码"), job.autoEmailOtp ? t("自动收码") : "", job.hasTotpKey ? "2FA" : ""].filter(Boolean);
-    return (
-      <span className="mail-mode password-mode">
-        {job.hasTotpKey ? <ShieldCheck size={12} /> : <KeyRound size={12} />}
-        {methods.join(" + ")}
-      </span>
-    );
-  }
-  if (job.autoEmailOtp) {
-    return (
-      <span className={`mail-mode ${["error", "timeout"].includes(job.mailStatus) ? "error" : ""}`}>
-        {job.hasTotpKey ? <ShieldCheck size={12} /> : <MailCheck size={12} />}
-        {job.hasTotpKey ? t("自动收码 + 2FA") : t("自动收码")}
-      </span>
-    );
-  }
+  // Icon-only compact — text "Mật khẩu + Tự nhận mã" quá rộng khi acc đủ 3
+  // phương thức, đè layout cột action. Tooltip (title) giữ label cho operator.
   if (job.loginMode === "manual") {
     return (
-      <span className="mail-mode unknown-mode">
-        <CircleAlert size={12} />{t("旧任务资料未记录")}
+      <span className="mail-mode unknown-mode" title={t("旧任务资料未记录")}>
+        <CircleAlert size={12} />
       </span>
     );
   }
-  if (!job.hasTotpKey) return null;
+  const hasPassword = job.loginMode === "password";
+  const hasEmailOtp = Boolean(job.autoEmailOtp);
+  const hasTotp = Boolean(job.hasTotpKey);
+  if (!hasPassword && !hasEmailOtp && !hasTotp) return null;
+  const labels = [];
+  if (hasPassword) labels.push(t("密码"));
+  if (hasEmailOtp) labels.push(t("自动收码"));
+  if (hasTotp) labels.push("2FA");
+  const title = labels.join(" + ");
+  const isError = hasEmailOtp && ["error", "timeout"].includes(job.mailStatus);
+  const className = `mail-mode login-icons${hasPassword ? " password-mode" : ""}${isError ? " error" : ""}`;
   return (
-    <span className="mail-mode">
-      <ShieldCheck size={12} />{t("邮箱码 + 2FA")}
+    <span className={className} title={title} aria-label={title}>
+      {hasPassword && <KeyRound size={12} />}
+      {hasEmailOtp && <MailCheck size={12} />}
+      {hasTotp && <ShieldCheck size={12} />}
     </span>
   );
 }
@@ -4006,6 +4245,43 @@ function Sub2ApiUploadBadge({ job }) {
   return (
     <span className="mail-mode sub2api-uploaded" title={tf("已于 {0} 上传到 Sub2API{1}", when, target)}>
       <CloudUpload size={12} />{t("已上传 Sub2API")}
+    </span>
+  );
+}
+
+// Lane routing badge: hiện lane sẽ dùng cho lần refresh/regenerate tiếp theo.
+// Logic phải khớp chooseRefreshLane trong src/console-server.mjs (xem docs/lane-routing.md).
+function RefreshLaneBadge({ job, ageDays }) {
+  if (job.status === "idle") return null; // chưa signup xong, chưa áp policy
+  const cutoff = Number(ageDays) || 60;
+  if (job.forceBrowserVerifyRequested) {
+    return (
+      <span className="mail-mode lane-badge lane-badge-force" title={t("已标记强制浏览器验证，下一次刷新/再授权会打开浏览器")}>
+        <ShieldAlert size={12} />{t("强制浏览器")}
+      </span>
+    );
+  }
+  if (job.source === "external") {
+    return (
+      <span className="mail-mode lane-badge lane-badge-external" title={t("账号来自外部导入，始终走浏览器验证")}>
+        <ShieldCheck size={12} />{t("外部导入 · 浏览器")}
+      </span>
+    );
+  }
+  if (!job.signupCompletedAt) return null;
+  const ageMs = Date.now() - Date.parse(job.signupCompletedAt);
+  if (!Number.isFinite(ageMs)) return null;
+  const ageDaysActual = Math.floor(ageMs / 86_400_000);
+  if (ageDaysActual < cutoff) {
+    return (
+      <span className="mail-mode lane-badge lane-badge-browser" title={tf("账号年龄 {0}/{1} 天 — 下一次刷新仍使用浏览器全量验证", ageDaysActual, cutoff)}>
+        <ShieldCheck size={12} />{tf("浏览器 ({0}/{1}d)", ageDaysActual, cutoff)}
+      </span>
+    );
+  }
+  return (
+    <span className="mail-mode lane-badge lane-badge-tls" title={tf("账号年龄 {0} 天 ≥ {1} 天 — 下一次刷新使用 TLS 刷新令牌", ageDaysActual, cutoff)}>
+      <RefreshCw size={12} />{t("TLS 刷新")}
     </span>
   );
 }
